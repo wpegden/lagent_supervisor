@@ -1,0 +1,283 @@
+# Lean formalization worker/reviewer supervisor
+
+This package implements a first-pass two-agent loop for long unattended Lean formalization runs:
+
+- **worker agent**: edits the repo and maintains `PLAN.md` and `TASKS.md`
+- **reviewer agent**: reads `PLAN.md`, `TASKS.md`, the worker handoff JSON, and the worker's latest terminal output, then returns a vibe-based decision: `CONTINUE`, `DONE`, or `STUCK`
+
+It supports:
+
+- Claude Code
+- Codex CLI
+- Gemini CLI
+- mixed worker/reviewer pairs, such as Codex worker + Claude reviewer
+
+## What changed in this version
+
+This package now uses **real `tmux` windows for each burst**.
+
+Each cycle works like this:
+
+1. the supervisor writes a prompt file;
+2. it launches the worker in a new `tmux` window using the provider's **non-interactive one-shot mode**;
+3. you can attach to the `tmux` session and watch the worker's native terminal output live while it runs;
+4. when the worker process exits, the supervisor reads `supervisor/worker_handoff.json` and captures the terminal output from the pane;
+5. the supervisor launches the reviewer the same way;
+6. the reviewer writes `supervisor/review_decision.json`;
+7. if the decision is `CONTINUE`, the supervisor launches the next worker burst.
+
+So the agents are visible in real TTY windows while running, but the supervisor still gets a clean file-based handoff when they finish.
+
+## High-level architecture
+
+Every role gets its own persistent scope directory under:
+
+```text
+<repo>/.agent-supervisor/scopes/<provider>-<role>/
+```
+
+Inside each scope directory there are two symlinks:
+
+```text
+repo/        -> your actual Lean repo
+supervisor/  -> <repo>/.agent-supervisor
+```
+
+The agents therefore operate from their own per-role project roots, while still editing the same underlying repository via `repo/`.
+
+This gives the worker and reviewer separate contexts for providers that scope sessions by project directory.
+
+## Files the worker must maintain
+
+The worker always maintains:
+
+- `repo/PLAN.md` — high-level durable plan
+- `repo/TASKS.md` — short-term task list with checked-off items
+
+At the end of every worker burst it must also write:
+
+- `supervisor/worker_handoff.json`
+
+with this shape:
+
+```json
+{
+  "summary_of_changes": "brief summary",
+  "current_frontier": "what it is working on now",
+  "likely_next_step": "best next step",
+  "vibe_check": "NOT_STUCK"
+}
+```
+
+The reviewer writes:
+
+- `supervisor/review_decision.json`
+
+with this shape:
+
+```json
+{
+  "decision": "CONTINUE",
+  "confidence": 0.81,
+  "reason": "brief reason",
+  "next_prompt": "short prompt for the worker"
+}
+```
+
+## Monitoring model
+
+The important distinction is:
+
+- **human monitoring** happens through `tmux`
+- **supervisor handoff** happens through JSON files plus captured pane text
+
+This means you get the best available TTY fidelity while the agent is running, instead of only seeing redirected logs.
+
+## Prerequisites
+
+You need:
+
+- Python 3.10+
+- `tmux`
+- whichever CLIs you want to use, already installed and authenticated:
+  - `claude`
+  - `codex`
+  - `gemini`
+
+## Minimal setup
+
+### 1. Create a goal file in your Lean repo
+
+Put something like this in `GOAL.md`:
+
+```md
+# Goal
+
+Formalize the target theorem from the paper.
+
+## Acceptance condition
+- The final Lean theorem statement is present.
+- The proof is completed with no placeholders.
+- Supporting lemmas needed for the result are formalized.
+```
+
+A starter template is included at `examples/GOAL.example.md`.
+
+### 2. Copy and edit a config file
+
+Pick one of the example configs in `configs/` and update:
+
+- `repo_path`
+- `goal_file`
+- optional model names
+- optional `tmux.session_name`
+
+### 3. Run the supervisor
+
+Foreground:
+
+```bash
+python3 supervisor.py --config configs/codex_worker_claude_reviewer.json
+```
+
+Or inside GNU Screen:
+
+```bash
+./scripts/start_in_screen.sh configs/codex_worker_claude_reviewer.json lean-supervisor
+```
+
+Or inside its own `tmux` session:
+
+```bash
+./scripts/start_in_tmux.sh configs/codex_worker_claude_reviewer.json lean-supervisor
+```
+
+### 4. Attach to the agent windows
+
+The worker/reviewer bursts run in the `tmux` session from the config, for example:
+
+```bash
+tmux attach -t lean-agents
+```
+
+or:
+
+```bash
+./scripts/attach_agents_tmux.sh lean-agents
+```
+
+### 5. Tail the logs if desired
+
+```bash
+./scripts/watch_logs.sh /path/to/your/repo
+```
+
+Logs are under:
+
+```text
+<repo>/.agent-supervisor/logs/
+```
+
+Important files:
+
+- `worker.latest.ansi.log`
+- `reviewer.latest.ansi.log`
+- `worker.all.ansi.log`
+- `reviewer.all.ansi.log`
+- `review_log.jsonl`
+
+
+
+## Default model/effort settings in the example configs
+
+The shipped example configs now default to the strongest documented settings for unattended runs:
+
+- **Claude Code**: `--model opus --effort max`
+- **Codex CLI**: `--model gpt-5.4 --config model_reasoning_effort="xhigh"`
+- **Gemini CLI**: `--model gemini-3.1-pro-preview`
+
+For Gemini, the current Gemini 3 docs say the default thinking level is already `high`, so the package does not add a separate effort flag for Gemini 3.1 Pro.
+
+## Example configs
+
+### Claude worker + Claude reviewer
+
+```bash
+python3 supervisor.py --config configs/claude_worker_claude_reviewer.json
+```
+
+### Codex worker + Claude reviewer
+
+```bash
+python3 supervisor.py --config configs/codex_worker_claude_reviewer.json
+```
+
+### Claude worker + Codex reviewer
+
+```bash
+python3 supervisor.py --config configs/claude_worker_codex_reviewer.json
+```
+
+### Gemini worker + Claude reviewer
+
+```bash
+python3 supervisor.py --config configs/gemini_worker_claude_reviewer.json
+```
+
+### Gemini worker + Gemini reviewer
+
+```bash
+python3 supervisor.py --config configs/gemini_worker_gemini_reviewer.json
+```
+
+## Provider notes
+
+### Claude Code
+
+The supervisor uses Claude in print mode and resumes the latest conversation in the role scope directory on later bursts. The example configs pin Claude to `opus` and add `--effort max`.
+
+### Codex
+
+The supervisor uses `codex exec` for initial bursts and `codex exec resume --last` for later bursts, again scoped to the role directory. The example configs pin Codex to `gpt-5.4` and set `model_reasoning_effort="xhigh"`.
+
+Because the role scope directory itself is not the Git repo root, the package passes `--skip-git-repo-check` and instructs the agent to work under `repo/`.
+
+### Gemini CLI
+
+The supervisor uses `--prompt` for initial bursts and `--resume latest --prompt` for later bursts, with `--approval-mode=yolo`. The example configs pin Gemini to `gemini-3.1-pro-preview`; Gemini 3 models already default to high thinking, so no extra effort flag is added.
+
+## Loop details
+
+Each cycle:
+
+1. worker burst runs in a real `tmux` window;
+2. worker updates `repo/PLAN.md` and `repo/TASKS.md`;
+3. worker writes `supervisor/worker_handoff.json`;
+4. supervisor captures the worker pane output;
+5. reviewer burst runs in a real `tmux` window;
+6. reviewer reads the files and decides `CONTINUE`, `DONE`, or `STUCK`;
+7. reviewer writes `supervisor/review_decision.json`;
+8. if `CONTINUE`, the supervisor launches the next worker burst.
+
+## First recommendation
+
+Start with either:
+
+- Codex worker + Claude reviewer
+- Claude worker + Claude reviewer
+
+Those are the combinations most likely to work with the least local tweaking.
+
+## Expected rough edges
+
+This is still a v1 package.
+
+It does **not** yet do any of the following:
+
+- run `lake build`
+- count `sorry`
+- detect repeated identical failure modes
+- enforce budget ceilings
+- distinguish "soft pause" from real mathematical stuckness using objective metrics
+
+It is intentionally the simple vibes-only version.

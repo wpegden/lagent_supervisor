@@ -1,0 +1,28 @@
+{
+  "repo_path": "/ABSOLUTE/PATH/TO/YOUR/LEAN/REPO",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 0,
+  "sleep_seconds": 1.0,
+  "tmux": {
+    "session_name": "lean-agents",
+    "dashboard_window_name": "dashboard",
+    "kill_windows_after_capture": true
+  },
+  "worker": {
+    "provider": "codex",
+    "model": "gpt-5.4",
+    "extra_args": [
+      "--config",
+      "model_reasoning_effort=\"xhigh\""
+    ]
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "opus",
+    "extra_args": [
+      "--effort",
+      "max"
+    ]
+  }
+}

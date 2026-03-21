@@ -1,0 +1,30 @@
+Continue autonomous Lean formalization work.
+
+Reviewer guidance:
+- Reason: {review_reason}
+- Next prompt: {next_prompt}
+
+Current planning files:
+- `{plan_path}`
+- `{tasks_path}`
+
+Current `{plan_path}` contents:
+{plan_text}
+
+Current `{tasks_path}` contents:
+{tasks_text}
+
+Requirements remain unchanged:
+- Maintain `{plan_path}` as the high-level durable plan.
+- Maintain `{tasks_path}` as the short-term checked-off task list.
+- Work inside `{repo_label}`.
+- Before ending this turn, write a JSON handoff file to `{handoff_path}`.
+- Also print the same JSON handoff at the end of your terminal output.
+
+Your handoff JSON must have exactly these keys:
+{{
+  "summary_of_changes": "brief summary",
+  "current_frontier": "what you are working on now",
+  "likely_next_step": "best immediate next step",
+  "vibe_check": "NOT_STUCK" | "MAYBE_STUCK" | "MAYBE_DONE"
+}}
