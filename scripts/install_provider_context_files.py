@@ -12,13 +12,13 @@ import supervisor
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Install provider context files for Claude and Gemini")
+    parser = argparse.ArgumentParser(description="Install provider context files for Claude, Codex, and Gemini")
     parser.add_argument("--home-dir", default=str(Path.home()), help="Target home directory for personal installs")
     parser.add_argument(
         "--provider",
         action="append",
-        choices=["claude", "gemini"],
-        help="Provider to install. Defaults to both.",
+        choices=["claude", "codex", "gemini"],
+        help="Provider to install. Defaults to all supported providers.",
     )
     parser.add_argument(
         "--scope-dir",
@@ -28,7 +28,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    providers = args.provider or ["claude", "gemini"]
+    providers = args.provider or ["claude", "codex", "gemini"]
     home_dir = Path(args.home_dir).expanduser().resolve()
     installed = supervisor.install_personal_provider_context_files(home_dir, providers)
 

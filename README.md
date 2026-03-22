@@ -361,6 +361,9 @@ The supervisor uses `codex exec` for initial bursts and `codex exec resume --las
 
 Because the role scope directory itself is not the Git repo root, the package passes `--skip-git-repo-check` and instructs the agent to work under `repo/`.
 
+The repo now carries a packaged Codex skill at `provider_context/codex/lean-formalizer/SKILL.md`.
+On startup, the supervisor installs it to the current user's `~/.codex/skills/lean-formalizer/` and also into each Codex role scope under `.agents/skills/lean-formalizer/`.
+
 ### Gemini CLI
 
 The supervisor uses `--prompt` for initial bursts and `--resume latest --prompt` for later bursts, with `--approval-mode=yolo`. The example configs pin Gemini to `gemini-3.1-pro-preview`; Gemini 3 models already default to high thinking, so no extra effort flag is added.

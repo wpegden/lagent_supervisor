@@ -366,6 +366,10 @@ def claude_skill_source_dir() -> Path:
     return PROVIDER_CONTEXT_DIR / "claude" / "lean-formalizer"
 
 
+def codex_skill_source_dir() -> Path:
+    return PROVIDER_CONTEXT_DIR / "codex" / "lean-formalizer"
+
+
 def gemini_context_source_file() -> Path:
     return PROVIDER_CONTEXT_DIR / "gemini" / "GEMINI.md"
 
@@ -399,6 +403,8 @@ def install_personal_provider_context_files(home_dir: Path, providers: Sequence[
     seen = {provider.strip().lower() for provider in providers if provider.strip()}
     if "claude" in seen:
         installed.extend(install_tree(claude_skill_source_dir(), home_dir / ".claude" / "skills" / "lean-formalizer"))
+    if "codex" in seen:
+        installed.extend(install_tree(codex_skill_source_dir(), home_dir / ".codex" / "skills" / "lean-formalizer"))
     if "gemini" in seen:
         path = install_file(gemini_context_source_file(), home_dir / ".gemini" / "GEMINI.md")
         if path is not None:
@@ -411,6 +417,8 @@ def install_scope_provider_context_files(scope_dir: Path, provider: str) -> List
     normalized = provider.strip().lower()
     if normalized == "claude":
         installed.extend(install_tree(claude_skill_source_dir(), scope_dir / ".claude" / "skills" / "lean-formalizer"))
+    elif normalized == "codex":
+        installed.extend(install_tree(codex_skill_source_dir(), scope_dir / ".agents" / "skills" / "lean-formalizer"))
     elif normalized == "gemini":
         path = install_file(gemini_context_source_file(), scope_dir / "GEMINI.md")
         if path is not None:

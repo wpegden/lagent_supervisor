@@ -302,11 +302,13 @@ class ProviderContextTests(SupervisorTestCase):
     def test_install_personal_provider_context_files(self) -> None:
         repo_path = self.make_repo()
         home_dir = repo_path.parent / "home"
-        installed = supervisor.install_personal_provider_context_files(home_dir, ["claude", "gemini"])
+        installed = supervisor.install_personal_provider_context_files(home_dir, ["claude", "codex", "gemini"])
 
         self.assertIn(home_dir / ".claude" / "skills" / "lean-formalizer" / "SKILL.md", installed)
+        self.assertIn(home_dir / ".codex" / "skills" / "lean-formalizer" / "SKILL.md", installed)
         self.assertIn(home_dir / ".gemini" / "GEMINI.md", installed)
         self.assertIn("lean-formalizer", (home_dir / ".claude" / "skills" / "lean-formalizer" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertIn("Lean manuscript formalizer", (home_dir / ".codex" / "skills" / "lean-formalizer" / "SKILL.md").read_text(encoding="utf-8"))
         self.assertIn("Lean manuscript formalizer", (home_dir / ".gemini" / "GEMINI.md").read_text(encoding="utf-8"))
 
     def test_role_scope_dir_installs_provider_scoped_context_files(self) -> None:
@@ -314,9 +316,11 @@ class ProviderContextTests(SupervisorTestCase):
         config = self.make_config(repo_path)
 
         claude_scope = supervisor.role_scope_dir(config, "claude", "worker")
+        codex_scope = supervisor.role_scope_dir(config, "codex", "worker")
         gemini_scope = supervisor.role_scope_dir(config, "gemini", "reviewer")
 
         self.assertTrue((claude_scope / ".claude" / "skills" / "lean-formalizer" / "SKILL.md").exists())
+        self.assertTrue((codex_scope / ".agents" / "skills" / "lean-formalizer" / "SKILL.md").exists())
         self.assertTrue((gemini_scope / "GEMINI.md").exists())
 
 
