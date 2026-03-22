@@ -135,6 +135,23 @@ You need:
 
 ## Minimal setup
 
+### Interactive initializer
+
+If you want the repo, `GOAL.md`, copied paper, and supervisor config created for you, run:
+
+```bash
+python3 scripts/init_formalization_project.py
+```
+
+It prompts for:
+
+- the source `.tex` file
+- the working Lean repo path
+- the optional git remote URL
+- the config path to write
+
+By default it creates a `paper_check` workflow using a Codex worker and Claude reviewer, writes a config under `configs/`, pins the repo's `lean-toolchain` to an explicit installed release when possible, and keeps finished tmux burst windows around for inspection.
+
 ### 1. Create a goal file in your Lean repo
 
 Put something like this in `GOAL.md`:

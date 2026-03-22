@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -8,6 +9,9 @@ import uuid
 from pathlib import Path
 
 import supervisor
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import init_formalization_project
 
 
 class DummyAdapter(supervisor.ProviderAdapter):
@@ -322,6 +326,59 @@ class ProviderContextTests(SupervisorTestCase):
         self.assertTrue((claude_scope / ".claude" / "skills" / "lean-formalizer" / "SKILL.md").exists())
         self.assertTrue((codex_scope / ".agents" / "skills" / "lean-formalizer" / "SKILL.md").exists())
         self.assertTrue((gemini_scope / "GEMINI.md").exists())
+
+
+class InitProjectTests(SupervisorTestCase):
+    def test_parse_active_release_toolchain(self) -> None:
+        output = """
+installed toolchains
+--------------------
+
+leanprover/lean4:v4.28.0 (resolved from default 'stable')
+
+active toolchain
+----------------
+
+leanprover/lean4:v4.28.0 (resolved from default 'stable')
+Lean (version 4.28.0, x86_64-unknown-linux-gnu, commit abcdef, Release)
+"""
+        self.assertEqual(
+            init_formalization_project.parse_active_release_toolchain(output),
+            "leanprover/lean4:v4.28.0",
+        )
+
+    def test_repo_name_to_package_name(self) -> None:
+        self.assertEqual(init_formalization_project.repo_name_to_package_name("connectivity-threshold-gnp"), "ConnectivityThresholdGnp")
+
+    def test_build_config_json_uses_expected_defaults(self) -> None:
+        repo_path = self.make_repo()
+        spec = init_formalization_project.InitSpec(
+            repo_path=repo_path,
+            remote_url="git@github.com:wpegden/example.git",
+            paper_source=repo_path / "paper.tex",
+            paper_dest_rel=Path("paper/paper.tex"),
+            config_path=repo_path.parent / "example.json",
+            package_name="Example",
+            goal_file_name="GOAL.md",
+            branch="main",
+            author_name="leanagent",
+            author_email="leanagent@packer.math.cmu.edu",
+            max_cycles=3,
+            session_name="example-agents",
+            kill_windows_after_capture=False,
+            worker_provider="codex",
+            reviewer_provider="claude",
+        )
+
+        data = init_formalization_project.build_config_json(spec)
+
+        self.assertEqual(data["workflow"]["start_phase"], "paper_check")
+        self.assertEqual(data["workflow"]["paper_tex_path"], "paper/paper.tex")
+        self.assertEqual(data["tmux"]["session_name"], "example-agents")
+        self.assertFalse(data["tmux"]["kill_windows_after_capture"])
+        self.assertEqual(data["git"]["remote_url"], "git@github.com:wpegden/example.git")
+        self.assertEqual(data["worker"]["provider"], "codex")
+        self.assertEqual(data["reviewer"]["provider"], "claude")
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required for git integration tests")
