@@ -1,9 +1,19 @@
 # Lean formalization worker/reviewer supervisor
 
-This package implements a first-pass two-agent loop for long unattended Lean formalization runs:
+This package implements a two-agent loop for long unattended Lean formalization runs.
 
-- **worker agent**: edits the repo and maintains `PLAN.md` and `TASKS.md`
-- **reviewer agent**: reads `PLAN.md`, `TASKS.md`, the worker handoff JSON, and the worker's latest terminal output, then returns a vibe-based decision: `CONTINUE`, `DONE`, or `STUCK`
+It now supports either:
+
+- a single proof-formalization phase, which matches the original workflow, or
+- a multi-phase workflow:
+  - `paper_check`
+  - `planning`
+  - `theorem_stating`
+  - `proof_formalization`
+
+The worker edits the repo and maintains shared workflow files such as `TASKS.md`, `PAPERNOTES.md`, `PLAN.md`, `PaperDefinitions.lean`, and `PaperTheorems.lean` as the current phase requires.
+
+The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`.
 
 It supports:
 
@@ -47,12 +57,21 @@ The agents therefore operate from their own per-role project roots, while still 
 
 This gives the worker and reviewer separate contexts for providers that scope sessions by project directory.
 
-## Files the worker must maintain
+## Files the workflow may maintain
 
-The worker always maintains:
+Always:
 
-- `repo/PLAN.md` — high-level durable plan
 - `repo/TASKS.md` — short-term task list with checked-off items
+
+From `paper_check` onward:
+- `repo/PAPERNOTES.md` — proof corrections, hidden assumptions, and mathematical notes
+
+From `planning` onward:
+- `repo/PLAN.md` — high-level formalization roadmap
+
+From `theorem_stating` onward:
+- `repo/PaperDefinitions.lean`
+- `repo/PaperTheorems.lean`
 
 At the end of every worker burst it must also write:
 
@@ -62,10 +81,12 @@ with this shape:
 
 ```json
 {
+  "phase": "planning",
+  "status": "NOT_STUCK",
   "summary_of_changes": "brief summary",
   "current_frontier": "what it is working on now",
   "likely_next_step": "best next step",
-  "vibe_check": "NOT_STUCK"
+  "input_request": ""
 }
 ```
 
@@ -77,12 +98,20 @@ with this shape:
 
 ```json
 {
+  "phase": "planning",
   "decision": "CONTINUE",
   "confidence": 0.81,
   "reason": "brief reason",
   "next_prompt": "short prompt for the worker"
 }
 ```
+
+The supervisor also writes:
+
+- `supervisor/validation_summary.json`
+
+with build status, syntax checks, sorry counts, and axiom enforcement results for the current cycle.
+If a git remote is configured, the validation summary also includes git branch, remote, head, and worktree cleanliness information.
 
 ## Monitoring model
 
@@ -129,11 +158,28 @@ Pick one of the example configs in `configs/` and update:
 
 - `repo_path`
 - `goal_file`
+- optional `git.remote_url`
+- optional `git.remote_name`
+- optional `git.branch`
+- optional `git.author_name` / `git.author_email`
+- optional `workflow.start_phase`
+- optional `workflow.paper_tex_path`
+- optional `workflow.sorry_mode`
 - optional model names
 - optional timeout settings:
   - `startup_timeout_seconds` for launch failures before the burst script starts
   - `burst_timeout_seconds` for a single worker/reviewer burst that never exits
 - optional `tmux.session_name`
+
+If `git.remote_url` is set, the supervisor will:
+
+- initialize `repo_path` as a git repository if needed
+- configure the requested remote
+- configure local `user.name` / `user.email` if they are missing
+- add a supervisor-managed `.gitignore` block for the state directory
+- refuse to proceed if the configured remote branch already exists but the local repo has no commits
+
+When a git remote is configured, the worker is instructed to commit and push after every productive burst.
 
 ### 3. Run the supervisor
 
@@ -189,6 +235,67 @@ Important files:
 - `reviewer.all.ansi.log`
 - `review_log.jsonl`
 
+## Web transcript browser
+
+The supervisor can also export a web-safe transcript stream of the supervisor/agent conversation:
+
+- worker prompts
+- worker handoff JSON
+- supervisor validation summaries
+- reviewer prompts
+- reviewer decision JSON
+
+It does **not** publish the raw terminal capture used for local debugging.
+
+By default the web files live under:
+
+```text
+~/lagent-chats/<repo_name>/
+```
+
+with shared viewer assets in:
+
+```text
+~/lagent-chats/index.html
+~/lagent-chats/_assets/
+~/lagent-chats/repos.json
+```
+
+You can initialize the viewer assets without running the supervisor:
+
+```bash
+python3 scripts/install_lagent_chats_user_files.py
+```
+
+Optional config block:
+
+```json
+"chat": {
+  "root_dir": "~/lagent-chats",
+  "repo_name": "my-repo",
+  "public_base_url": "https://packer.math.cmu.edu/lagent-chats/"
+}
+```
+
+To serve the viewer with nginx, render the site config:
+
+```bash
+python3 scripts/render_lagent_chats_nginx_conf.py
+```
+
+Typical setup on Ubuntu:
+
+```bash
+python3 scripts/render_lagent_chats_nginx_conf.py | sudo tee /etc/nginx/sites-available/lagent-chats >/dev/null
+sudo ln -sf /etc/nginx/sites-available/lagent-chats /etc/nginx/sites-enabled/lagent-chats
+sudo setfacl -m u:www-data:rx /home/$USER
+sudo setfacl -R -m u:www-data:rx ~/lagent-chats
+sudo setfacl -d -m u:www-data:rx ~/lagent-chats
+sudo nginx -t
+sudo systemctl enable --now nginx
+sudo certbot --nginx -d packer.math.cmu.edu
+```
+
 
 
 ## Default model/effort settings in the example configs
@@ -233,11 +340,20 @@ python3 supervisor.py --config configs/gemini_worker_claude_reviewer.json
 python3 supervisor.py --config configs/gemini_worker_gemini_reviewer.json
 ```
 
+### Full multi-phase workflow
+
+```bash
+python3 supervisor.py --config configs/full_workflow_example.json
+```
+
 ## Provider notes
 
 ### Claude Code
 
 The supervisor uses Claude in print mode and resumes the latest conversation in the role scope directory on later bursts. The example configs pin Claude to `opus` and add `--effort max`.
+
+The repo now carries a packaged Claude skill at `provider_context/claude/lean-formalizer/SKILL.md`.
+On startup, the supervisor installs it to the current user's `~/.claude/skills/lean-formalizer/` and also into each Claude role scope under `.claude/skills/lean-formalizer/`.
 
 ### Codex
 
@@ -249,18 +365,30 @@ Because the role scope directory itself is not the Git repo root, the package pa
 
 The supervisor uses `--prompt` for initial bursts and `--resume latest --prompt` for later bursts, with `--approval-mode=yolo`. The example configs pin Gemini to `gemini-3.1-pro-preview`; Gemini 3 models already default to high thinking, so no extra effort flag is added.
 
+The repo now carries a packaged Gemini context file at `provider_context/gemini/GEMINI.md`.
+On startup, the supervisor installs it to the current user's `~/.gemini/GEMINI.md` and into each Gemini role scope as `GEMINI.md`.
+
+You can also seed a user home explicitly with:
+
+```bash
+python3 scripts/install_provider_context_files.py --home-dir /home/leanagent
+```
+
 ## Loop details
 
 Each cycle:
 
 1. worker burst runs in a real `tmux` window;
-2. worker updates `repo/PLAN.md` and `repo/TASKS.md`;
+2. worker updates the current phase artifacts such as `repo/TASKS.md`, `repo/PAPERNOTES.md`, `repo/PLAN.md`, `repo/PaperDefinitions.lean`, and `repo/PaperTheorems.lean`;
+   If a git remote is configured and the burst made real progress, the worker should commit and push before ending the burst.
 3. worker writes `supervisor/worker_handoff.json`;
-4. supervisor captures the worker pane output;
+4. supervisor captures the worker pane output and runs its own validation checks;
 5. reviewer burst runs in a real `tmux` window;
-6. reviewer reads the files and decides `CONTINUE`, `DONE`, or `STUCK`;
+6. reviewer reads the files and decides `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `DONE`, or `STUCK` as appropriate for the current phase;
 7. reviewer writes `supervisor/review_decision.json`;
-8. if `CONTINUE`, the supervisor launches the next worker burst.
+8. if `ADVANCE_PHASE`, the supervisor moves to the next workflow phase;
+9. if `NEED_INPUT`, the supervisor writes `INPUT_REQUEST.md` and pauses until `HUMAN_INPUT.md` is provided;
+10. if `CONTINUE`, the supervisor launches the next worker burst.
 
 ## First recommendation
 

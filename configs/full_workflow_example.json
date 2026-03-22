@@ -1,0 +1,45 @@
+{
+  "repo_path": "/ABSOLUTE/PATH/TO/YOUR/LEAN/REPO",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 0,
+  "sleep_seconds": 1.0,
+  "startup_timeout_seconds": 30.0,
+  "burst_timeout_seconds": 7200.0,
+  "workflow": {
+    "start_phase": "paper_check",
+    "paper_tex_path": "paper/main.tex",
+    "sorry_mode": "default",
+    "approved_axioms_path": "APPROVED_AXIOMS.json",
+    "human_input_path": "HUMAN_INPUT.md",
+    "input_request_path": "INPUT_REQUEST.md"
+  },
+  "git": {
+    "remote_url": "git@github.com:YOUR_ORG/YOUR_REPO.git",
+    "remote_name": "origin",
+    "branch": "main",
+    "author_name": "leanagent",
+    "author_email": "leanagent@packer.math.cmu.edu"
+  },
+  "tmux": {
+    "session_name": "lean-agents",
+    "dashboard_window_name": "dashboard",
+    "kill_windows_after_capture": true
+  },
+  "worker": {
+    "provider": "codex",
+    "model": "gpt-5.4",
+    "extra_args": [
+      "--config",
+      "model_reasoning_effort=\"xhigh\""
+    ]
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "opus",
+    "extra_args": [
+      "--effort",
+      "max"
+    ]
+  }
+}

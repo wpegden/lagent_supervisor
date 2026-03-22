@@ -6,6 +6,10 @@
   "sleep_seconds": 1.0,
   "startup_timeout_seconds": 30.0,
   "burst_timeout_seconds": 900.0,
+  "workflow": {
+    "start_phase": "proof_formalization",
+    "sorry_mode": "default"
+  },
   "tmux": {
     "session_name": "lagent-smoke-agents",
     "dashboard_window_name": "dashboard",

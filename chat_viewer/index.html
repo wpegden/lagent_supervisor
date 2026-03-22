@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LAgent Chats</title>
+  <link rel="stylesheet" href="_assets/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <p class="eyebrow">LAgent Chats</p>
+        <h1>Supervisor transcripts</h1>
+        <p class="subtle">Structured prompts, handoffs, and review decisions by repository.</p>
+      </div>
+
+      <label class="search">
+        <span>Find repo</span>
+        <input id="repo-search" type="search" placeholder="repo name">
+      </label>
+
+      <div id="repo-list" class="repo-list"></div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <p id="repo-kicker" class="eyebrow">Transcript</p>
+          <h2 id="repo-title">No repository selected</h2>
+          <p id="repo-meta" class="subtle">Choose a repo from the left.</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="toggle">
+            <input id="auto-refresh" type="checkbox" checked>
+            <span>Auto-refresh</span>
+          </label>
+          <button id="refresh-button" type="button">Refresh now</button>
+        </div>
+      </header>
+
+      <section class="filters">
+        <label>
+          <span>Cycle</span>
+          <select id="cycle-filter">
+            <option value="all">All cycles</option>
+          </select>
+        </label>
+        <label>
+          <span>Kind</span>
+          <select id="kind-filter">
+            <option value="all">All events</option>
+          </select>
+        </label>
+      </section>
+
+      <section id="empty-state" class="empty-state">
+        <h3>No transcript data yet</h3>
+        <p>Run the supervisor once for a repo and refresh this page.</p>
+      </section>
+
+      <section id="transcript" class="transcript" hidden></section>
+    </main>
+  </div>
+
+  <template id="event-template">
+    <article class="event-card">
+      <div class="event-header">
+        <div>
+          <p class="event-badges"></p>
+          <h3 class="event-title"></h3>
+        </div>
+        <time class="event-time"></time>
+      </div>
+      <details class="event-details">
+        <summary>Show content</summary>
+        <pre class="event-content"></pre>
+      </details>
+    </article>
+  </template>
+
+  <script src="_assets/app.js" defer></script>
+</body>
+</html>
