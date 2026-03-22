@@ -1,0 +1,30 @@
+{
+  "repo_path": "/home/wes/src/lagent_supervisor/smoke_test_repo",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 3,
+  "sleep_seconds": 1.0,
+  "startup_timeout_seconds": 30.0,
+  "burst_timeout_seconds": 900.0,
+  "tmux": {
+    "session_name": "lagent-smoke-agents",
+    "dashboard_window_name": "dashboard",
+    "kill_windows_after_capture": false
+  },
+  "worker": {
+    "provider": "codex",
+    "model": "gpt-5.4",
+    "extra_args": [
+      "--config",
+      "model_reasoning_effort=\"xhigh\""
+    ]
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "opus",
+    "extra_args": [
+      "--effort",
+      "max"
+    ]
+  }
+}

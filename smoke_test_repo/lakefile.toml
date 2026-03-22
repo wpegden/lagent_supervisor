@@ -1,0 +1,10 @@
+name = "SmokeTest"
+version = "0.1.0"
+defaultTargets = ["smoketest"]
+
+[[lean_lib]]
+name = "SmokeTest"
+
+[[lean_exe]]
+name = "smoketest"
+root = "Main"

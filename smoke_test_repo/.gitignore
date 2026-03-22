@@ -1,0 +1,7 @@
+.agent-supervisor/
+.lake/
+build/
+lake-packages/
+lake-manifest.json
+PLAN.md
+TASKS.md
