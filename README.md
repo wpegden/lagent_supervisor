@@ -149,6 +149,7 @@ It prompts for:
 - the working Lean repo path
 - the optional git remote URL
 - the config path to write
+- the worker and reviewer providers
 
 By default it creates a `paper_check` workflow using a Codex worker and Claude reviewer, writes a config under `configs/`, pins the repo's `lean-toolchain` to an explicit installed release when possible, and keeps finished tmux burst windows around for inspection.
 

@@ -380,6 +380,32 @@ Lean (version 4.28.0, x86_64-unknown-linux-gnu, commit abcdef, Release)
         self.assertEqual(data["worker"]["provider"], "codex")
         self.assertEqual(data["reviewer"]["provider"], "claude")
 
+    def test_build_config_json_uses_requested_providers(self) -> None:
+        repo_path = self.make_repo()
+        spec = init_formalization_project.InitSpec(
+            repo_path=repo_path,
+            remote_url="git@github.com:wpegden/example.git",
+            paper_source=repo_path / "paper.tex",
+            paper_dest_rel=Path("paper/paper.tex"),
+            config_path=repo_path.parent / "example.json",
+            package_name="Example",
+            goal_file_name="GOAL.md",
+            branch="main",
+            author_name="leanagent",
+            author_email="leanagent@packer.math.cmu.edu",
+            max_cycles=3,
+            session_name="example-agents",
+            kill_windows_after_capture=False,
+            worker_provider="codex",
+            reviewer_provider="codex",
+        )
+
+        data = init_formalization_project.build_config_json(spec)
+
+        self.assertEqual(data["worker"]["provider"], "codex")
+        self.assertEqual(data["reviewer"]["provider"], "codex")
+        self.assertEqual(data["reviewer"]["model"], "gpt-5.4")
+
 
 @unittest.skipUnless(shutil.which("git"), "git is required for git integration tests")
 class GitSetupTests(SupervisorTestCase):

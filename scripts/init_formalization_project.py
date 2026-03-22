@@ -19,16 +19,22 @@ sys.path.insert(0, str(SCRIPT_DIR.parent))
 import supervisor
 
 
-DEFAULT_WORKER = {
-    "provider": "codex",
-    "model": "gpt-5.4",
-    "extra_args": ["--config", 'model_reasoning_effort="xhigh"'],
-}
-
-DEFAULT_REVIEWER = {
-    "provider": "claude",
-    "model": "opus",
-    "extra_args": ["--effort", "max"],
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
+    "claude": {
+        "provider": "claude",
+        "model": "opus",
+        "extra_args": ["--effort", "max"],
+    },
+    "codex": {
+        "provider": "codex",
+        "model": "gpt-5.4",
+        "extra_args": ["--config", 'model_reasoning_effort="xhigh"'],
+    },
+    "gemini": {
+        "provider": "gemini",
+        "model": "gemini-3.1-pro-preview",
+        "extra_args": [],
+    },
 }
 
 
@@ -79,6 +85,16 @@ def prompt_yes_no(label: str, default: bool) -> bool:
         if value in {"n", "no"}:
             return False
         print("Please answer y or n.")
+
+
+def prompt_choice(label: str, choices: Sequence[str], default: str) -> str:
+    allowed = [choice.strip().lower() for choice in choices]
+    default_text = default.strip().lower()
+    while True:
+        value = prompt_text(label, default_text).strip().lower()
+        if value in allowed:
+            return value
+        print(f"Please choose one of: {', '.join(allowed)}")
 
 
 def run_checked(args: Sequence[str], *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
@@ -232,8 +248,8 @@ def build_config_json(spec: InitSpec) -> dict[str, Any]:
             "dashboard_window_name": "dashboard",
             "kill_windows_after_capture": spec.kill_windows_after_capture,
         },
-        "worker": dict(DEFAULT_WORKER),
-        "reviewer": dict(DEFAULT_REVIEWER),
+        "worker": dict(PROVIDER_PRESETS[spec.worker_provider]),
+        "reviewer": dict(PROVIDER_PRESETS[spec.reviewer_provider]),
     }
 
 
@@ -296,6 +312,8 @@ def gather_spec(args: argparse.Namespace) -> InitSpec:
     max_cycles = int(prompt_text("Initial max_cycles", str(args.max_cycles or 3)))
     session_default = f"{repo_name}-agents"
     session_name = prompt_text("Agent tmux session name", args.session_name or session_default)
+    worker_provider = prompt_choice("Worker provider", sorted(PROVIDER_PRESETS), args.worker_provider or "codex")
+    reviewer_provider = prompt_choice("Reviewer provider", sorted(PROVIDER_PRESETS), args.reviewer_provider or "claude")
 
     return InitSpec(
         repo_path=repo_path,
@@ -311,8 +329,8 @@ def gather_spec(args: argparse.Namespace) -> InitSpec:
         max_cycles=max_cycles,
         session_name=session_name,
         kill_windows_after_capture=False if args.kill_windows_after_capture is None else args.kill_windows_after_capture,
-        worker_provider="codex",
-        reviewer_provider="claude",
+        worker_provider=worker_provider,
+        reviewer_provider=reviewer_provider,
     )
 
 
@@ -356,6 +374,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--author-name", help="Local git author name")
     parser.add_argument("--author-email", help="Local git author email")
     parser.add_argument("--max-cycles", type=int, help="Initial max_cycles to write into the config")
+    parser.add_argument("--worker-provider", choices=sorted(PROVIDER_PRESETS), help="Worker provider for the generated config")
+    parser.add_argument("--reviewer-provider", choices=sorted(PROVIDER_PRESETS), help="Reviewer provider for the generated config")
     parser.add_argument(
         "--kill-windows-after-capture",
         action=argparse.BooleanOptionalAction,
