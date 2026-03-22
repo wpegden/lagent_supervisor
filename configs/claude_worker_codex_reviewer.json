@@ -4,6 +4,8 @@
   "state_dir": ".agent-supervisor",
   "max_cycles": 0,
   "sleep_seconds": 1.0,
+  "startup_timeout_seconds": 15.0,
+  "burst_timeout_seconds": 7200.0,
   "tmux": {
     "session_name": "lean-agents",
     "dashboard_window_name": "dashboard",

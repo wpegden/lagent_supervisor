@@ -130,6 +130,9 @@ Pick one of the example configs in `configs/` and update:
 - `repo_path`
 - `goal_file`
 - optional model names
+- optional timeout settings:
+  - `startup_timeout_seconds` for launch failures before the burst script starts
+  - `burst_timeout_seconds` for a single worker/reviewer burst that never exits
 - optional `tmux.session_name`
 
 ### 3. Run the supervisor
