@@ -450,7 +450,8 @@ def supervisor_phase_tasks(config: Config, phase: str) -> List[str]:
             "- [ ] Make both files syntactically valid Lean.",
         ]
     return [
-        "- [ ] Prove the target statements in `PaperTheorems.lean`.",
+        "- [ ] Prove the target statements presented in `PaperTheorems.lean`.",
+        "- [ ] Keep reusable proof infrastructure in separate support files when that yields a cleaner project structure.",
         "- [ ] Maintain `TASKS.md` and `PLAN.md` as the proof frontier moves.",
         "- [ ] Keep sorrys within the configured policy.",
         "- [ ] Do not introduce unapproved axioms.",
@@ -1147,10 +1148,13 @@ def phase_worker_instructions(config: Config, phase: str) -> str:
     )
     return textwrap.dedent(
         """\
-        Phase objective: prove the target statements in `repo/PaperTheorems.lean`.
+        Phase objective: prove the target statements presented in `repo/PaperTheorems.lean`.
 
         Requirements:
         - Maintain `repo/TASKS.md` and `repo/PLAN.md`.
+        - Keep `repo/PaperDefinitions.lean` and `repo/PaperTheorems.lean` as the paper-facing interface for definitions and theorem statements.
+        - Prefer reusable lemmas, technical definitions, and proof infrastructure in separate support files when that yields a cleaner project structure.
+        - It is fine for proofs in `repo/PaperTheorems.lean` to be short wrappers around results proved elsewhere in the repo.
         - Work toward zero sorrys and no unapproved axioms.
         - Keep the proof frontier concrete in `TASKS.md`.
         """
@@ -1284,6 +1288,8 @@ def phase_reviewer_instructions(config: Config, phase: str) -> str:
         """\
         Decide whether the worker should continue the proof phase, stop as stuck, or declare the whole workflow done.
         Use the supervisor validation summary for build status, sorry counts, and axiom enforcement.
+        Keep `PaperDefinitions.lean` and `PaperTheorems.lean` paper-facing and easy to compare against the paper.
+        If the worker is stuffing reusable infrastructure into those files when separate support files would be cleaner, require refactoring.
         """
     ).strip()
     git_note = git_reviewer_instructions(config)

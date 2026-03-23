@@ -203,6 +203,26 @@ class CommandTests(SupervisorTestCase):
         self.assertIn(".agents/skills/lean-formalizer/SKILL.md", prompt)
         self.assertIn("read or reread the installed Lean formalization context file", prompt)
         self.assertIn("Follow the Lean-search, naming, proof-planning, and tool-usage suggestions", prompt)
+        self.assertIn("paper-facing interface", prompt)
+        self.assertIn("separate support files", prompt)
+        self.assertIn("short wrappers around results proved elsewhere", prompt)
+
+    def test_proof_phase_reviewer_prompt_prefers_support_file_refactors(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        prompt = supervisor.build_reviewer_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            "worker terminal output",
+            '{"status":"NOT_STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            False,
+        )
+
+        self.assertIn("paper-facing", prompt)
+        self.assertIn("separate support files would be cleaner", prompt)
 
 
 class ArtifactFallbackTests(SupervisorTestCase):
