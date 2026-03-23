@@ -177,6 +177,33 @@ def ensure_lake_project(repo_path: Path, package_name: str) -> None:
     run_checked(["lake", "init", package_name, "math"], cwd=repo_path)
 
 
+def ensure_build_only_ci_workflow(repo_path: Path) -> Path:
+    workflow_path = repo_path / ".github" / "workflows" / "lean_action_ci.yml"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
+    workflow_path.write_text(
+        textwrap.dedent(
+            """\
+            name: Lean Action CI
+
+            on:
+              push:
+              pull_request:
+              workflow_dispatch:
+
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+
+                steps:
+                  - uses: actions/checkout@v5
+                  - uses: leanprover/lean-action@v1
+            """
+        ),
+        encoding="utf-8",
+    )
+    return workflow_path
+
+
 def ensure_explicit_repo_toolchain(repo_path: Path) -> Optional[str]:
     toolchain = detect_explicit_lean_toolchain()
     if not toolchain:
@@ -339,6 +366,7 @@ def bootstrap_project(spec: InitSpec, *, create_commit: bool) -> dict[str, Any]:
     ensure_repo_git(spec.repo_path, spec.branch, spec.author_name, spec.author_email)
     ensure_remote(spec.repo_path, "origin", spec.remote_url)
     ensure_lake_project(spec.repo_path, spec.package_name)
+    ci_workflow_path = ensure_build_only_ci_workflow(spec.repo_path)
     pinned_toolchain = ensure_explicit_repo_toolchain(spec.repo_path)
     paper_dest = copy_paper_into_repo(spec.repo_path, spec.paper_source, spec.paper_dest_rel)
 
@@ -354,6 +382,7 @@ def bootstrap_project(spec: InitSpec, *, create_commit: bool) -> dict[str, Any]:
         "paper_dest": paper_dest,
         "config_path": spec.config_path,
         "repo_path": spec.repo_path,
+        "ci_workflow_path": ci_workflow_path,
         "pinned_toolchain": pinned_toolchain,
         "push_error": push_error,
         "agent_session": spec.session_name,
@@ -419,6 +448,7 @@ def main() -> int:
     print(f"- Goal file: {result['goal_path']}")
     print(f"- Paper copy: {result['paper_dest']}")
     print(f"- Config: {result['config_path']}")
+    print(f"- CI workflow: {result['ci_workflow_path']}")
     if result["pinned_toolchain"]:
         print(f"- Lean toolchain: {result['pinned_toolchain']}")
     print()

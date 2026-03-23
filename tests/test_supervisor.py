@@ -379,6 +379,43 @@ Lean (version 4.28.0, x86_64-unknown-linux-gnu, commit abcdef, Release)
     def test_repo_name_to_package_name(self) -> None:
         self.assertEqual(init_formalization_project.repo_name_to_package_name("connectivity-threshold-gnp"), "ConnectivityThresholdGnp")
 
+    def test_ensure_build_only_ci_workflow_rewrites_default_math_template(self) -> None:
+        repo_path = self.make_repo()
+        workflow_path = repo_path / ".github" / "workflows" / "lean_action_ci.yml"
+        workflow_path.parent.mkdir(parents=True, exist_ok=True)
+        workflow_path.write_text(
+            """name: Lean Action CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: leanprover/lean-action@v1
+      - uses: leanprover-community/docgen-action@v1
+""",
+            encoding="utf-8",
+        )
+
+        written = init_formalization_project.ensure_build_only_ci_workflow(repo_path)
+        content = written.read_text(encoding="utf-8")
+
+        self.assertEqual(written, workflow_path)
+        self.assertIn("leanprover/lean-action@v1", content)
+        self.assertNotIn("docgen-action", content)
+        self.assertNotIn("pages: write", content)
+
     def test_build_config_json_uses_expected_defaults(self) -> None:
         repo_path = self.make_repo()
         spec = init_formalization_project.InitSpec(
