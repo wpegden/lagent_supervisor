@@ -1185,9 +1185,9 @@ def provider_context_worker_instructions(config: Config) -> str:
     return textwrap.dedent(
         f"""\
         Provider-context requirements:
-        - Before substantive work, consult the installed Lean formalization context file at `{context_path}` if it is present in this scope.
-        - Follow the `lean-formalizer` guidance for theorem search, naming, and proof planning rather than relying only on recall.
-        - When searching for existing lemmas or theorem names, use the local Loogle server at `http://127.0.0.1:8088/json?q=...` when it is helpful.
+        - Before substantive work in this burst, read or reread the installed Lean formalization context file at `{context_path}` if it is present in this scope.
+        - Treat that file as the authoritative workflow for Lean-specific search, naming, and proof planning in this repo.
+        - Follow the theorem-search process described there, including any local search tools or servers it tells you to use, rather than relying only on recall.
         """
     ).strip()
 
