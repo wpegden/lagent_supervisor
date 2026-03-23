@@ -151,7 +151,7 @@ It prompts for:
 - the config path to write
 - the worker and reviewer providers
 
-By default it creates a `paper_check` workflow using a Codex worker and Claude reviewer, writes a config under `configs/`, pins the repo's `lean-toolchain` to an explicit installed release when possible, rewrites the default Lean GitHub CI workflow to a build-only check, and keeps finished tmux burst windows around for inspection.
+By default it creates a `paper_check` workflow using a Codex worker and Claude reviewer, writes a config under `configs/`, sets `max_cycles` to `150`, invokes `lake init` with an explicit installed Lean release when available to avoid the transient `stable` warning, rewrites the default Lean GitHub CI workflow to a build-only check, and keeps finished tmux burst windows around for inspection.
 
 ### 1. Create a goal file in your Lean repo
 

@@ -399,6 +399,16 @@ Lean (version 4.28.0, x86_64-unknown-linux-gnu, commit abcdef, Release)
     def test_repo_name_to_package_name(self) -> None:
         self.assertEqual(init_formalization_project.repo_name_to_package_name("connectivity-threshold-gnp"), "ConnectivityThresholdGnp")
 
+    def test_lake_command_uses_explicit_toolchain_prefix(self) -> None:
+        self.assertEqual(
+            init_formalization_project.lake_command("leanprover/lean4:v4.29.0-rc6"),
+            ["lake", "+leanprover/lean4:v4.29.0-rc6"],
+        )
+        self.assertEqual(init_formalization_project.lake_command(None), ["lake"])
+
+    def test_initializer_default_max_cycles(self) -> None:
+        self.assertEqual(init_formalization_project.DEFAULT_INIT_MAX_CYCLES, 150)
+
     def test_ensure_build_only_ci_workflow_rewrites_default_math_template(self) -> None:
         repo_path = self.make_repo()
         workflow_path = repo_path / ".github" / "workflows" / "lean_action_ci.yml"

@@ -37,6 +37,8 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+DEFAULT_INIT_MAX_CYCLES = 150
+
 
 class InitError(RuntimeError):
     pass
@@ -146,6 +148,13 @@ def detect_explicit_lean_toolchain() -> Optional[str]:
     return None
 
 
+def lake_command(toolchain: Optional[str] = None) -> list[str]:
+    command = ["lake"]
+    if toolchain:
+        command.append(f"+{toolchain}")
+    return command
+
+
 def ensure_repo_git(repo_path: Path, branch: str, author_name: str, author_email: str) -> None:
     if run_capture(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_path).returncode != 0:
         run_checked(["git", "init", "-b", branch], cwd=repo_path)
@@ -174,7 +183,8 @@ def has_lake_project(repo_path: Path) -> bool:
 def ensure_lake_project(repo_path: Path, package_name: str) -> None:
     if has_lake_project(repo_path):
         return
-    run_checked(["lake", "init", package_name, "math"], cwd=repo_path)
+    toolchain = detect_explicit_lean_toolchain()
+    run_checked([*lake_command(toolchain), "init", package_name, "math"], cwd=repo_path)
 
 
 def ensure_build_only_ci_workflow(repo_path: Path) -> Path:
@@ -336,7 +346,7 @@ def gather_spec(args: argparse.Namespace) -> InitSpec:
     paper_dest_default = f"paper/{paper_source.name}"
     paper_dest_rel = Path(prompt_text("Paper path inside repo", args.paper_dest or paper_dest_default))
     goal_file_name = prompt_text("Goal file name", args.goal_file or "GOAL.md")
-    max_cycles = int(prompt_text("Initial max_cycles", str(args.max_cycles or 3)))
+    max_cycles = int(prompt_text("Initial max_cycles", str(args.max_cycles or DEFAULT_INIT_MAX_CYCLES)))
     session_default = f"{repo_name}-agents"
     session_name = prompt_text("Agent tmux session name", args.session_name or session_default)
     worker_provider = prompt_choice("Worker provider", sorted(PROVIDER_PRESETS), args.worker_provider or "codex")
