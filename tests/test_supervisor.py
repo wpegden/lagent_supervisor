@@ -202,7 +202,7 @@ class CommandTests(SupervisorTestCase):
 
         self.assertIn(".agents/skills/lean-formalizer/SKILL.md", prompt)
         self.assertIn("read or reread the installed Lean formalization context file", prompt)
-        self.assertIn("authoritative workflow for Lean-specific search", prompt)
+        self.assertIn("Follow the Lean-search, naming, proof-planning, and tool-usage suggestions", prompt)
 
 
 class ArtifactFallbackTests(SupervisorTestCase):

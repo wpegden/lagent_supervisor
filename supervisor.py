@@ -1186,8 +1186,7 @@ def provider_context_worker_instructions(config: Config) -> str:
         f"""\
         Provider-context requirements:
         - Before substantive work in this burst, read or reread the installed Lean formalization context file at `{context_path}` if it is present in this scope.
-        - Treat that file as the authoritative workflow for Lean-specific search, naming, and proof planning in this repo.
-        - Follow the theorem-search process described there, including any local search tools or servers it tells you to use, rather than relying only on recall.
+        - Follow the Lean-search, naming, proof-planning, and tool-usage suggestions in that file during this burst.
         """
     ).strip()
 
