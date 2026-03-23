@@ -1180,16 +1180,20 @@ def provider_context_worker_instructions(config: Config) -> str:
     provider = config.worker.provider
     if provider == "claude":
         context_path = ".claude/skills/lean-formalizer/SKILL.md"
+        context_label = "the installed `lean-formalizer` skill"
     elif provider == "codex":
         context_path = ".agents/skills/lean-formalizer/SKILL.md"
+        context_label = "the installed `lean-formalizer` skill"
     elif provider == "gemini":
         context_path = "GEMINI.md"
+        context_label = "the installed Lean formalization context file"
     else:
         context_path = "the installed provider context file"
+        context_label = "the installed provider context file"
     return textwrap.dedent(
         f"""\
         Provider-context requirements:
-        - Before substantive work in this burst, read or reread the installed Lean formalization context file at `{context_path}` if it is present in this scope.
+        - Before substantive work in this burst, read or reread {context_label} at `{context_path}` if it is present in this scope.
         - Follow the Lean-search, naming, proof-planning, and tool-usage suggestions in that file during this burst.
         """
     ).strip()

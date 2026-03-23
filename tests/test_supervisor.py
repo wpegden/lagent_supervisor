@@ -201,7 +201,7 @@ class CommandTests(SupervisorTestCase):
         prompt = supervisor.build_worker_prompt(config, {}, "proof_formalization", False)
 
         self.assertIn(".agents/skills/lean-formalizer/SKILL.md", prompt)
-        self.assertIn("read or reread the installed Lean formalization context file", prompt)
+        self.assertIn("read or reread the installed `lean-formalizer` skill", prompt)
         self.assertIn("Follow the Lean-search, naming, proof-planning, and tool-usage suggestions", prompt)
         self.assertIn("paper-facing interface", prompt)
         self.assertIn("separate support files", prompt)
