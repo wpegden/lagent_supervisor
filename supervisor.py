@@ -1172,6 +1172,26 @@ def git_worker_instructions(config: Config) -> str:
     ).strip()
 
 
+def provider_context_worker_instructions(config: Config) -> str:
+    provider = config.worker.provider
+    if provider == "claude":
+        context_path = ".claude/skills/lean-formalizer/SKILL.md"
+    elif provider == "codex":
+        context_path = ".agents/skills/lean-formalizer/SKILL.md"
+    elif provider == "gemini":
+        context_path = "GEMINI.md"
+    else:
+        context_path = "the installed provider context file"
+    return textwrap.dedent(
+        f"""\
+        Provider-context requirements:
+        - Before substantive work, consult the installed Lean formalization context file at `{context_path}` if it is present in this scope.
+        - Follow the `lean-formalizer` guidance for theorem search, naming, and proof planning rather than relying only on recall.
+        - When searching for existing lemmas or theorem names, use the local Loogle server at `http://127.0.0.1:8088/json?q=...` when it is helpful.
+        """
+    ).strip()
+
+
 def git_reviewer_instructions(config: Config) -> str:
     if not git_is_enabled(config):
         return ""
@@ -1197,6 +1217,7 @@ def build_worker_prompt(config: Config, state: Dict[str, Any], phase: str, is_in
             - Next prompt: {(last_review.get("next_prompt") or "Continue from the current frontier.").strip()}
             """
         )
+    provider_notes = provider_context_worker_instructions(config)
     git_notes = git_worker_instructions(config)
     return textwrap.dedent(
         f"""\
@@ -1209,7 +1230,8 @@ def build_worker_prompt(config: Config, state: Dict[str, Any], phase: str, is_in
 
         {phase_context_text(config, state, phase)}
 
-        {review_guidance}{phase_worker_instructions(config, phase)}
+        {review_guidance}{provider_notes}
+        {phase_worker_instructions(config, phase)}
         {git_notes}
 
         Before ending this turn:

@@ -175,6 +175,34 @@ class CommandTests(SupervisorTestCase):
         self.assertIn("create a non-empty git commit", prompt)
         self.assertIn("git push origin HEAD:main", prompt)
 
+    def test_worker_prompt_mentions_provider_context_and_loogle(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config = supervisor.Config(
+            repo_path=config.repo_path,
+            goal_file=config.goal_file,
+            state_dir=config.state_dir,
+            worker=supervisor.ProviderConfig(
+                provider="codex",
+                model="gpt-5.4",
+                extra_args=["--config", 'model_reasoning_effort="xhigh"'],
+            ),
+            reviewer=config.reviewer,
+            tmux=config.tmux,
+            workflow=config.workflow,
+            chat=config.chat,
+            git=config.git,
+            max_cycles=config.max_cycles,
+            sleep_seconds=config.sleep_seconds,
+            startup_timeout_seconds=config.startup_timeout_seconds,
+            burst_timeout_seconds=config.burst_timeout_seconds,
+        )
+
+        prompt = supervisor.build_worker_prompt(config, {}, "proof_formalization", False)
+
+        self.assertIn(".agents/skills/lean-formalizer/SKILL.md", prompt)
+        self.assertIn("http://127.0.0.1:8088/json?q=...", prompt)
+
 
 class ArtifactFallbackTests(SupervisorTestCase):
     def test_malformed_artifact_falls_back_to_last_matching_json_in_output(self) -> None:
