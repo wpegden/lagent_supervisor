@@ -147,7 +147,7 @@ def load_config(path: Path) -> Config:
 
     tmux_block = raw.get("tmux", {})
     tmux_cfg = TmuxConfig(
-        session_name=str(tmux_block.get("session_name", "lean-agents")),
+        session_name=sanitize_tmux_session_name(str(tmux_block.get("session_name", "lean-agents"))),
         dashboard_window_name=str(tmux_block.get("dashboard_window_name", "dashboard")),
         kill_windows_after_capture=bool(tmux_block.get("kill_windows_after_capture", True)),
     )
@@ -288,6 +288,12 @@ def current_phase(config: Config, state: Dict[str, Any]) -> str:
 def sanitize_repo_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
     return cleaned or "repo"
+
+
+def sanitize_tmux_session_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_-")
+    return cleaned or "lean-agents"
 
 
 def default_git_author_email(author_name: str) -> str:

@@ -532,7 +532,7 @@ def build_config_json(spec: InitSpec) -> dict[str, Any]:
             "author_email": spec.author_email,
         },
         "tmux": {
-            "session_name": spec.session_name,
+            "session_name": supervisor.sanitize_tmux_session_name(spec.session_name),
             "dashboard_window_name": "dashboard",
             "kill_windows_after_capture": spec.kill_windows_after_capture,
         },
@@ -611,8 +611,10 @@ def gather_spec(args: argparse.Namespace) -> InitSpec:
     paper_dest_rel = Path(prompt_text("Paper path inside repo", args.paper_dest or paper_dest_default))
     goal_file_name = prompt_text("Goal file name", args.goal_file or "GOAL.md")
     max_cycles = int(prompt_text("Initial max_cycles", str(args.max_cycles or DEFAULT_INIT_MAX_CYCLES)))
-    session_default = f"{repo_name}-agents"
-    session_name = prompt_text("Agent tmux session name", args.session_name or session_default)
+    session_default = supervisor.sanitize_tmux_session_name(f"{repo_name}-agents")
+    session_name = supervisor.sanitize_tmux_session_name(
+        prompt_text("Agent tmux session name", args.session_name or session_default)
+    )
     worker_provider = prompt_choice("Worker provider", sorted(PROVIDER_PRESETS), args.worker_provider or "codex")
     reviewer_provider = prompt_choice("Reviewer provider", sorted(PROVIDER_PRESETS), args.reviewer_provider or "claude")
 
@@ -667,8 +669,10 @@ def bootstrap_project(spec: InitSpec, *, create_commit: bool) -> dict[str, Any]:
         "ci_workflow_path": ci_workflow_path,
         "pinned_toolchain": pinned_toolchain,
         "push_error": push_error,
-        "agent_session": spec.session_name,
-        "supervisor_session": f"{supervisor.sanitize_repo_name(spec.repo_path.name)}-supervisor",
+        "agent_session": supervisor.sanitize_tmux_session_name(spec.session_name),
+        "supervisor_session": supervisor.sanitize_tmux_session_name(
+            f"{supervisor.sanitize_repo_name(spec.repo_path.name)}-supervisor"
+        ),
     }
 
 

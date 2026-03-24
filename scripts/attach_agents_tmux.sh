@@ -6,4 +6,15 @@ if [[ $# -ne 1 ]]; then
   exit 1
 fi
 
-tmux attach -t "$1"
+SESSION_NAME=$(python3 - <<'PY' "$1"
+import re
+import sys
+
+value = sys.argv[1].strip()
+cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", value)
+cleaned = re.sub(r"_+", "_", cleaned).strip("_-")
+print(cleaned or "lean-agents")
+PY
+)
+
+tmux attach -t "$SESSION_NAME"

@@ -15,9 +15,9 @@ SESSION_NAME="${2:-lean-supervisor}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-tmux new-session -d -s "$SESSION_NAME" -n supervisor bash -lc \
-  "cd '$ROOT_DIR' && python3 supervisor.py --config '$CONFIG_PATH'; echo; echo '[supervisor exited]'; exec bash"
+ACTUAL_SESSION=$(tmux new-session -d -P -F '#{session_name}' -s "$SESSION_NAME" -n supervisor bash -lc \
+  "cd '$ROOT_DIR' && python3 supervisor.py --config '$CONFIG_PATH'; echo; echo '[supervisor exited]'; exec bash")
 
-echo "Started supervisor in tmux session: $SESSION_NAME"
-echo "Attach with: tmux attach -t $SESSION_NAME"
+echo "Started supervisor in tmux session: $ACTUAL_SESSION"
+echo "Attach with: tmux attach -t $ACTUAL_SESSION"
 echo "Agent bursts will appear in the agent tmux session configured in your JSON file."

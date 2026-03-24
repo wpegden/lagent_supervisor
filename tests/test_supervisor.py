@@ -95,6 +95,36 @@ class SupervisorTestCase(unittest.TestCase):
 
 
 class CommandTests(SupervisorTestCase):
+    def test_sanitize_tmux_session_name_replaces_dots(self) -> None:
+        self.assertEqual(
+            supervisor.sanitize_tmux_session_name("arxiv-1702.07325-agents"),
+            "arxiv-1702_07325-agents",
+        )
+        self.assertEqual(
+            supervisor.sanitize_tmux_session_name(" weird session:name "),
+            "weird_session_name",
+        )
+
+    def test_load_config_normalizes_tmux_session_name(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "tmux": {"session_name": "arxiv-1702.07325-agents"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.tmux.session_name, "arxiv-1702_07325-agents")
+
     def test_codex_resume_uses_resume_safe_flags(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path)
@@ -379,6 +409,31 @@ class ProviderContextTests(SupervisorTestCase):
 
 
 class InitProjectTests(SupervisorTestCase):
+    def test_build_config_json_normalizes_tmux_session_name(self) -> None:
+        repo_path = self.make_repo()
+        spec = init_formalization_project.InitSpec(
+            repo_path=repo_path,
+            remote_url=None,
+            paper_source=repo_path / "paper.tex",
+            paper_arxiv_id=None,
+            paper_dest_rel=Path("paper/paper.tex"),
+            config_path=repo_path.parent / "example.json",
+            package_name="Example",
+            goal_file_name="GOAL.md",
+            branch="main",
+            author_name="leanagent",
+            author_email="leanagent@packer.math.cmu.edu",
+            max_cycles=3,
+            session_name="arxiv-1702.07325-agents",
+            kill_windows_after_capture=False,
+            worker_provider="codex",
+            reviewer_provider="claude",
+        )
+
+        data = init_formalization_project.build_config_json(spec)
+
+        self.assertEqual(data["tmux"]["session_name"], "arxiv-1702_07325-agents")
+
     def test_normalize_arxiv_id_accepts_prefixed_and_old_style_ids(self) -> None:
         self.assertEqual(init_formalization_project.normalize_arxiv_id("arXiv:1607.07814"), "1607.07814")
         self.assertEqual(init_formalization_project.normalize_arxiv_id("math/0301234v2"), "math/0301234v2")

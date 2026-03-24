@@ -152,6 +152,7 @@ It prompts for:
 - the worker and reviewer providers
 
 If you provide an arXiv identifier, the initializer downloads the latest arXiv source bundle, chooses the main `.tex` file, and flattens included `.tex` and available `.bbl` content into a single reference `.tex` before copying it into the repo.
+Generated tmux session names are normalized to tmux-safe characters, so identifiers such as `1702.07325` become session names such as `arxiv-1702_07325-agents`.
 
 By default it creates a `paper_check` workflow using a Codex worker and Claude reviewer, writes a config under `configs/`, sets `max_cycles` to `150`, invokes `lake init` with an explicit installed Lean release when available to avoid the transient `stable` warning, rewrites the default Lean GitHub CI workflow to a build-only check, and keeps finished tmux burst windows around for inspection.
 
