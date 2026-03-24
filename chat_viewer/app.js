@@ -12,6 +12,8 @@ const elements = {
   repoKicker: document.querySelector("#repo-kicker"),
   repoTitle: document.querySelector("#repo-title"),
   repoMeta: document.querySelector("#repo-meta"),
+  repoDocPanel: document.querySelector("#repo-doc-panel"),
+  repoDocLinks: document.querySelector("#repo-doc-links"),
   cycleFilter: document.querySelector("#cycle-filter"),
   kindFilter: document.querySelector("#kind-filter"),
   emptyState: document.querySelector("#empty-state"),
@@ -94,6 +96,16 @@ function formatTimestamp(value) {
   }
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function markdownViewerHref(repoName, file) {
+  const params = new URLSearchParams({
+    repo: repoName,
+    path: file.href || "",
+    label: file.label || "",
+    source: file.path || "",
+  });
+  return `_assets/markdown-viewer.html?${params.toString()}`;
 }
 
 function filteredRepos() {
@@ -237,6 +249,8 @@ function renderHeader() {
     elements.repoKicker.textContent = "Transcript";
     elements.repoTitle.textContent = "No repository selected";
     elements.repoMeta.textContent = "Choose a repo from the left.";
+    elements.repoDocLinks.replaceChildren();
+    elements.repoDocPanel.hidden = true;
     return;
   }
   elements.repoKicker.textContent = state.currentMeta.current_phase || "Transcript";
@@ -244,6 +258,20 @@ function renderHeader() {
   elements.repoMeta.textContent =
     `${state.currentMeta.repo_path} · last update ${formatTimestamp(state.currentMeta.updated_at)} · ` +
     `${state.currentMeta.event_count || 0} events`;
+
+  const files = Array.isArray(state.currentMeta.markdown_files) ? state.currentMeta.markdown_files : [];
+  elements.repoDocLinks.replaceChildren();
+  elements.repoDocPanel.hidden = !files.length;
+  files.forEach((file) => {
+    const link = document.createElement("a");
+    link.className = "doc-link";
+    link.href = markdownViewerHref(state.currentMeta.repo_name, file);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = file.label || file.path || "Markdown file";
+    link.title = file.path || file.label || "Markdown file";
+    elements.repoDocLinks.append(link);
+  });
 }
 
 async function selectRepo(repoName, updateHash = false) {

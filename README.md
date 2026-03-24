@@ -265,6 +265,7 @@ The supervisor can also export a web-safe transcript stream of the supervisor/ag
 - supervisor validation summaries
 - reviewer prompts
 - reviewer decision JSON
+- links to the current exported workflow markdown files such as `GOAL.md`, `TASKS.md`, `PAPERNOTES.md`, `PLAN.md`, `HUMAN_INPUT.md`, and `INPUT_REQUEST.md` when they exist, opened through a lightweight web markdown viewer
 
 It does **not** publish the raw terminal capture used for local debugging.
 

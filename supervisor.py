@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -753,6 +754,10 @@ def chat_repo_index_path(config: Config) -> Path:
     return chat_repo_dir(config) / "index.html"
 
 
+def chat_repo_files_dir(config: Config) -> Path:
+    return chat_repo_dir(config) / "files"
+
+
 def chat_repo_url(config: Config) -> str:
     return f"{config.chat.public_base_url}#{config.chat.repo_name}"
 
@@ -768,6 +773,8 @@ def install_chat_viewer_assets(root_dir: Path) -> None:
     asset_targets = {
         CHAT_VIEWER_DIR / "index.html": root_dir / "index.html",
         CHAT_VIEWER_DIR / "app.js": assets_dir / "app.js",
+        CHAT_VIEWER_DIR / "markdown-viewer.html": assets_dir / "markdown-viewer.html",
+        CHAT_VIEWER_DIR / "markdown-viewer.js": assets_dir / "markdown-viewer.js",
         CHAT_VIEWER_DIR / "styles.css": assets_dir / "styles.css",
     }
     for source, target in asset_targets.items():
@@ -794,6 +801,7 @@ def default_chat_meta(config: Config) -> Dict[str, Any]:
         "last_worker_status": None,
         "last_reviewer_decision": None,
         "awaiting_human_input": False,
+        "markdown_files": [],
     }
 
 
@@ -807,6 +815,60 @@ def update_chat_manifest(config: Config, meta: Dict[str, Any]) -> None:
     filtered.append(meta)
     filtered.sort(key=lambda entry: (entry.get("updated_at") or "", entry.get("repo_name") or ""), reverse=True)
     JsonFile.dump(path, {"repos": filtered})
+
+
+def workflow_markdown_files(config: Config) -> List[Path]:
+    candidates = [
+        config.goal_file,
+        config.repo_path / "TASKS.md",
+        config.repo_path / "PAPERNOTES.md",
+        config.repo_path / "PLAN.md",
+        config.workflow.human_input_path,
+        config.workflow.input_request_path,
+    ]
+    results: List[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except FileNotFoundError:
+            resolved = path.expanduser().resolve()
+        if resolved in seen or not path.exists() or path.suffix.lower() != ".md":
+            continue
+        seen.add(resolved)
+        results.append(path)
+    return results
+
+
+def chat_export_relative_path(config: Config, source_path: Path) -> Tuple[str, Path]:
+    try:
+        rel = source_path.resolve().relative_to(config.repo_path)
+        return relative_repo_label(config, source_path), Path("files") / "repo" / rel
+    except ValueError:
+        digest = hashlib.sha1(str(source_path.resolve()).encode("utf-8")).hexdigest()[:8]
+        safe_name = f"{sanitize_repo_name(source_path.stem)}-{digest}{source_path.suffix}"
+        return str(source_path), Path("files") / "external" / safe_name
+
+
+def sync_chat_markdown_files(config: Config) -> List[Dict[str, Any]]:
+    files_dir = chat_repo_files_dir(config)
+    if files_dir.exists():
+        shutil.rmtree(files_dir)
+    exported: List[Dict[str, Any]] = []
+    for path in workflow_markdown_files(config):
+        source_label, export_rel = chat_export_relative_path(config, path)
+        target = chat_repo_dir(config) / export_rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+        exported.append(
+            {
+                "label": path.name,
+                "path": source_label,
+                "href": f"{config.chat.repo_name}/{export_rel.as_posix()}",
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+            }
+        )
+    return exported
 
 
 def ensure_chat_site(config: Config) -> None:
@@ -830,10 +892,10 @@ def ensure_chat_site(config: Config) -> None:
     )
     chat_repo_index_path(config).write_text(redirect, encoding="utf-8")
     meta_path = chat_repo_meta_path(config)
-    if not meta_path.exists():
-        meta = default_chat_meta(config)
-        JsonFile.dump(meta_path, meta)
-        update_chat_manifest(config, meta)
+    meta = JsonFile.load(meta_path, default_chat_meta(config))
+    meta["markdown_files"] = sync_chat_markdown_files(config)
+    JsonFile.dump(meta_path, meta)
+    update_chat_manifest(config, meta)
 
 
 def summarize_chat_event(kind: str, content: Any) -> str:
@@ -1415,6 +1477,7 @@ def record_chat_event(
             "awaiting_human_input": bool(state.get("awaiting_human_input")),
         }
     )
+    meta["markdown_files"] = sync_chat_markdown_files(config)
     if kind == "worker_handoff" and isinstance(content, dict):
         meta["last_worker_status"] = content.get("status")
     if kind == "reviewer_decision" and isinstance(content, dict):

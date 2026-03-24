@@ -331,7 +331,10 @@ class WorkflowTests(SupervisorTestCase):
     def test_chat_event_export_builds_manifest_and_repo_files(self) -> None:
         repo_path = self.make_repo()
         chat_root = repo_path.parent / "chat site"
-        config = self.make_config(repo_path, chat_root_dir=chat_root)
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="planning")
+        supervisor.ensure_repo_files(config, "planning")
+        (repo_path / "TASKS.md").write_text("# Tasks\n\n- [ ] Do work.\n", encoding="utf-8")
+        (repo_path / "PLAN.md").write_text("# High-Level Plan\n\n- Main step.\n", encoding="utf-8")
         state = {"phase": "planning", "cycle": 2, "awaiting_human_input": False}
 
         supervisor.record_chat_event(
@@ -365,6 +368,8 @@ class WorkflowTests(SupervisorTestCase):
 
         self.assertTrue((chat_root / "index.html").exists())
         self.assertTrue((chat_root / "_assets" / "app.js").exists())
+        self.assertTrue((chat_root / "_assets" / "markdown-viewer.html").exists())
+        self.assertTrue((chat_root / "_assets" / "markdown-viewer.js").exists())
         self.assertTrue((chat_root / "_assets" / "styles.css").exists())
         self.assertTrue((chat_root / config.chat.repo_name / "index.html").exists())
 
@@ -375,6 +380,17 @@ class WorkflowTests(SupervisorTestCase):
         meta = json.loads((chat_root / config.chat.repo_name / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["current_cycle"], 2)
         self.assertEqual(meta["last_event_kind"], "reviewer_decision")
+        exported_paths = {entry["path"] for entry in meta["markdown_files"]}
+        self.assertIn("repo/GOAL.md", exported_paths)
+        self.assertIn("repo/TASKS.md", exported_paths)
+        self.assertIn("repo/PLAN.md", exported_paths)
+        self.assertTrue(all(entry.get("href") for entry in meta["markdown_files"]))
+        self.assertTrue(all(entry.get("label") for entry in meta["markdown_files"]))
+
+        tasks_export = chat_root / config.chat.repo_name / "files" / "repo" / "TASKS.md"
+        plan_export = chat_root / config.chat.repo_name / "files" / "repo" / "PLAN.md"
+        self.assertEqual(tasks_export.read_text(encoding="utf-8"), "# Tasks\n\n- [ ] Do work.\n")
+        self.assertEqual(plan_export.read_text(encoding="utf-8"), "# High-Level Plan\n\n- Main step.\n")
 
         lines = (chat_root / config.chat.repo_name / "events.jsonl").read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(lines), 2)
