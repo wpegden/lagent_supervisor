@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import uuid
@@ -378,6 +379,53 @@ class ProviderContextTests(SupervisorTestCase):
 
 
 class InitProjectTests(SupervisorTestCase):
+    def test_normalize_arxiv_id_accepts_prefixed_and_old_style_ids(self) -> None:
+        self.assertEqual(init_formalization_project.normalize_arxiv_id("arXiv:1607.07814"), "1607.07814")
+        self.assertEqual(init_formalization_project.normalize_arxiv_id("math/0301234v2"), "math/0301234v2")
+        self.assertIsNone(init_formalization_project.normalize_arxiv_id("/tmp/paper.tex"))
+
+    def test_default_paths_use_arxiv_identifier_stem(self) -> None:
+        repo_path, config_path = init_formalization_project.default_paths(None, "1607.07814")
+        self.assertEqual(repo_path.name, "arxiv-1607.07814")
+        self.assertEqual(config_path.name, "arxiv-1607.07814.json")
+
+    def test_flatten_arxiv_source_inlines_tex_and_bbl(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lagent arxiv flatten ") as tmpdir:
+            source_dir = Path(tmpdir)
+            (source_dir / "sections").mkdir()
+            (source_dir / "main.tex").write_text(
+                textwrap.dedent(
+                    r"""
+                    \documentclass{article}
+                    \begin{document}
+                    % \input{ignored}
+                    \input{sections/intro}
+                    \bibliographystyle{alpha}
+                    \bibliography{refs}
+                    \end{document}
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            (source_dir / "sections" / "intro.tex").write_text(
+                "Intro text.\n",
+                encoding="utf-8",
+            )
+            (source_dir / "main.bbl").write_text(
+                "\\begin{thebibliography}{1}\n\\bibitem{ref} Ref.\n\\end{thebibliography}\n",
+                encoding="utf-8",
+            )
+
+            main_tex, flattened = init_formalization_project.flatten_arxiv_source(source_dir, "1607.07814")
+
+            self.assertEqual(main_tex.name, "main.tex")
+            self.assertIn("arXiv identifier: 1607.07814", flattened)
+            self.assertIn("begin included file: sections/intro.tex", flattened)
+            self.assertIn("Intro text.", flattened)
+            self.assertIn("begin bibliography from: main.bbl", flattened)
+            self.assertIn("\\bibitem{ref}", flattened)
+            self.assertIn("% \\input{ignored}", flattened)
+
     def test_parse_active_release_toolchain(self) -> None:
         output = """
 installed toolchains
@@ -452,6 +500,7 @@ jobs:
             repo_path=repo_path,
             remote_url="git@github.com:wpegden/example.git",
             paper_source=repo_path / "paper.tex",
+            paper_arxiv_id=None,
             paper_dest_rel=Path("paper/paper.tex"),
             config_path=repo_path.parent / "example.json",
             package_name="Example",
@@ -482,6 +531,7 @@ jobs:
             repo_path=repo_path,
             remote_url="git@github.com:wpegden/example.git",
             paper_source=repo_path / "paper.tex",
+            paper_arxiv_id=None,
             paper_dest_rel=Path("paper/paper.tex"),
             config_path=repo_path.parent / "example.json",
             package_name="Example",
