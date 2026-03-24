@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
@@ -850,25 +850,66 @@ def chat_export_relative_path(config: Config, source_path: Path) -> Tuple[str, P
         return str(source_path), Path("files") / "external" / safe_name
 
 
+def remove_empty_directories(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in sorted((item for item in root.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            continue
+
+
 def sync_chat_markdown_files(config: Config) -> List[Dict[str, Any]]:
     files_dir = chat_repo_files_dir(config)
-    if files_dir.exists():
-        shutil.rmtree(files_dir)
+    files_dir.mkdir(parents=True, exist_ok=True)
     exported: List[Dict[str, Any]] = []
+    expected_exports: set[Path] = set()
     for path in workflow_markdown_files(config):
         source_label, export_rel = chat_export_relative_path(config, path)
         target = chat_repo_dir(config) / export_rel
+        expected_exports.add(export_rel)
+        source_stat = path.stat()
+        should_copy = True
+        if target.exists():
+            target_stat = target.stat()
+            should_copy = (
+                target_stat.st_size != source_stat.st_size or target_stat.st_mtime_ns != source_stat.st_mtime_ns
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, target)
+        if should_copy:
+            shutil.copy2(path, target)
         exported.append(
             {
                 "label": path.name,
                 "path": source_label,
                 "href": f"{config.chat.repo_name}/{export_rel.as_posix()}",
-                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+                "updated_at": datetime.fromtimestamp(source_stat.st_mtime).astimezone().isoformat(timespec="seconds"),
             }
         )
+    for exported_path in files_dir.rglob("*"):
+        if not exported_path.is_file():
+            continue
+        rel = exported_path.relative_to(chat_repo_dir(config))
+        if rel not in expected_exports:
+            exported_path.unlink()
+    remove_empty_directories(files_dir)
     return exported
+
+
+def refresh_chat_markdown_metadata(config: Config, *, update_manifest: bool) -> List[Dict[str, Any]]:
+    repo_dir = chat_repo_dir(config)
+    meta_path = chat_repo_meta_path(config)
+    if not repo_dir.exists() or not meta_path.exists():
+        return []
+    meta = JsonFile.load(meta_path, default_chat_meta(config))
+    markdown_files = sync_chat_markdown_files(config)
+    if meta.get("markdown_files") != markdown_files:
+        meta["markdown_files"] = markdown_files
+        JsonFile.dump(meta_path, meta)
+        if update_manifest:
+            update_chat_manifest(config, meta)
+    return markdown_files
 
 
 def ensure_chat_site(config: Config) -> None:
@@ -893,8 +934,11 @@ def ensure_chat_site(config: Config) -> None:
     chat_repo_index_path(config).write_text(redirect, encoding="utf-8")
     meta_path = chat_repo_meta_path(config)
     meta = JsonFile.load(meta_path, default_chat_meta(config))
-    meta["markdown_files"] = sync_chat_markdown_files(config)
     JsonFile.dump(meta_path, meta)
+    meta["markdown_files"] = refresh_chat_markdown_metadata(config, update_manifest=False)
+    if not meta["markdown_files"]:
+        meta["markdown_files"] = sync_chat_markdown_files(config)
+        JsonFile.dump(meta_path, meta)
     update_chat_manifest(config, meta)
 
 
@@ -1761,12 +1805,15 @@ def wait_for_path(
     role: str,
     state_name: str,
     log_path: Path,
+    poll_callback: Optional[Callable[[], None]] = None,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     pane_exit_grace_seconds = 1.0
     while True:
         if path.exists():
             return
+        if poll_callback is not None:
+            poll_callback()
         if pane_is_dead(pane_id):
             grace_deadline = time.monotonic() + pane_exit_grace_seconds
             while time.monotonic() < grace_deadline:
@@ -1781,6 +1828,32 @@ def wait_for_path(
                 f"Timed out after {timeout_seconds:.1f}s waiting for {role} {state_name}. See {log_path}"
             )
         time.sleep(0.2)
+
+
+class ChatMarkdownRefresher:
+    def __init__(self, config: Config, *, interval_seconds: float = 2.0):
+        self.config = config
+        self.interval_seconds = interval_seconds
+        self.next_refresh_at = 0.0
+        self.last_warning: Optional[str] = None
+
+    def maybe_refresh(self, *, force: bool = False) -> None:
+        if not chat_repo_meta_path(self.config).exists():
+            return
+        now = time.monotonic()
+        if not force and now < self.next_refresh_at:
+            return
+        try:
+            refresh_chat_markdown_metadata(self.config, update_manifest=False)
+        except Exception as exc:
+            message = str(exc)
+            if message != self.last_warning:
+                print(f"[chat-export] warning: could not refresh markdown files: {message}", file=sys.stderr)
+                self.last_warning = message
+            self.next_refresh_at = now + self.interval_seconds
+            return
+        self.last_warning = None
+        self.next_refresh_at = now + self.interval_seconds
 
 
 def launch_tmux_burst(adapter: ProviderAdapter, cycle: int, prompt: str) -> Dict[str, Any]:
@@ -1834,6 +1907,7 @@ def launch_tmux_burst(adapter: ProviderAdapter, cycle: int, prompt: str) -> Dict
     print(f"Attach with: tmux attach -t {session}")
     captured_text = ""
     completed = False
+    chat_markdown_refresher = ChatMarkdownRefresher(adapter.config)
     try:
         wait_for_path(
             start_file,
@@ -1842,6 +1916,7 @@ def launch_tmux_burst(adapter: ProviderAdapter, cycle: int, prompt: str) -> Dict
             role=adapter.role,
             state_name="startup marker",
             log_path=per_cycle_log,
+            poll_callback=chat_markdown_refresher.maybe_refresh,
         )
         wait_for_path(
             exit_file,
@@ -1850,11 +1925,13 @@ def launch_tmux_burst(adapter: ProviderAdapter, cycle: int, prompt: str) -> Dict
             role=adapter.role,
             state_name="exit marker",
             log_path=per_cycle_log,
+            poll_callback=chat_markdown_refresher.maybe_refresh,
         )
         completed = True
     finally:
         # Let tmux flush pane output to pipe-pane target.
         time.sleep(0.3)
+        chat_markdown_refresher.maybe_refresh(force=True)
         capture = tmux_cmd("capture-pane", "-p", "-t", pane_id, "-S", "-2000", check=False)
         captured_text = capture.stdout if capture.returncode == 0 else ""
         latest_log.write_text(read_text(per_cycle_log), encoding="utf-8")

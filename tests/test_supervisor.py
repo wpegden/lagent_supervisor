@@ -397,6 +397,40 @@ class WorkflowTests(SupervisorTestCase):
         first_event = json.loads(lines[0])
         self.assertEqual(first_event["kind"], "worker_prompt")
 
+    def test_refresh_chat_markdown_metadata_updates_stale_export(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="planning")
+        supervisor.ensure_repo_files(config, "planning")
+        plan_path = repo_path / "PLAN.md"
+        plan_path.write_text("# High-Level Plan\n\n- First draft.\n", encoding="utf-8")
+
+        state = {"phase": "planning", "cycle": 1, "awaiting_human_input": False}
+        supervisor.record_chat_event(
+            config,
+            state,
+            cycle=1,
+            phase="planning",
+            kind="worker_prompt",
+            actor="supervisor",
+            target="worker",
+            content="Plan the project.",
+            content_type="text",
+        )
+
+        exported_plan = chat_root / config.chat.repo_name / "files" / "repo" / "PLAN.md"
+        self.assertEqual(exported_plan.read_text(encoding="utf-8"), "# High-Level Plan\n\n- First draft.\n")
+
+        time.sleep(0.02)
+        plan_path.write_text("# Formalization Plan\n\n- Expanded plan.\n", encoding="utf-8")
+        supervisor.refresh_chat_markdown_metadata(config, update_manifest=False)
+
+        self.assertEqual(exported_plan.read_text(encoding="utf-8"), "# Formalization Plan\n\n- Expanded plan.\n")
+        meta = json.loads((chat_root / config.chat.repo_name / "meta.json").read_text(encoding="utf-8"))
+        plan_entry = next(entry for entry in meta["markdown_files"] if entry["label"] == "PLAN.md")
+        self.assertIn("Expanded plan", exported_plan.read_text(encoding="utf-8"))
+        self.assertTrue(plan_entry["updated_at"])
+
 
 class ProviderContextTests(SupervisorTestCase):
     def test_install_personal_provider_context_files(self) -> None:
