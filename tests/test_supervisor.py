@@ -1,4 +1,5 @@
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -150,6 +151,76 @@ class CommandTests(SupervisorTestCase):
         self.assertNotIn("--sandbox", continued)
         self.assertNotIn("--color", continued)
 
+    def test_gemini_includes_repo_and_state_dirs_in_workspace(self) -> None:
+        repo_path = self.make_repo()
+        base_config = self.make_config(repo_path)
+        state_dir = repo_path.parent / "external-state"
+        config = supervisor.Config(
+            repo_path=base_config.repo_path,
+            goal_file=base_config.goal_file,
+            state_dir=state_dir,
+            worker=supervisor.ProviderConfig(
+                provider="gemini",
+                model="gemini-3.1-pro-preview",
+                extra_args=[],
+            ),
+            reviewer=base_config.reviewer,
+            tmux=base_config.tmux,
+            workflow=base_config.workflow,
+            chat=base_config.chat,
+            git=base_config.git,
+            max_cycles=base_config.max_cycles,
+            sleep_seconds=base_config.sleep_seconds,
+            startup_timeout_seconds=base_config.startup_timeout_seconds,
+            burst_timeout_seconds=base_config.burst_timeout_seconds,
+        )
+        adapter = supervisor.GeminiAdapter(config.worker, "worker", config, {})
+
+        initial = adapter.build_initial_command()
+
+        self.assertIn("--include-directories", initial)
+        include_value = initial[initial.index("--include-directories") + 1]
+        include_dirs = include_value.split(",")
+        self.assertIn(str(state_dir), include_dirs)
+        self.assertNotIn(str(repo_path), include_dirs)
+
+    def test_gemini_burst_script_runs_in_repo_with_role_scoped_home(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config = supervisor.Config(
+            repo_path=config.repo_path,
+            goal_file=config.goal_file,
+            state_dir=config.state_dir,
+            worker=supervisor.ProviderConfig(
+                provider="gemini",
+                model="gemini-3.1-pro-preview",
+                extra_args=[],
+            ),
+            reviewer=config.reviewer,
+            tmux=config.tmux,
+            workflow=config.workflow,
+            chat=config.chat,
+            git=config.git,
+            max_cycles=config.max_cycles,
+            sleep_seconds=config.sleep_seconds,
+            startup_timeout_seconds=config.startup_timeout_seconds,
+            burst_timeout_seconds=config.burst_timeout_seconds,
+        )
+        adapter = supervisor.GeminiAdapter(config.worker, "worker", config, {})
+
+        script_path = supervisor.build_burst_script(
+            adapter,
+            1,
+            config.state_dir / "prompt.txt",
+            config.state_dir / "start.txt",
+            config.state_dir / "exit.txt",
+        )
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn(f"WORK_DIR={shlex.quote(str(repo_path))}", script_text)
+        self.assertIn(f"export GEMINI_CLI_HOME={shlex.quote(str(config.state_dir / 'scopes' / 'gemini-worker'))}", script_text)
+        self.assertLess(script_text.index("export GEMINI_CLI_HOME="), script_text.index("cmd=("))
+
     def test_determine_resume_cycle_and_stage_starts_new_cycle_after_completed_review(self) -> None:
         cycle, stage = supervisor.determine_resume_cycle_and_stage(
             {
@@ -168,6 +239,11 @@ class CommandTests(SupervisorTestCase):
                 "last_validation": {"cycle": 11},
             }
         )
+
+        self.assertEqual((cycle, stage), (12, "worker"))
+
+    def test_determine_resume_cycle_and_stage_retries_worker_when_no_review_has_run(self) -> None:
+        cycle, stage = supervisor.determine_resume_cycle_and_stage({"cycle": 12})
 
         self.assertEqual((cycle, stage), (12, "worker"))
 
@@ -272,6 +348,36 @@ class CommandTests(SupervisorTestCase):
         self.assertIn("paper-facing interface", prompt)
         self.assertIn("separate support files", prompt)
         self.assertIn("short wrappers around results proved elsewhere", prompt)
+
+    def test_gemini_worker_prompt_uses_repo_root_paths(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config = supervisor.Config(
+            repo_path=config.repo_path,
+            goal_file=config.goal_file,
+            state_dir=config.state_dir,
+            worker=supervisor.ProviderConfig(
+                provider="gemini",
+                model="gemini-3.1-pro-preview",
+                extra_args=[],
+            ),
+            reviewer=config.reviewer,
+            tmux=config.tmux,
+            workflow=config.workflow,
+            chat=config.chat,
+            git=config.git,
+            max_cycles=config.max_cycles,
+            sleep_seconds=config.sleep_seconds,
+            startup_timeout_seconds=config.startup_timeout_seconds,
+            burst_timeout_seconds=config.burst_timeout_seconds,
+        )
+
+        prompt = supervisor.build_worker_prompt(config, {}, "paper_check", True)
+
+        self.assertIn("Goal file: GOAL.md", prompt)
+        self.assertIn("write your handoff JSON to `.agent-supervisor/worker_handoff.json`", prompt)
+        self.assertIn(".agent-supervisor/scopes/gemini-worker/GEMINI.md", prompt)
+        self.assertNotIn("Goal file: repo/GOAL.md", prompt)
 
     def test_worker_prompt_includes_active_stuck_recovery_guidance(self) -> None:
         repo_path = self.make_repo()

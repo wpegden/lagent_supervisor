@@ -689,6 +689,78 @@ def role_scope_dir(config: Config, provider: str, role: str) -> Path:
     return scope
 
 
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def gemini_include_directories(config: Config, scope_dir: Path) -> List[Path]:
+    candidates = [config.repo_path, config.state_dir]
+    if config.workflow.paper_tex_path is not None:
+        candidates.append(config.workflow.paper_tex_path.parent)
+    candidates.extend(
+        [
+            config.goal_file.parent,
+            config.workflow.approved_axioms_path.parent,
+            config.workflow.human_input_path.parent,
+            config.workflow.input_request_path.parent,
+        ]
+    )
+    include_dirs: List[Path] = []
+    resolved_scope = scope_dir.resolve()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved == resolved_scope:
+            continue
+        if any(path_is_within(resolved, existing) for existing in include_dirs):
+            continue
+        include_dirs = [existing for existing in include_dirs if not path_is_within(existing, resolved)]
+        include_dirs.append(resolved)
+        if len(include_dirs) >= 5:
+            break
+    return include_dirs
+
+
+def repo_prompt_label(config: Config, provider: str, path: Path) -> str:
+    if provider == "gemini":
+        try:
+            return path.resolve().relative_to(config.repo_path).as_posix()
+        except ValueError:
+            return str(path.resolve())
+    return relative_repo_label(config, path)
+
+
+def supervisor_prompt_label(config: Config, provider: str, path: Path) -> str:
+    if provider == "gemini":
+        try:
+            return path.resolve().relative_to(config.repo_path).as_posix()
+        except ValueError:
+            return str(path.resolve())
+    try:
+        rel = path.resolve().relative_to(config.state_dir.resolve())
+        return f"supervisor/{rel.as_posix()}"
+    except ValueError:
+        return str(path.resolve())
+
+
+def prepare_gemini_cli_home(scope_dir: Path) -> Path:
+    gemini_home = scope_dir / ".gemini"
+    gemini_home.mkdir(parents=True, exist_ok=True)
+    source_home = Path.home() / ".gemini"
+    for name in ("oauth_creds.json", "google_accounts.json", "installation_id", "settings.json", "trustedFolders.json"):
+        source = source_home / name
+        if not source.exists():
+            continue
+        target = gemini_home / name
+        if target.exists():
+            continue
+        shutil.copy2(source, target)
+    return scope_dir
+
+
 def tmux_cmd(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["tmux", *args], text=True, capture_output=True, check=check)
 
@@ -991,6 +1063,12 @@ class ProviderAdapter:
     def scope_dir(self) -> Path:
         return role_scope_dir(self.config, self.cfg.provider, self.role)
 
+    def work_dir(self) -> Path:
+        return self.scope_dir()
+
+    def burst_env(self) -> Dict[str, str]:
+        return {}
+
     def needs_initial_run(self) -> bool:
         return not bool(self.role_state().get("initialized"))
 
@@ -1057,8 +1135,17 @@ class GeminiAdapter(ProviderAdapter):
         cmd = ["gemini", "--approval-mode=yolo"]
         if self.cfg.model:
             cmd += ["--model", self.cfg.model]
+        include_dirs = gemini_include_directories(self.config, self.work_dir())
+        if include_dirs:
+            cmd += ["--include-directories", ",".join(str(path) for path in include_dirs)]
         cmd += self.cfg.extra_args
         return cmd
+
+    def work_dir(self) -> Path:
+        return self.config.repo_path
+
+    def burst_env(self) -> Dict[str, str]:
+        return {"GEMINI_CLI_HOME": str(prepare_gemini_cli_home(self.scope_dir()))}
 
     def build_initial_command(self) -> List[str]:
         return self._base() + ["--prompt", PROMPT_TOKEN]
@@ -1136,12 +1223,14 @@ def current_stuck_recovery_attempt_number(state: Dict[str, Any]) -> int:
 
 
 def last_review_cycle(state: Dict[str, Any]) -> int:
-    last_review = state.get("last_review") or {}
-    value = last_review.get("cycle", state.get("cycle", 0))
+    last_review = state.get("last_review")
+    if not isinstance(last_review, dict):
+        return 0
+    value = last_review.get("cycle", 0)
     try:
         return int(value)
     except (TypeError, ValueError):
-        return int(state.get("cycle", 0) or 0)
+        return 0
 
 
 def last_validation_cycle(state: Dict[str, Any]) -> int:
@@ -1291,29 +1380,35 @@ def stuck_recovery_context_text(state: Dict[str, Any]) -> str:
     ).strip()
 
 
-def phase_context_text(config: Config, state: Dict[str, Any], phase: str) -> str:
+def phase_context_text(config: Config, state: Dict[str, Any], phase: str, provider: str) -> str:
+    goal_label = repo_prompt_label(config, provider, config.goal_file)
+    tasks_label = repo_prompt_label(config, provider, config.repo_path / "TASKS.md")
     parts = [
         f"Current phase: {phase}",
         f"Sorry mode: {config.workflow.sorry_mode}",
-        f"Goal file: {relative_repo_label(config, config.goal_file)}",
+        f"Goal file: {goal_label}",
         "Supervisor-managed files:",
-        "- `repo/TASKS.md` always exists and is shared with the supervisor.",
+        f"- `{tasks_label}` always exists and is shared with the supervisor.",
     ]
     if config.workflow.paper_tex_path is not None:
-        parts.append(f"- Paper tex: `{relative_repo_label(config, config.workflow.paper_tex_path)}`")
+        parts.append(f"- Paper tex: `{repo_prompt_label(config, provider, config.workflow.paper_tex_path)}`")
     if phase_uses_paper_notes(phase):
-        parts.append("- `repo/PAPERNOTES.md` is where paper corrections and clarifications belong.")
+        parts.append(
+            f"- `{repo_prompt_label(config, provider, config.repo_path / 'PAPERNOTES.md')}` is where paper corrections and clarifications belong."
+        )
     if phase_uses_plan(phase):
-        parts.append("- `repo/PLAN.md` is the durable formalization roadmap.")
+        parts.append(f"- `{repo_prompt_label(config, provider, config.repo_path / 'PLAN.md')}` is the durable formalization roadmap.")
     if phase_uses_statement_files(phase):
-        parts.append("- `repo/PaperDefinitions.lean` and `repo/PaperTheorems.lean` are the target statement files.")
-    parts.append(f"- Approved axioms file: `{relative_repo_label(config, config.workflow.approved_axioms_path)}`")
+        definitions_label = repo_prompt_label(config, provider, config.repo_path / "PaperDefinitions.lean")
+        theorems_label = repo_prompt_label(config, provider, config.repo_path / "PaperTheorems.lean")
+        parts.append(f"- `{definitions_label}` and `{theorems_label}` are the target statement files.")
+    parts.append(f"- Approved axioms file: `{repo_prompt_label(config, provider, config.workflow.approved_axioms_path)}`")
     if git_is_enabled(config):
         parts.append(
             f"- Git remote: `{config.git.remote_name}` -> `{config.git.remote_url}` on branch `{current_git_branch(config)}`."
         )
         parts.append(f"- Push command when you made progress: `{git_push_command(config)}`")
-    parts.append(f"- Validation summary file: `supervisor/{validation_summary_path(config).name}`")
+    parts.append(f"- Validation summary file: `{supervisor_prompt_label(config, provider, validation_summary_path(config))}`")
     latest_validation = state.get("last_validation")
     if latest_validation:
         parts.append("Latest supervisor validation summary:")
@@ -1322,7 +1417,7 @@ def phase_context_text(config: Config, state: Dict[str, Any], phase: str) -> str
         parts.append("Latest supervisor validation summary: none yet.")
     human_input_text = trim_text(read_text(config.workflow.human_input_path).strip(), 6000)
     if human_input_text:
-        parts.append(f"Latest human input from `{relative_repo_label(config, config.workflow.human_input_path)}`:")
+        parts.append(f"Latest human input from `{repo_prompt_label(config, provider, config.workflow.human_input_path)}`:")
         parts.append(human_input_text)
     stuck_recovery_text = stuck_recovery_context_text(state)
     if stuck_recovery_text:
@@ -1332,30 +1427,39 @@ def phase_context_text(config: Config, state: Dict[str, Any], phase: str) -> str
     return "\n".join(parts)
 
 
-def phase_worker_instructions(config: Config, phase: str) -> str:
-    paper_label = relative_repo_label(config, config.workflow.paper_tex_path) if config.workflow.paper_tex_path else "the paper tex file"
+def phase_worker_instructions(config: Config, phase: str, provider: str) -> str:
+    paper_label = (
+        repo_prompt_label(config, provider, config.workflow.paper_tex_path)
+        if config.workflow.paper_tex_path
+        else "the paper tex file"
+    )
+    tasks_label = repo_prompt_label(config, provider, config.repo_path / "TASKS.md")
+    papernotes_label = repo_prompt_label(config, provider, config.repo_path / "PAPERNOTES.md")
+    plan_label = repo_prompt_label(config, provider, config.repo_path / "PLAN.md")
+    definitions_label = repo_prompt_label(config, provider, config.repo_path / "PaperDefinitions.lean")
+    theorems_label = repo_prompt_label(config, provider, config.repo_path / "PaperTheorems.lean")
     if phase == "paper_check":
         return textwrap.dedent(
             f"""\
             Phase objective: carefully read `{paper_label}` and mathematically verify the paper's proofs.
 
             Requirements:
-            - Maintain `repo/TASKS.md`.
-            - Maintain `repo/PAPERNOTES.md` with corrections, hidden assumptions, and proof clarifications.
+            - Maintain `{tasks_label}`.
+            - Maintain `{papernotes_label}` with corrections, hidden assumptions, and proof clarifications.
             - Read the paper carefully enough to catch proof gaps or incorrect statements.
             - Report `STUCK` only if you find a genuine gap or incorrect statement, try to repair it seriously, and still cannot make the argument work.
-            - Report `DONE` only when the whole paper has been checked and `PAPERNOTES.md` is up to date.
+            - Report `DONE` only when the whole paper has been checked and `{papernotes_label}` is up to date.
             """
         ).strip()
     if phase == "planning":
         return textwrap.dedent(
             f"""\
-            Phase objective: create a high-level but comprehensive `repo/PLAN.md` for formalizing the main results of `{paper_label}`.
+            Phase objective: create a high-level but comprehensive `{plan_label}` for formalizing the main results of `{paper_label}`.
 
             Requirements:
-            - Maintain `repo/TASKS.md`.
-            - Maintain `repo/PAPERNOTES.md`.
-            - Build `repo/PLAN.md` around statement prerequisites, reusable definitions, mathlib imports, and plausible proof roadmaps.
+            - Maintain `{tasks_label}`.
+            - Maintain `{papernotes_label}`.
+            - Build `{plan_label}` around statement prerequisites, reusable definitions, mathlib imports, and plausible proof roadmaps.
             - Use `NEED_INPUT` for external results, proposed axioms, or formalization design choices that genuinely need a human decision.
             - Never introduce axioms unless they are explicitly approved by a human and listed in the approved axioms file.
             """
@@ -1366,8 +1470,8 @@ def phase_worker_instructions(config: Config, phase: str) -> str:
             Phase objective: create Lean files that state the paper's definitions and theorems as close to `{paper_label}` as possible.
 
             Requirements:
-            - Maintain `repo/TASKS.md`, `repo/PAPERNOTES.md`, and `repo/PLAN.md`.
-            - Create or update `repo/PaperDefinitions.lean` and `repo/PaperTheorems.lean`.
+            - Maintain `{tasks_label}`, `{papernotes_label}`, and `{plan_label}`.
+            - Create or update `{definitions_label}` and `{theorems_label}`.
             - Keep the definitions and statements easy for a human to compare against the paper.
             - Make both files syntactically valid Lean.
             - Do not introduce unapproved axioms.
@@ -1375,21 +1479,21 @@ def phase_worker_instructions(config: Config, phase: str) -> str:
             """
         ).strip()
     sorry_policy = (
-        "Default sorry policy: do not move on with extra sorrys anywhere outside `repo/PaperTheorems.lean`."
+        f"Default sorry policy: do not move on with extra sorrys anywhere outside `{theorems_label}`."
         if config.workflow.sorry_mode == "default"
         else "Sorrys-allowed mode: temporary extra sorrys are allowed, but you must drive the count down and remove them all by the end."
     )
     return textwrap.dedent(
-        """\
-        Phase objective: prove the target statements presented in `repo/PaperTheorems.lean`.
+        f"""\
+        Phase objective: prove the target statements presented in `{theorems_label}`.
 
         Requirements:
-        - Maintain `repo/TASKS.md` and `repo/PLAN.md`.
-        - Keep `repo/PaperDefinitions.lean` and `repo/PaperTheorems.lean` as the paper-facing interface for definitions and theorem statements.
+        - Maintain `{tasks_label}` and `{plan_label}`.
+        - Keep `{definitions_label}` and `{theorems_label}` as the paper-facing interface for definitions and theorem statements.
         - Prefer reusable lemmas, technical definitions, and proof infrastructure in separate support files when that yields a cleaner project structure.
-        - It is fine for proofs in `repo/PaperTheorems.lean` to be short wrappers around results proved elsewhere in the repo.
+        - It is fine for proofs in `{theorems_label}` to be short wrappers around results proved elsewhere in the repo.
         - Work toward zero sorrys and no unapproved axioms.
-        - Keep the proof frontier concrete in `TASKS.md`.
+        - Keep the proof frontier concrete in `{tasks_label}`.
         """
     ).strip() + "\n- " + sorry_policy + "\n- `DONE` means the full workflow is complete."
 
@@ -1418,7 +1522,11 @@ def provider_context_worker_instructions(config: Config) -> str:
         context_path = ".agents/skills/lean-formalizer/SKILL.md"
         context_label = "the installed `lean-formalizer` skill"
     elif provider == "gemini":
-        context_path = "GEMINI.md"
+        context_path = supervisor_prompt_label(
+            config,
+            provider,
+            role_scope_dir(config, "gemini", "worker") / "GEMINI.md",
+        )
         context_label = "the installed Lean formalization context file"
     else:
         context_path = "the installed provider context file"
@@ -1470,6 +1578,7 @@ def build_worker_prompt(config: Config, state: Dict[str, Any], phase: str, is_in
         )
     provider_notes = provider_context_worker_instructions(config)
     git_notes = git_worker_instructions(config)
+    worker_handoff_label = supervisor_prompt_label(config, config.worker.provider, config.state_dir / "worker_handoff.json")
     return textwrap.dedent(
         f"""\
         You are the main formalization worker.
@@ -1479,14 +1588,14 @@ def build_worker_prompt(config: Config, state: Dict[str, Any], phase: str, is_in
         Global goal:
         {goal_text}
 
-        {phase_context_text(config, state, phase)}
+        {phase_context_text(config, state, phase, config.worker.provider)}
 
         {review_guidance}{stuck_recovery_notes}{provider_notes}
-        {phase_worker_instructions(config, phase)}
+        {phase_worker_instructions(config, phase, config.worker.provider)}
         {git_notes}
 
         Before ending this turn:
-        - write your handoff JSON to `supervisor/worker_handoff.json`
+        - write your handoff JSON to `{worker_handoff_label}`
         - also print the same JSON as the final thing in your terminal output
 
         Your handoff JSON must have exactly these keys:
@@ -1564,6 +1673,9 @@ def build_reviewer_prompt(
         if include_terminal_output
         else "[omitted from the web transcript; raw terminal output is only kept in local logs]"
     )
+    worker_handoff_label = supervisor_prompt_label(config, config.reviewer.provider, config.state_dir / "worker_handoff.json")
+    validation_label = supervisor_prompt_label(config, config.reviewer.provider, validation_summary_path(config))
+    review_decision_label = supervisor_prompt_label(config, config.reviewer.provider, config.state_dir / "review_decision.json")
     return textwrap.dedent(
         f"""\
         You are the review agent supervising the worker.
@@ -1573,15 +1685,15 @@ def build_reviewer_prompt(
         Global goal:
         {goal_text}
 
-        {phase_context_text(config, state, phase)}
+        {phase_context_text(config, state, phase, config.reviewer.provider)}
 
         Recent reviewer decisions:
         {json.dumps(recent_reviews, indent=2, ensure_ascii=False) if recent_reviews else "[]"}
 
-        Worker handoff JSON from `supervisor/worker_handoff.json`:
+        Worker handoff JSON from `{worker_handoff_label}`:
         {worker_handoff_text}
 
-        Supervisor validation summary from `supervisor/{validation_summary_path(config).name}`:
+        Supervisor validation summary from `{validation_label}`:
         {trim_text(json.dumps(validation_summary, indent=2, ensure_ascii=False), 16000)}
 
         Worker's latest terminal output:
@@ -1590,7 +1702,7 @@ def build_reviewer_prompt(
         {phase_reviewer_instructions(config, phase)}
 
         Before ending this turn:
-        - write your decision JSON to `supervisor/review_decision.json`
+        - write your decision JSON to `{review_decision_label}`
         - also print the same JSON as the final thing in your terminal output
 
         Return exactly this JSON shape:
@@ -1636,6 +1748,9 @@ def build_stuck_recovery_prompt(
         for attempt in attempts
     ]
     preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
+    worker_handoff_label = supervisor_prompt_label(config, config.reviewer.provider, config.state_dir / "worker_handoff.json")
+    validation_label = supervisor_prompt_label(config, config.reviewer.provider, validation_summary_path(config))
+    stuck_recovery_label = supervisor_prompt_label(config, config.reviewer.provider, stuck_recovery_suggestion_path(config))
     return textwrap.dedent(
         f"""\
         You are temporarily acting as the supervisor's stuck-recovery reviewer.
@@ -1649,7 +1764,7 @@ def build_stuck_recovery_prompt(
         Global goal:
         {goal_text}
 
-        {phase_context_text(config, state, phase)}
+        {phase_context_text(config, state, phase, config.reviewer.provider)}
 
         Triggering stuck review:
         {json.dumps(last_review, indent=2, ensure_ascii=False)}
@@ -1657,10 +1772,10 @@ def build_stuck_recovery_prompt(
         Prior stuck-recovery attempts for this same stuck episode:
         {json.dumps(prior_attempts, indent=2, ensure_ascii=False) if prior_attempts else "[]"}
 
-        Worker handoff JSON from `supervisor/worker_handoff.json`:
+        Worker handoff JSON from `{worker_handoff_label}`:
         {worker_handoff_text}
 
-        Supervisor validation summary from `supervisor/{validation_summary_path(config).name}`:
+        Supervisor validation summary from `{validation_label}`:
         {trim_text(json.dumps(validation_summary, indent=2, ensure_ascii=False), 16000)}
 
         Worker's latest terminal output:
@@ -1674,7 +1789,7 @@ def build_stuck_recovery_prompt(
         - If the best idea is an explicit route change, say so directly and explain why it is different from the failed route.
 
         Before ending this turn:
-        - write your recovery JSON to `supervisor/{stuck_recovery_suggestion_path(config).name}`
+        - write your recovery JSON to `{stuck_recovery_label}`
         - also print the same JSON as the final thing in your terminal output
 
         Return exactly this JSON shape:
@@ -1959,7 +2074,8 @@ def build_burst_script(
     safe_script_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", script_tag).strip("-") if script_tag else None
     script_stem = f"{adapter.role}-{safe_script_tag}" if safe_script_tag else f"{adapter.role}-cycle-{cycle:04d}"
     script_path = runtime_dir / f"{script_stem}.sh"
-    scope_dir = adapter.scope_dir()
+    work_dir = adapter.work_dir()
+    env_vars = adapter.burst_env()
 
     lines = [
         "#!/usr/bin/env bash",
@@ -1967,20 +2083,22 @@ def build_burst_script(
         f"START_FILE={shlex.quote(str(start_file))}",
         f"EXIT_FILE={shlex.quote(str(exit_file))}",
         f"PROMPT_FILE={shlex.quote(str(prompt_file))}",
-        f"SCOPE_DIR={shlex.quote(str(scope_dir))}",
+        f"WORK_DIR={shlex.quote(str(work_dir))}",
         "cleanup() {",
         "  ec=$?",
         "  printf '%s\n' \"$ec\" > \"$EXIT_FILE\"",
         "  exit \"$ec\"",
         "}",
         "trap cleanup EXIT",
-        "cd \"$SCOPE_DIR\"",
+        "cd \"$WORK_DIR\"",
         "printf '%s\n' \"$(date -Is)\" > \"$START_FILE\"",
         "PROMPT_CONTENT=$(cat \"$PROMPT_FILE\")",
         f"echo '[agent-burst] role={adapter.role} provider={adapter.cfg.provider} cwd='\"$PWD\"",
         "echo '[agent-burst] start='$(date -Is)",
-        "cmd=(",
     ]
+    for key, value in env_vars.items():
+        lines.append(f"export {key}={shlex.quote(value)}")
+    lines.append("cmd=(")
     for arg in adapter.current_command():
         lines.append(f"  {shlex.quote(arg)}")
     lines += [
