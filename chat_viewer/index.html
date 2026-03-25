@@ -58,6 +58,18 @@
         </label>
       </section>
 
+      <section id="branch-panel" class="branch-panel" hidden>
+        <div class="branch-panel-header">
+          <div>
+            <p class="eyebrow">Branch Tree</p>
+            <h3 id="branch-title">No branching yet</h3>
+            <p id="branch-meta" class="subtle"></p>
+          </div>
+        </div>
+        <div id="branch-current-path" class="branch-current-path"></div>
+        <div id="branch-episodes" class="branch-episodes"></div>
+      </section>
+
       <section id="empty-state" class="empty-state">
         <h3>No transcript data yet</h3>
         <p>Run the supervisor once for a repo and refresh this page.</p>
@@ -66,22 +78,6 @@
       <section id="transcript" class="transcript" hidden></section>
     </main>
   </div>
-
-  <template id="event-template">
-    <article class="event-card">
-      <div class="event-header">
-        <div>
-          <p class="event-badges"></p>
-          <h3 class="event-title"></h3>
-        </div>
-        <time class="event-time"></time>
-      </div>
-      <details class="event-details">
-        <summary>Show content</summary>
-        <pre class="event-content"></pre>
-      </details>
-    </article>
-  </template>
 
   <script src="_assets/app.js" defer></script>
 </body>

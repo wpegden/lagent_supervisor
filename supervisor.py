@@ -14,7 +14,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -35,11 +35,15 @@ PHASES: Tuple[str, ...] = (
 )
 WORKER_STATUSES: Tuple[str, ...] = ("NOT_STUCK", "STUCK", "DONE", "NEED_INPUT")
 REVIEWER_DECISIONS: Tuple[str, ...] = ("CONTINUE", "ADVANCE_PHASE", "STUCK", "NEED_INPUT", "DONE")
+BRANCH_STRATEGY_DECISIONS: Tuple[str, ...] = ("NO_BRANCH", "BRANCH")
+BRANCH_SELECTION_DECISIONS: Tuple[str, ...] = ("CONTINUE_BRANCHING", "SELECT_BRANCH")
 SORRY_MODES: Tuple[str, ...] = ("default", "allowed")
 SUPERVISOR_TASKS_START = "<!-- SUPERVISOR_TASKS:START -->"
 SUPERVISOR_TASKS_END = "<!-- SUPERVISOR_TASKS:END -->"
 SUPERVISOR_GITIGNORE_START = "# >>> lagent-supervisor >>>"
 SUPERVISOR_GITIGNORE_END = "# <<< lagent-supervisor <<<"
+DEFAULT_BRANCH_EVALUATION_CYCLES = 20
+DEFAULT_BRANCH_POLL_SECONDS = 300.0
 
 
 class SupervisorError(RuntimeError):
@@ -87,6 +91,13 @@ class GitConfig:
 
 
 @dataclass
+class BranchingConfig:
+    max_current_branches: int = 2
+    evaluation_cycle_budget: int = DEFAULT_BRANCH_EVALUATION_CYCLES
+    poll_seconds: float = DEFAULT_BRANCH_POLL_SECONDS
+
+
+@dataclass
 class Config:
     repo_path: Path
     goal_file: Path
@@ -101,6 +112,7 @@ class Config:
     sleep_seconds: float
     startup_timeout_seconds: float
     burst_timeout_seconds: float
+    branching: BranchingConfig = field(default_factory=BranchingConfig)
 
 
 class JsonFile:
@@ -214,6 +226,19 @@ def load_config(path: Path) -> Config:
     if not git_author_email:
         git_author_email = default_git_author_email(git_author_name)
 
+    branching_block = raw.get("branching", {})
+    max_current_branches = int(branching_block.get("max_current_branches", 2))
+    if max_current_branches < 1:
+        raise SupervisorError("branching.max_current_branches must be at least 1")
+    evaluation_cycle_budget = int(
+        branching_block.get("evaluation_cycle_budget", DEFAULT_BRANCH_EVALUATION_CYCLES)
+    )
+    if evaluation_cycle_budget < 1:
+        raise SupervisorError("branching.evaluation_cycle_budget must be at least 1")
+    poll_seconds = float(branching_block.get("poll_seconds", DEFAULT_BRANCH_POLL_SECONDS))
+    if poll_seconds <= 0:
+        raise SupervisorError("branching.poll_seconds must be positive")
+
     return Config(
         repo_path=repo_path,
         goal_file=goal_file,
@@ -245,16 +270,29 @@ def load_config(path: Path) -> Config:
         sleep_seconds=float(raw.get("sleep_seconds", 1.0)),
         startup_timeout_seconds=float(raw.get("startup_timeout_seconds", 15.0)),
         burst_timeout_seconds=float(raw.get("burst_timeout_seconds", 7200.0)),
+        branching=BranchingConfig(
+            max_current_branches=max_current_branches,
+            evaluation_cycle_budget=evaluation_cycle_budget,
+            poll_seconds=poll_seconds,
+        ),
     )
 
 
 def check_dependencies(config: Config) -> None:
     required = ["tmux"]
-    if config.git.remote_url:
+    if config.git.remote_url or branching_enabled(config):
         required.append("git")
     for exe in required:
         if subprocess.run(["bash", "-lc", f"command -v {shlex.quote(exe)} >/dev/null 2>&1"], check=False).returncode != 0:
             raise SupervisorError(f"Required executable not found on PATH: {exe}")
+
+
+def branching_enabled(config: Config) -> bool:
+    return config.branching.max_current_branches > 1
+
+
+def branch_review_budget(config: Config) -> int:
+    return config.branching.evaluation_cycle_budget
 
 
 def phase_index(phase: str) -> int:
@@ -671,6 +709,7 @@ def role_scope_dir(config: Config, provider: str, role: str) -> Path:
     links = {
         "repo": config.repo_path,
         "supervisor": config.state_dir,
+        ".agent-supervisor": config.state_dir,
     }
     for name, target in links.items():
         link = scope / name
@@ -734,16 +773,18 @@ def repo_prompt_label(config: Config, provider: str, path: Path) -> str:
 
 
 def supervisor_prompt_label(config: Config, provider: str, path: Path) -> str:
-    if provider == "gemini":
-        try:
-            return path.resolve().relative_to(config.repo_path).as_posix()
-        except ValueError:
-            return str(path.resolve())
     try:
-        rel = path.resolve().relative_to(config.state_dir.resolve())
-        return f"supervisor/{rel.as_posix()}"
+        return path.resolve().relative_to(config.repo_path.resolve()).as_posix()
     except ValueError:
         return str(path.resolve())
+
+
+def legacy_supervisor_artifact_paths(config: Config, path: Path) -> List[Path]:
+    try:
+        rel = path.resolve().relative_to(config.state_dir.resolve())
+    except ValueError:
+        return []
+    return [config.repo_path / "supervisor" / rel]
 
 
 def prepare_gemini_cli_home(scope_dir: Path) -> Path:
@@ -876,7 +917,129 @@ def default_chat_meta(config: Config) -> Dict[str, Any]:
         "last_reviewer_decision": None,
         "awaiting_human_input": False,
         "markdown_files": [],
+        "branch_overview": None,
     }
+
+
+def branch_lineage_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    lineage = state.get("branch_lineage")
+    if not isinstance(lineage, list):
+        return []
+    results: List[Dict[str, Any]] = []
+    for entry in lineage:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("branch_name", "")).strip()
+        episode_id = str(entry.get("episode_id", "")).strip()
+        if not name or not episode_id:
+            continue
+        results.append(
+            {
+                "episode_id": episode_id,
+                "branch_name": name,
+                "summary": str(entry.get("summary", "")).strip(),
+                "rewrite_scope": str(entry.get("rewrite_scope", "")).strip(),
+            }
+        )
+    return results
+
+
+def branch_overview(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    lineage = branch_lineage_entries(state)
+    history = state.get("branch_history")
+    if not isinstance(history, list):
+        history = []
+    active = active_branch_episode(state)
+    if not lineage and not history and active is None:
+        return None
+
+    current_lineage_map = {entry["episode_id"]: entry["branch_name"] for entry in lineage}
+    episodes_raw: List[Dict[str, Any]] = [entry for entry in history if isinstance(entry, dict)]
+    if active is not None:
+        episodes_raw.append(active)
+
+    episodes: List[Dict[str, Any]] = []
+    for raw_episode in episodes_raw:
+        episode_id = str(raw_episode.get("id", "")).strip()
+        if not episode_id:
+            continue
+        episode_lineage = raw_episode.get("lineage")
+        if not isinstance(episode_lineage, list):
+            episode_lineage = []
+        ancestor_branch_names = [
+            str(entry.get("branch_name", "")).strip()
+            for entry in episode_lineage
+            if isinstance(entry, dict) and str(entry.get("branch_name", "")).strip()
+        ]
+        selected_branch = str(raw_episode.get("selected_branch", "")).strip()
+        status = str(raw_episode.get("status", "")).strip() or "active"
+        branches_payload: List[Dict[str, Any]] = []
+        for raw_branch in raw_episode.get("branches", []):
+            if not isinstance(raw_branch, dict):
+                continue
+            branch_name = str(raw_branch.get("name", "")).strip()
+            if not branch_name:
+                continue
+            if status == "active":
+                branch_status = "active"
+            elif selected_branch and branch_name == selected_branch:
+                branch_status = "selected"
+            else:
+                branch_status = "dead"
+            branches_payload.append(
+                {
+                    "name": branch_name,
+                    "summary": str(raw_branch.get("summary", "")).strip(),
+                    "rewrite_scope": str(raw_branch.get("rewrite_scope", "")).strip(),
+                    "status": branch_status,
+                    "is_current_path": current_lineage_map.get(episode_id) == branch_name,
+                    "path_newest_to_oldest": [branch_name, *reversed(ancestor_branch_names), "mainline"],
+                }
+            )
+        episodes.append(
+            {
+                "id": episode_id,
+                "phase": raw_episode.get("phase"),
+                "trigger_cycle": int(raw_episode.get("trigger_cycle", 0) or 0),
+                "status": status,
+                "selected_branch": selected_branch or None,
+                "selection_question": str(raw_episode.get("selection_question", "")).strip(),
+                "lineage_newest_to_oldest": [*reversed(ancestor_branch_names), "mainline"],
+                "branches": branches_payload,
+            }
+        )
+
+    episodes.sort(key=lambda entry: (int(entry.get("trigger_cycle", 0) or 0), str(entry.get("id", ""))), reverse=True)
+
+    current_path_newest_to_oldest = [entry["branch_name"] for entry in reversed(lineage)] + ["mainline"]
+    current_path_status = "alive"
+    for episode in episodes:
+        episode_id = str(episode.get("id", ""))
+        current_branch = current_lineage_map.get(episode_id)
+        if not current_branch:
+            continue
+        if episode.get("status") == "selected" and current_branch != episode.get("selected_branch"):
+            current_path_status = "dead"
+            break
+
+    return {
+        "has_branching": bool(episodes),
+        "current_path_newest_to_oldest": current_path_newest_to_oldest,
+        "current_path_status": current_path_status,
+        "episodes": episodes,
+    }
+
+
+def sync_chat_state_metadata(config: Config, state: Dict[str, Any]) -> None:
+    meta_path = chat_repo_meta_path(config)
+    if not meta_path.exists():
+        return
+    meta = JsonFile.load(meta_path, default_chat_meta(config))
+    overview = branch_overview(state)
+    if meta.get("branch_overview") != overview:
+        meta["branch_overview"] = overview
+        JsonFile.dump(meta_path, meta)
+        update_chat_manifest(config, meta)
 
 
 def update_chat_manifest(config: Config, meta: Dict[str, Any]) -> None:
@@ -1013,6 +1176,8 @@ def ensure_chat_site(config: Config) -> None:
     if not meta["markdown_files"]:
         meta["markdown_files"] = sync_chat_markdown_files(config)
         JsonFile.dump(meta_path, meta)
+    meta["branch_overview"] = branch_overview(load_state(config))
+    JsonFile.dump(meta_path, meta)
     update_chat_manifest(config, meta)
 
 
@@ -1039,6 +1204,14 @@ def summarize_chat_event(kind: str, content: Any) -> str:
         attempt = content.get("attempt", "?")
         suggestion = str(content.get("creative_suggestion", "")).strip()
         return f"Recovery attempt {attempt}: {suggestion}".strip(": ")
+    if kind == "branch_strategy_decision" and isinstance(content, dict):
+        decision = str(content.get("branch_decision", "")).strip()
+        reason = str(content.get("reason", "")).strip()
+        return f"{decision}: {reason}".strip(": ")
+    if kind == "branch_selection_decision" and isinstance(content, dict):
+        decision = str(content.get("selection_decision", "")).strip()
+        reason = str(content.get("reason", "")).strip()
+        return f"{decision}: {reason}".strip(": ")
     return kind.replace("_", " ")
 
 
@@ -1174,12 +1347,19 @@ def load_state(config: Config) -> Dict[str, Any]:
     state.setdefault("awaiting_human_input", False)
     state.setdefault("stuck_recovery_attempts", [])
     state.setdefault("stuck_recovery_last_trigger_cycle", None)
+    state.setdefault("branch_episode_counter", 0)
+    state.setdefault("active_branch_episode", None)
+    state.setdefault("branch_history", [])
+    state.setdefault("branch_context", None)
+    state.setdefault("branch_lineage", [])
+    state.setdefault("last_branch_consideration_cycle", 0)
     current_phase(config, state)
     return state
 
 
 def save_state(config: Config, state: Dict[str, Any]) -> None:
     JsonFile.dump(config.state_dir / "state.json", state)
+    sync_chat_state_metadata(config, state)
 
 
 def phase_specific_worker_statuses(phase: str) -> Sequence[str]:
@@ -1194,6 +1374,128 @@ def phase_specific_reviewer_decisions(phase: str) -> Sequence[str]:
     if phase == "proof_formalization":
         return ("CONTINUE", "STUCK", "DONE")
     return ("CONTINUE", "ADVANCE_PHASE", "STUCK")
+
+
+def active_branch_episode(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    episode = state.get("active_branch_episode")
+    if isinstance(episode, dict):
+        return episode
+    return None
+
+
+def branch_episode_dir(config: Config, episode_id: str) -> Path:
+    return config.state_dir / "branches" / episode_id
+
+
+def branch_strategy_artifact_path(config: Config) -> Path:
+    return config.state_dir / "branch_strategy.json"
+
+
+def branch_selection_artifact_path(config: Config) -> Path:
+    return config.state_dir / "branch_selection.json"
+
+
+def branch_strategy_keywords() -> Dict[str, Tuple[str, ...]]:
+    return {
+        "strong": (
+            "pivot",
+            "route change",
+            "rewrite",
+            "counterexample",
+            "too weak",
+            "too strong",
+            "paper-faithful",
+            "topological route",
+            "combinatorial route",
+            "major refactor",
+            "mismatch",
+        ),
+        "general": (
+            "route",
+            "refactor",
+            "blocked",
+            "repair",
+            "interface bug",
+            "direct route",
+            "backup route",
+            "deleted-spur",
+            "containment",
+            "same-level continuation",
+            "entrance",
+        ),
+    }
+
+
+def branch_strategy_signal_tags(decision: Dict[str, Any]) -> List[str]:
+    text = " ".join(
+        str(decision.get(key, "")).strip().lower()
+        for key in ("reason", "next_prompt")
+    )
+    tags: List[str] = []
+    if str(decision.get("decision", "")).strip().upper() == "STUCK":
+        tags.append("stuck")
+    keywords = branch_strategy_keywords()
+    for category, terms in keywords.items():
+        for term in terms:
+            if term in text:
+                tags.append(f"{category}:{term}")
+    return tags
+
+
+def should_consider_branching(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    decision: Dict[str, Any],
+) -> bool:
+    if not branching_enabled(config):
+        return False
+    if phase != "proof_formalization":
+        return False
+    if active_branch_episode(state):
+        return False
+    cycle = int(decision.get("cycle", state.get("cycle", 0)) or 0)
+    if state.get("last_branch_consideration_cycle") == cycle:
+        return False
+    tags = branch_strategy_signal_tags(decision)
+    if "stuck" in tags:
+        return True
+    strong_tags = [tag for tag in tags if tag.startswith("strong:")]
+    if strong_tags:
+        return True
+    general_tags = {tag for tag in tags if tag.startswith("general:")}
+    return len(general_tags) >= 2
+
+
+def deep_copy_jsonish(data: Any) -> Any:
+    return json.loads(json.dumps(data, ensure_ascii=False))
+
+
+def sanitize_branch_label(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-.")
+    return cleaned or "branch"
+
+
+def branch_review_count(state: Dict[str, Any]) -> int:
+    reviews = state.get("review_log")
+    return len(reviews) if isinstance(reviews, list) else 0
+
+
+def branch_progress_count(branch_state: Dict[str, Any], base_review_count: int) -> int:
+    return max(0, branch_review_count(branch_state) - base_review_count)
+
+
+def branch_episode_preflight_error(config: Config) -> Optional[str]:
+    if not shutil.which("git"):
+        return "git is not available on PATH"
+    if not repo_is_git_repository(config):
+        return "branching requires the repo to already be a git worktree"
+    if not repo_has_git_commits(config):
+        return "branching requires the repo to already have at least one commit"
+    status = git_output(config, ["status", "--short"]).strip()
+    if status:
+        return "branching requires a clean git worktree"
+    return None
 
 
 def format_json_enum(values: Sequence[str]) -> str:
@@ -1380,6 +1682,23 @@ def stuck_recovery_context_text(state: Dict[str, Any]) -> str:
     ).strip()
 
 
+def branch_context_text(state: Dict[str, Any]) -> str:
+    context = state.get("branch_context")
+    if not isinstance(context, dict):
+        return ""
+    return textwrap.dedent(
+        f"""\
+        Active branch strategy:
+        - Episode: {context.get('episode_id', '')}
+        - Branch: {context.get('branch_name', '')}
+        - Summary: {str(context.get('summary', '')).strip()}
+        - Rewrite scope: {str(context.get('rewrite_scope', '')).strip()}
+        - Branch worker prompt: {str(context.get('worker_prompt', '')).strip()}
+        - Why this might eventually succeed: {str(context.get('why_this_might_eventually_succeed', '')).strip()}
+        """
+    ).strip()
+
+
 def phase_context_text(config: Config, state: Dict[str, Any], phase: str, provider: str) -> str:
     goal_label = repo_prompt_label(config, provider, config.goal_file)
     tasks_label = repo_prompt_label(config, provider, config.repo_path / "TASKS.md")
@@ -1422,6 +1741,9 @@ def phase_context_text(config: Config, state: Dict[str, Any], phase: str, provid
     stuck_recovery_text = stuck_recovery_context_text(state)
     if stuck_recovery_text:
         parts.append(stuck_recovery_text)
+    branch_text = branch_context_text(state)
+    if branch_text:
+        parts.append(branch_text)
     approved = approved_axioms(config)
     parts.append(f"Approved axioms: {approved if approved else '[]'}")
     return "\n".join(parts)
@@ -1806,6 +2128,153 @@ def build_stuck_recovery_prompt(
     ).strip()
 
 
+def build_branch_strategy_prompt(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    worker_terminal_output: str,
+    worker_handoff_text: str,
+    validation_summary: Dict[str, Any],
+    last_review: Dict[str, Any],
+    is_initial: bool,
+    *,
+    include_terminal_output: bool = True,
+) -> str:
+    goal_text = read_text(config.goal_file).strip()
+    recent_reviews = state.get("review_log", [])[-6:]
+    terminal_section = (
+        trim_text(worker_terminal_output, 18000)
+        if include_terminal_output
+        else "[omitted from the web transcript; raw terminal output is only kept in local logs]"
+    )
+    worker_handoff_label = supervisor_prompt_label(config, config.reviewer.provider, config.state_dir / "worker_handoff.json")
+    validation_label = supervisor_prompt_label(config, config.reviewer.provider, validation_summary_path(config))
+    branch_strategy_label = supervisor_prompt_label(config, config.reviewer.provider, branch_strategy_artifact_path(config))
+    preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
+    return textwrap.dedent(
+        f"""\
+        You are temporarily acting as the supervisor's branching strategist.
+
+        {preface}
+
+        Your job is to decide whether the current run should stay on one route or split into multiple branches with materially different strategies.
+        A branch is justified only if there are genuinely different routes to try, such as continuing the current proof path versus a major rewrite or route change.
+        Do not branch just because one path is difficult or because two branches would be superficially different.
+
+        Global goal:
+        {goal_text}
+
+        {phase_context_text(config, state, phase, config.reviewer.provider)}
+
+        Latest reviewer decision:
+        {json.dumps(last_review, indent=2, ensure_ascii=False)}
+
+        Recent reviewer decisions:
+        {json.dumps(recent_reviews, indent=2, ensure_ascii=False) if recent_reviews else "[]"}
+
+        Worker handoff JSON from `{worker_handoff_label}`:
+        {worker_handoff_text}
+
+        Supervisor validation summary from `{validation_label}`:
+        {trim_text(json.dumps(validation_summary, indent=2, ensure_ascii=False), 16000)}
+
+        Worker's latest terminal output:
+        {terminal_section}
+
+        Branching policy:
+        - At most {config.branching.max_current_branches} branches may run concurrently in this branch episode.
+        - Branches should be designed to answer the question: which route seems more likely to eventually succeed at formalizing the whole paper?
+        - Do not prefer the route that is merely further along today if it appears structurally flawed.
+        - Prefer branches whose strategies are materially different: e.g. continue current route, major rewrite, alternate theorem route, alternate abstraction.
+        - If no such strategic fork exists yet, return `NO_BRANCH`.
+
+        Before ending this turn:
+        - write your branch-strategy JSON to `{branch_strategy_label}`
+        - also print the same JSON as the final thing in your terminal output
+
+        Return exactly this JSON shape:
+        {{
+          "phase": "{phase}",
+          "branch_decision": "NO_BRANCH" | "BRANCH",
+          "confidence": 0.0,
+          "reason": "brief reason",
+          "strategies": [
+            {{
+              "name": "short-branch-name",
+              "summary": "one-sentence strategy summary",
+              "worker_prompt": "direct branch-specific worker prompt",
+              "why_this_might_eventually_succeed": "why this route could still formalize the whole paper",
+              "rewrite_scope": "incremental" | "major"
+            }}
+          ]
+        }}
+
+        If `branch_decision` is `BRANCH`, include between 2 and {config.branching.max_current_branches} strategies.
+        If `branch_decision` is `NO_BRANCH`, return an empty `strategies` list.
+        """
+    ).strip()
+
+
+def build_branch_selection_prompt(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    episode: Dict[str, Any],
+    branch_snapshots: List[Dict[str, Any]],
+    is_initial: bool,
+) -> str:
+    goal_text = read_text(config.goal_file).strip()
+    selection_label = supervisor_prompt_label(config, config.reviewer.provider, branch_selection_artifact_path(config))
+    preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
+    question = str(
+        episode.get(
+            "selection_question",
+            "Which branch seems more likely to eventually succeed at formalizing the whole paper?",
+        )
+    ).strip()
+    return textwrap.dedent(
+        f"""\
+        You are temporarily acting as the supervisor's branch selector.
+
+        {preface}
+
+        Global goal:
+        {goal_text}
+
+        {phase_context_text(config, state, phase, config.reviewer.provider)}
+
+        Branch episode metadata:
+        {json.dumps(episode, indent=2, ensure_ascii=False)}
+
+        Current branch snapshots:
+        {json.dumps(branch_snapshots, indent=2, ensure_ascii=False)}
+
+        Decision question:
+        {question}
+
+        Requirements:
+        - Judge branches by their likelihood of eventually succeeding at formalizing the whole paper.
+        - Do not default to the branch that is merely furthest along today.
+        - Prefer the branch whose route appears structurally sound and paper-faithful, even if it is temporarily behind.
+        - Return `CONTINUE_BRANCHING` if the evidence is still too weak and the branches should keep running.
+        - Return `SELECT_BRANCH` only if one branch is now clearly the better bet.
+
+        Before ending this turn:
+        - write your branch-selection JSON to `{selection_label}`
+        - also print the same JSON as the final thing in your terminal output
+
+        Return exactly this JSON shape:
+        {{
+          "phase": "{phase}",
+          "selection_decision": "CONTINUE_BRANCHING" | "SELECT_BRANCH",
+          "confidence": 0.0,
+          "reason": "brief reason",
+          "selected_branch": "branch name or empty string"
+        }}
+        """
+    ).strip()
+
+
 def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -1859,6 +2328,7 @@ def record_chat_event(
         meta["last_worker_status"] = content.get("status")
     if kind == "reviewer_decision" and isinstance(content, dict):
         meta["last_reviewer_decision"] = content.get("decision")
+    meta["branch_overview"] = branch_overview(state)
     JsonFile.dump(chat_repo_meta_path(config), meta)
     update_chat_manifest(config, meta)
     return event
@@ -2374,14 +2844,22 @@ def extract_json_object(text: str, required_key: Optional[str] = None) -> Dict[s
     raise SupervisorError("Could not parse JSON object from captured text")
 
 
-def load_json_artifact_with_fallback(path: Path, captured_text: str, required_key: str) -> Dict[str, Any]:
+def load_json_artifact_with_fallback(
+    path: Path,
+    captured_text: str,
+    required_key: str,
+    *,
+    fallback_paths: Sequence[Path] = (),
+) -> Dict[str, Any]:
     errors: List[str] = []
-    if path.exists():
+    for candidate in [path, *fallback_paths]:
+        if not candidate.exists():
+            continue
         try:
-            data = parse_json_object_file(path)
+            data = parse_json_object_file(candidate)
             if required_key in data:
                 return data
-            errors.append(f"Artifact missing required key {required_key!r}: {path}")
+            errors.append(f"Artifact missing required key {required_key!r}: {candidate}")
         except SupervisorError as exc:
             errors.append(str(exc))
     try:
@@ -2437,6 +2915,147 @@ def validate_stuck_recovery_suggestion(phase: str, suggestion: Dict[str, Any]) -
     if not suggestion["worker_prompt"]:
         raise SupervisorError("Stuck-recovery suggestion must include a non-empty worker_prompt.")
     return suggestion
+
+
+def validate_branch_strategy_decision(config: Config, phase: str, decision: Dict[str, Any]) -> Dict[str, Any]:
+    required_keys = {"phase", "branch_decision", "confidence", "reason", "strategies"}
+    missing = required_keys.difference(decision)
+    if missing:
+        raise SupervisorError(f"Branch-strategy decision missing keys: {sorted(missing)}")
+    if str(decision.get("phase")).strip().lower() != phase:
+        raise SupervisorError(
+            f"Branch-strategy decision phase mismatch: expected {phase}, got {decision.get('phase')}"
+        )
+    branch_decision = str(decision.get("branch_decision", "")).strip().upper()
+    if branch_decision not in BRANCH_STRATEGY_DECISIONS:
+        raise SupervisorError(f"Invalid branch_decision {branch_decision!r}")
+    raw_strategies = decision.get("strategies")
+    if not isinstance(raw_strategies, list):
+        raise SupervisorError("Branch-strategy decision strategies must be a list.")
+    strategies: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for raw in raw_strategies:
+        if not isinstance(raw, dict):
+            raise SupervisorError("Each branch strategy must be an object.")
+        for key in ("name", "summary", "worker_prompt", "why_this_might_eventually_succeed", "rewrite_scope"):
+            if key not in raw:
+                raise SupervisorError(f"Branch strategy missing key {key!r}.")
+        name = sanitize_branch_label(str(raw.get("name", "")))
+        if not name:
+            raise SupervisorError("Branch strategy name cannot be empty.")
+        if name in seen_names:
+            raise SupervisorError(f"Duplicate branch strategy name: {name}")
+        seen_names.add(name)
+        rewrite_scope = str(raw.get("rewrite_scope", "")).strip().lower()
+        if rewrite_scope not in {"incremental", "major"}:
+            raise SupervisorError(f"Invalid rewrite_scope {rewrite_scope!r} for branch strategy {name}")
+        strategies.append(
+            {
+                "name": name,
+                "summary": str(raw.get("summary", "")).strip(),
+                "worker_prompt": str(raw.get("worker_prompt", "")).strip(),
+                "why_this_might_eventually_succeed": str(raw.get("why_this_might_eventually_succeed", "")).strip(),
+                "rewrite_scope": rewrite_scope,
+            }
+        )
+    if branch_decision == "NO_BRANCH":
+        strategies = []
+    elif not (2 <= len(strategies) <= config.branching.max_current_branches):
+        raise SupervisorError(
+            "Branch-strategy decision must include between 2 and "
+            f"{config.branching.max_current_branches} strategies when branching."
+        )
+    decision["branch_decision"] = branch_decision
+    decision["strategies"] = strategies
+    return decision
+
+
+def validate_branch_selection_decision(
+    phase: str,
+    decision: Dict[str, Any],
+    allowed_branches: Sequence[str],
+) -> Dict[str, Any]:
+    required_keys = {"phase", "selection_decision", "confidence", "reason", "selected_branch"}
+    missing = required_keys.difference(decision)
+    if missing:
+        raise SupervisorError(f"Branch-selection decision missing keys: {sorted(missing)}")
+    if str(decision.get("phase")).strip().lower() != phase:
+        raise SupervisorError(
+            f"Branch-selection decision phase mismatch: expected {phase}, got {decision.get('phase')}"
+        )
+    selection_decision = str(decision.get("selection_decision", "")).strip().upper()
+    if selection_decision not in BRANCH_SELECTION_DECISIONS:
+        raise SupervisorError(f"Invalid selection_decision {selection_decision!r}")
+    selected_branch = sanitize_branch_label(str(decision.get("selected_branch", "")))
+    if selection_decision == "SELECT_BRANCH":
+        if selected_branch not in set(allowed_branches):
+            raise SupervisorError(
+                f"Branch-selection decision selected invalid branch {selected_branch!r}; "
+                f"allowed: {sorted(set(allowed_branches))}"
+            )
+    else:
+        selected_branch = ""
+    decision["selection_decision"] = selection_decision
+    decision["selected_branch"] = selected_branch
+    return decision
+
+
+def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phase: str) -> bool:
+    cycle = int(state.get("cycle", 0) or 0)
+    if cycle <= 0 or last_review_cycle(state) >= cycle:
+        return False
+    if (
+        isinstance(state.get("last_validation"), dict)
+        and last_validation_cycle(state) == cycle
+        and isinstance(state.get("last_worker_handoff"), dict)
+        and "last_worker_output" in state
+    ):
+        return False
+
+    artifact_path = config.state_dir / "worker_handoff.json"
+    fallback_paths = legacy_supervisor_artifact_paths(config, artifact_path)
+    if not artifact_path.exists() and not any(path.exists() for path in fallback_paths):
+        return False
+
+    log_path = config.state_dir / "logs" / f"worker-cycle-{cycle:04d}.ansi.log"
+    worker_terminal_output = read_text(log_path).strip() if log_path.exists() else ""
+
+    worker_handoff = load_json_artifact_with_fallback(
+        artifact_path,
+        worker_terminal_output,
+        "status",
+        fallback_paths=fallback_paths,
+    )
+    worker_handoff = validate_worker_handoff(phase, worker_handoff)
+    state["last_worker_output"] = worker_terminal_output
+    state["last_worker_handoff"] = worker_handoff
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="worker_handoff",
+        actor="worker",
+        target="supervisor",
+        content=worker_handoff,
+        content_type="json",
+    )
+
+    validation_summary = run_validation(config, phase, cycle)
+    state["last_validation"] = validation_summary
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="validation_summary",
+        actor="supervisor",
+        target="reviewer",
+        content=validation_summary,
+        content_type="json",
+    )
+    save_state(config, state)
+    return True
 
 
 def maybe_consume_human_input(config: Config, state: Dict[str, Any]) -> bool:
@@ -2562,6 +3181,7 @@ def run_stuck_recovery_review(
         Path(run["artifact_path"]),
         recovery_terminal_output,
         "worker_prompt",
+        fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
     )
     suggestion = validate_stuck_recovery_suggestion(phase, suggestion)
     suggestion = record_stuck_recovery_attempt(
@@ -2584,6 +3204,538 @@ def run_stuck_recovery_review(
     save_state(config, state)
     append_jsonl(config.state_dir / "stuck_recovery_log.jsonl", suggestion)
     return suggestion
+
+
+def config_to_raw_dict(config: Config) -> Dict[str, Any]:
+    workflow: Dict[str, Any] = {
+        "start_phase": config.workflow.start_phase,
+        "sorry_mode": config.workflow.sorry_mode,
+        "approved_axioms_path": str(config.workflow.approved_axioms_path),
+        "human_input_path": str(config.workflow.human_input_path),
+        "input_request_path": str(config.workflow.input_request_path),
+    }
+    if config.workflow.paper_tex_path is not None:
+        workflow["paper_tex_path"] = str(config.workflow.paper_tex_path)
+    return {
+        "repo_path": str(config.repo_path),
+        "goal_file": str(config.goal_file),
+        "state_dir": str(config.state_dir),
+        "worker": {
+            "provider": config.worker.provider,
+            "model": config.worker.model,
+            "extra_args": list(config.worker.extra_args),
+        },
+        "reviewer": {
+            "provider": config.reviewer.provider,
+            "model": config.reviewer.model,
+            "extra_args": list(config.reviewer.extra_args),
+        },
+        "tmux": {
+            "session_name": config.tmux.session_name,
+            "dashboard_window_name": config.tmux.dashboard_window_name,
+            "kill_windows_after_capture": config.tmux.kill_windows_after_capture,
+        },
+        "workflow": workflow,
+        "chat": {
+            "root_dir": str(config.chat.root_dir),
+            "repo_name": config.chat.repo_name,
+            "public_base_url": config.chat.public_base_url,
+        },
+        "git": {
+            "remote_url": config.git.remote_url,
+            "remote_name": config.git.remote_name,
+            "branch": config.git.branch,
+            "author_name": config.git.author_name,
+            "author_email": config.git.author_email,
+        },
+        "max_cycles": config.max_cycles,
+        "sleep_seconds": config.sleep_seconds,
+        "startup_timeout_seconds": config.startup_timeout_seconds,
+        "burst_timeout_seconds": config.burst_timeout_seconds,
+        "branching": {
+            "max_current_branches": config.branching.max_current_branches,
+            "evaluation_cycle_budget": config.branching.evaluation_cycle_budget,
+            "poll_seconds": config.branching.poll_seconds,
+        },
+    }
+
+
+def branch_episode_snapshots(episode: Dict[str, Any]) -> List[Dict[str, Any]]:
+    snapshots: List[Dict[str, Any]] = []
+    base_review_count = int(episode.get("base_review_count", 0))
+    for branch in episode.get("branches", []):
+        if not isinstance(branch, dict):
+            continue
+        config_path = Path(str(branch.get("config_path", "")))
+        worktree_path = Path(str(branch.get("worktree_path", "")))
+        state_path = worktree_path / ".agent-supervisor" / "state.json"
+        state_data = JsonFile.load(state_path, {})
+        latest_review = state_data.get("last_review") if isinstance(state_data.get("last_review"), dict) else {}
+        latest_handoff = (
+            state_data.get("last_worker_handoff") if isinstance(state_data.get("last_worker_handoff"), dict) else {}
+        )
+        latest_validation = (
+            state_data.get("last_validation") if isinstance(state_data.get("last_validation"), dict) else {}
+        )
+        snapshots.append(
+            {
+                "name": branch.get("name"),
+                "summary": branch.get("summary"),
+                "rewrite_scope": branch.get("rewrite_scope"),
+                "worker_prompt": branch.get("worker_prompt"),
+                "why_this_might_eventually_succeed": branch.get("why_this_might_eventually_succeed"),
+                "worktree_path": str(worktree_path),
+                "config_path": str(config_path),
+                "supervisor_session": branch.get("supervisor_session"),
+                "agent_session": branch.get("agent_session"),
+                "review_count": branch_review_count(state_data),
+                "progress_reviews": branch_progress_count(state_data, base_review_count),
+                "cycle": int(state_data.get("cycle", 0) or 0),
+                "phase": state_data.get("phase"),
+                "latest_review_decision": latest_review.get("decision"),
+                "latest_review_reason": latest_review.get("reason"),
+                "latest_worker_status": latest_handoff.get("status"),
+                "latest_worker_frontier": latest_handoff.get("current_frontier"),
+                "git_head": ((latest_validation.get("git") or {}).get("head") if isinstance(latest_validation, dict) else None),
+            }
+        )
+    return snapshots
+
+
+def branch_episode_ready_for_selection(config: Config, episode: Dict[str, Any], snapshots: Sequence[Dict[str, Any]]) -> bool:
+    if not snapshots:
+        return False
+    if any(snapshot.get("latest_review_decision") == "DONE" for snapshot in snapshots):
+        return True
+    target = int(
+        episode.get(
+            "next_selection_review_target",
+            int(episode.get("base_review_count", 0)) + branch_review_budget(config),
+        )
+    )
+    return all(int(snapshot.get("review_count", 0) or 0) >= target for snapshot in snapshots)
+
+
+def branch_strategy_branch_name(config: Config, episode_id: str, label: str) -> str:
+    return f"lagent/{sanitize_repo_name(config.chat.repo_name)}/{episode_id}/{sanitize_branch_label(label)}"
+
+
+def branch_strategy_worktree_path(config: Config, episode_id: str, label: str) -> Path:
+    return config.repo_path.parent / f"{config.repo_path.name}--{episode_id}--{sanitize_branch_label(label)}"
+
+
+def child_branch_config_payload(
+    config: Config,
+    *,
+    episode_id: str,
+    strategy: Dict[str, Any],
+    worktree_path: Path,
+    config_path: Path,
+) -> Dict[str, Any]:
+    child_repo_name = sanitize_repo_name(f"{config.chat.repo_name}-{episode_id}-{strategy['name']}")
+    agent_session = sanitize_tmux_session_name(f"{child_repo_name}-agents")
+    payload = config_to_raw_dict(config)
+    payload["repo_path"] = str(worktree_path)
+    payload["goal_file"] = str(worktree_path / config.goal_file.name)
+    payload["state_dir"] = str(worktree_path / ".agent-supervisor")
+    payload["tmux"]["session_name"] = agent_session
+    payload["workflow"]["approved_axioms_path"] = str(worktree_path / config.workflow.approved_axioms_path.name)
+    payload["workflow"]["human_input_path"] = str(worktree_path / config.workflow.human_input_path.name)
+    payload["workflow"]["input_request_path"] = str(worktree_path / config.workflow.input_request_path.name)
+    if config.workflow.paper_tex_path is not None:
+        payload["workflow"]["paper_tex_path"] = str(worktree_path / config.workflow.paper_tex_path.relative_to(config.repo_path))
+    payload["chat"]["repo_name"] = child_repo_name
+    payload["git"]["branch"] = branch_strategy_branch_name(config, episode_id, strategy["name"])
+    payload["branching"]["max_current_branches"] = 1
+    return payload
+
+
+def start_supervisor_tmux_session(config_path: Path, supervisor_session: str) -> None:
+    tmux_cmd(
+        "new-session",
+        "-d",
+        "-s",
+        supervisor_session,
+        "-n",
+        "supervisor",
+        "bash",
+        "-lc",
+        (
+            f"cd {shlex.quote(str(PACKAGE_DIR))} && "
+            f"python3 supervisor.py --config {shlex.quote(str(config_path))}; "
+            "echo; echo '[supervisor exited]'; exec bash"
+        ),
+    )
+
+
+def build_child_branch_state(
+    state: Dict[str, Any],
+    *,
+    episode_id: str,
+    strategy: Dict[str, Any],
+) -> Dict[str, Any]:
+    child_state = deep_copy_jsonish(state)
+    child_state["roles"] = {}
+    child_state["active_branch_episode"] = None
+    child_state["last_branch_consideration_cycle"] = 0
+    child_state["branch_lineage"] = [
+        *branch_lineage_entries(state),
+        {
+            "episode_id": episode_id,
+            "branch_name": strategy["name"],
+            "summary": strategy["summary"],
+            "rewrite_scope": strategy["rewrite_scope"],
+        },
+    ]
+    child_state["branch_context"] = {
+        "episode_id": episode_id,
+        "branch_name": strategy["name"],
+        "summary": strategy["summary"],
+        "worker_prompt": strategy["worker_prompt"],
+        "why_this_might_eventually_succeed": strategy["why_this_might_eventually_succeed"],
+        "rewrite_scope": strategy["rewrite_scope"],
+    }
+    return child_state
+
+
+def create_branch_episode(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    decision: Dict[str, Any],
+    branch_strategy: Dict[str, Any],
+) -> Dict[str, Any]:
+    preflight_error = branch_episode_preflight_error(config)
+    if preflight_error:
+        raise SupervisorError(f"Cannot create branch episode: {preflight_error}.")
+    status = git_validation_summary(config) if git_is_enabled(config) else {"head": git_output(config, ["rev-parse", "HEAD"]).strip()}
+
+    state["branch_episode_counter"] = int(state.get("branch_episode_counter", 0) or 0) + 1
+    episode_id = f"episode-{state['branch_episode_counter']:03d}"
+    episode_dir = branch_episode_dir(config, episode_id)
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    base_review_count = branch_review_count(state)
+    parent_head = status.get("head")
+    branches: List[Dict[str, Any]] = []
+    for strategy in branch_strategy["strategies"]:
+        label = sanitize_branch_label(strategy["name"])
+        worktree_path = branch_strategy_worktree_path(config, episode_id, label)
+        local_branch = branch_strategy_branch_name(config, episode_id, label)
+        if worktree_path.exists():
+            raise SupervisorError(f"Refusing to create branch worktree at existing path: {worktree_path}")
+        git_run(config, ["worktree", "add", "-b", local_branch, str(worktree_path), "HEAD"])
+        child_config_path = episode_dir / f"{label}.json"
+        payload = child_branch_config_payload(
+            config,
+            episode_id=episode_id,
+            strategy={**strategy, "name": label},
+            worktree_path=worktree_path,
+            config_path=child_config_path,
+        )
+        JsonFile.dump(child_config_path, payload)
+        child_state = build_child_branch_state(state, episode_id=episode_id, strategy={**strategy, "name": label})
+        JsonFile.dump(worktree_path / ".agent-supervisor" / "state.json", child_state)
+        supervisor_session = sanitize_tmux_session_name(f"{payload['chat']['repo_name']}-supervisor")
+        start_supervisor_tmux_session(child_config_path, supervisor_session)
+        branches.append(
+            {
+                "name": label,
+                "summary": strategy["summary"],
+                "worker_prompt": strategy["worker_prompt"],
+                "why_this_might_eventually_succeed": strategy["why_this_might_eventually_succeed"],
+                "rewrite_scope": strategy["rewrite_scope"],
+                "worktree_path": str(worktree_path),
+                "config_path": str(child_config_path),
+                "local_branch": local_branch,
+                "supervisor_session": supervisor_session,
+                "agent_session": payload["tmux"]["session_name"],
+            }
+        )
+
+    episode = {
+        "id": episode_id,
+        "phase": phase,
+        "trigger_cycle": int(decision.get("cycle", state.get("cycle", 0)) or 0),
+        "lineage": branch_lineage_entries(state),
+        "base_review_count": base_review_count,
+        "next_selection_review_target": base_review_count + branch_review_budget(config),
+        "evaluation_cycle_budget": branch_review_budget(config),
+        "selection_question": "Which branch seems more likely to eventually succeed at formalizing the whole paper?",
+        "reason": branch_strategy.get("reason", ""),
+        "confidence": branch_strategy.get("confidence", 0.0),
+        "parent_head": parent_head,
+        "branches": branches,
+        "status": "active",
+    }
+    state["active_branch_episode"] = episode
+    state["last_branch_consideration_cycle"] = episode["trigger_cycle"]
+    save_state(config, state)
+    append_jsonl(episode_dir / "branch_strategy_log.jsonl", branch_strategy)
+    return episode
+
+
+def run_branch_strategy_review(
+    config: Config,
+    state: Dict[str, Any],
+    reviewer: ProviderAdapter,
+    phase: str,
+    last_review: Dict[str, Any],
+) -> Dict[str, Any]:
+    validation_summary = state.get("last_validation") or {}
+    worker_terminal_output = str(state.get("last_worker_output") or "").strip()
+    worker_handoff = state.get("last_worker_handoff") or {}
+    worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
+    cycle = int(last_review.get("cycle", state.get("cycle", 0)) or 0)
+    prompt = build_branch_strategy_prompt(
+        config,
+        state,
+        phase,
+        worker_terminal_output,
+        worker_handoff_text,
+        validation_summary,
+        last_review,
+        reviewer.needs_initial_run(),
+    )
+    prompt_for_chat = build_branch_strategy_prompt(
+        config,
+        state,
+        phase,
+        worker_terminal_output,
+        worker_handoff_text,
+        validation_summary,
+        last_review,
+        reviewer.needs_initial_run(),
+        include_terminal_output=False,
+    )
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="branch_strategy_prompt",
+        actor="supervisor",
+        target="reviewer",
+        content=prompt_for_chat,
+        content_type="text",
+        summary=f"Supervisor -> branch-strategy prompt for cycle {cycle}",
+    )
+    run = launch_tmux_burst_with_retries(
+        reviewer,
+        cycle,
+        prompt,
+        stage_label="reviewer branch-strategy burst",
+        artifact_name=branch_strategy_artifact_path(config).name,
+        burst_tag=f"branch-strategy-{cycle:04d}",
+    )
+    reviewer.mark_initialized()
+    strategy = load_json_artifact_with_fallback(
+        Path(run["artifact_path"]),
+        run["captured_output"].strip(),
+        "branch_decision",
+        fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
+    )
+    strategy = validate_branch_strategy_decision(config, phase, strategy)
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="branch_strategy_decision",
+        actor="reviewer",
+        target="supervisor",
+        content=strategy,
+        content_type="json",
+    )
+    append_jsonl(config.state_dir / "branch_strategy_log.jsonl", strategy)
+    save_state(config, state)
+    return strategy
+
+
+def run_branch_selection_review(
+    config: Config,
+    state: Dict[str, Any],
+    reviewer: ProviderAdapter,
+    phase: str,
+    episode: Dict[str, Any],
+    snapshots: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    cycle = int(state.get("cycle", 0) or 0)
+    prompt = build_branch_selection_prompt(
+        config,
+        state,
+        phase,
+        episode,
+        snapshots,
+        reviewer.needs_initial_run(),
+    )
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="branch_selection_prompt",
+        actor="supervisor",
+        target="reviewer",
+        content=prompt,
+        content_type="text",
+        summary=f"Supervisor -> branch-selection prompt for cycle {cycle}",
+    )
+    run = launch_tmux_burst_with_retries(
+        reviewer,
+        cycle,
+        prompt,
+        stage_label="reviewer branch-selection burst",
+        artifact_name=branch_selection_artifact_path(config).name,
+        burst_tag=f"branch-selection-{cycle:04d}",
+    )
+    reviewer.mark_initialized()
+    allowed = [str(snapshot.get("name", "")) for snapshot in snapshots]
+    selection = load_json_artifact_with_fallback(
+        Path(run["artifact_path"]),
+        run["captured_output"].strip(),
+        "selection_decision",
+        fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
+    )
+    selection = validate_branch_selection_decision(phase, selection, allowed)
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="branch_selection_decision",
+        actor="reviewer",
+        target="supervisor",
+        content=selection,
+        content_type="json",
+    )
+    append_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
+    save_state(config, state)
+    return selection
+
+
+def prune_branch_episode(config: Config, state: Dict[str, Any], episode: Dict[str, Any], selected_branch: str) -> Dict[str, Any]:
+    winner: Optional[Dict[str, Any]] = None
+    completed_episode = deep_copy_jsonish(episode)
+    completed_episode["status"] = "selected"
+    completed_episode["selected_branch"] = selected_branch
+    inherited_history = [entry for entry in state.get("branch_history", []) if isinstance(entry, dict)]
+    for branch in episode.get("branches", []):
+        if not isinstance(branch, dict):
+            continue
+        branch_state_path = Path(str(branch.get("worktree_path", ""))) / ".agent-supervisor" / "state.json"
+        if branch_state_path.exists():
+            branch_state = JsonFile.load(branch_state_path, {})
+            branch_state["branch_history"] = [*deep_copy_jsonish(inherited_history), deep_copy_jsonish(completed_episode)]
+            branch_state["active_branch_episode"] = None
+            JsonFile.dump(branch_state_path, branch_state)
+        if branch.get("name") == selected_branch:
+            winner = branch
+            continue
+        tmux_cmd("kill-session", "-t", str(branch.get("supervisor_session")), check=False)
+        tmux_cmd("kill-session", "-t", str(branch.get("agent_session")), check=False)
+    if winner is None:
+        raise SupervisorError(f"Could not find selected branch {selected_branch!r} in active episode.")
+
+    winner_config_path = Path(str(winner.get("config_path", "")))
+    winner_config = JsonFile.load(winner_config_path, {})
+    winner_branching = winner_config.get("branching", {})
+    winner_branching["max_current_branches"] = config.branching.max_current_branches
+    winner_branching["evaluation_cycle_budget"] = config.branching.evaluation_cycle_budget
+    winner_branching["poll_seconds"] = config.branching.poll_seconds
+    winner_config["branching"] = winner_branching
+    JsonFile.dump(winner_config_path, winner_config)
+
+    state["branch_history"].append(deep_copy_jsonish(completed_episode))
+    state["active_branch_episode"] = None
+    save_state(config, state)
+    return winner
+
+
+def branch_episode_status_lines(config: Config, episode: Dict[str, Any], snapshots: Sequence[Dict[str, Any]]) -> List[str]:
+    target = int(
+        episode.get(
+            "next_selection_review_target",
+            int(episode.get("base_review_count", 0)) + branch_review_budget(config),
+        )
+    )
+    lines = [
+        f"Branch episode {episode.get('id', '')}: trigger_cycle={episode.get('trigger_cycle', '?')} "
+        f"branches={len(snapshots)} next_selection_review_target={target}",
+        f"Selection question: {str(episode.get('selection_question', '')).strip()}",
+    ]
+    for snapshot in snapshots:
+        head = str(snapshot.get("git_head") or "")[:12]
+        lines.append(
+            "- "
+            f"{snapshot.get('name', '')}: "
+            f"phase={snapshot.get('phase') or '?'} "
+            f"cycle={int(snapshot.get('cycle', 0) or 0)} "
+            f"reviews={int(snapshot.get('review_count', 0) or 0)}/{target} "
+            f"progress_reviews={int(snapshot.get('progress_reviews', 0) or 0)} "
+            f"latest_review={snapshot.get('latest_review_decision') or 'none'} "
+            f"worker_status={snapshot.get('latest_worker_status') or 'none'} "
+            f"head={head or 'unknown'}"
+        )
+    return lines
+
+
+def monitor_active_branch_episode(
+    config: Config,
+    state: Dict[str, Any],
+    reviewer: ProviderAdapter,
+    phase: str,
+) -> int:
+    while True:
+        episode = active_branch_episode(state)
+        if episode is None:
+            return 0
+
+        snapshots = branch_episode_snapshots(episode)
+        print(f"\n===== branch episode {episode.get('id', '')}: monitoring =====")
+        for line in branch_episode_status_lines(config, episode, snapshots):
+            print(line)
+
+        if not branch_episode_ready_for_selection(config, episode, snapshots):
+            print(
+                f"Waiting {config.branching.poll_seconds:.0f}s before polling branch progress again."
+            )
+            time.sleep(config.branching.poll_seconds)
+            continue
+
+        selection = run_branch_selection_review(config, state, reviewer, phase, episode, snapshots)
+        append_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
+        print("\n===== branch selection decision =====")
+        print(json.dumps(selection, indent=2, ensure_ascii=False))
+
+        if selection["selection_decision"] == "CONTINUE_BRANCHING":
+            budget = int(episode.get("evaluation_cycle_budget", branch_review_budget(config)) or branch_review_budget(config))
+            current_target = int(
+                episode.get(
+                    "next_selection_review_target",
+                    int(episode.get("base_review_count", 0)) + budget,
+                )
+            )
+            episode["next_selection_review_target"] = current_target + budget
+            state["active_branch_episode"] = episode
+            save_state(config, state)
+            print(
+                "Reviewer chose to continue branching. "
+                f"Next branch-selection checkpoint is review_count >= {episode['next_selection_review_target']} "
+                "for every active branch."
+            )
+            time.sleep(config.branching.poll_seconds)
+            continue
+
+        winner = prune_branch_episode(config, state, episode, str(selection.get("selected_branch", "")))
+        print(
+            "Selected winning branch "
+            f"{winner.get('name')} at {winner.get('worktree_path')}."
+        )
+        print(
+            "The winning branch supervisor remains active in its own worktree/session. "
+            f"Use config {winner.get('config_path')} and session {winner.get('supervisor_session')} to keep following it."
+        )
+        return 0
 
 
 def enforce_terminal_decision(
@@ -2627,12 +3779,13 @@ def main() -> int:
     ensure_chat_site(config)
     ensure_tmux_session(config)
 
-    if not maybe_consume_human_input(config, state):
+    has_active_branch_episode = active_branch_episode(state) is not None
+    if not has_active_branch_episode and not maybe_consume_human_input(config, state):
         print(f"Waiting for human input in: {config.workflow.human_input_path}")
         print(f"Input request written to: {config.workflow.input_request_path}")
         return 0
 
-    if state.get("pending_human_input_event"):
+    if not has_active_branch_episode and state.get("pending_human_input_event"):
         record_chat_event(
             config,
             state,
@@ -2649,13 +3802,13 @@ def main() -> int:
     worker = make_adapter("worker", config, state)
     reviewer = make_adapter("reviewer", config, state)
 
-    if can_attempt_stuck_recovery(state):
+    if not has_active_branch_episode and can_attempt_stuck_recovery(state):
         suggestion = run_stuck_recovery_review(config, state, reviewer, phase)
         print(
             f"Prepared stuck-recovery attempt {suggestion['attempt']}/{MAX_STUCK_RECOVERY_ATTEMPTS} "
             f"from prior STUCK review."
         )
-    elif has_unhandled_stuck_review(state):
+    elif not has_active_branch_episode and has_unhandled_stuck_review(state):
         print(
             "Stopping because the current stuck episode already exhausted all "
             f"{MAX_STUCK_RECOVERY_ATTEMPTS} stuck-recovery attempts."
@@ -2678,10 +3831,20 @@ def main() -> int:
         print(f"git_remote={config.git.remote_name}:{config.git.remote_url}")
         print(f"git_branch={current_git_branch(config)}")
     print(f"sorry_mode={config.workflow.sorry_mode}")
+    print(
+        "branching="
+        f"max_current_branches={config.branching.max_current_branches} "
+        f"evaluation_cycle_budget={config.branching.evaluation_cycle_budget} "
+        f"poll_seconds={config.branching.poll_seconds}"
+    )
 
     while True:
         phase = current_phase(config, state)
+        if active_branch_episode(state):
+            return monitor_active_branch_episode(config, state, reviewer, phase)
         ensure_repo_files(config, phase)
+        if recover_interrupted_worker_state(config, state, phase):
+            print(f"Recovered completed worker burst for cycle {int(state.get('cycle', 0))}; resuming reviewer stage.")
         cycle, stage = determine_resume_cycle_and_stage(state)
         is_new_cycle = cycle > int(state.get("cycle", 0) or 0)
         if is_new_cycle:
@@ -2722,6 +3885,7 @@ def main() -> int:
                 Path(worker_run["artifact_path"]),
                 worker_terminal_output,
                 "status",
+                fallback_paths=legacy_supervisor_artifact_paths(config, Path(worker_run["artifact_path"])),
             )
             worker_handoff = validate_worker_handoff(phase, worker_handoff)
             state["last_worker_output"] = worker_terminal_output
@@ -2806,7 +3970,12 @@ def main() -> int:
         )
         reviewer.mark_initialized()
         reviewer_terminal_output = reviewer_run["captured_output"].strip()
-        decision = load_json_artifact_with_fallback(Path(reviewer_run["artifact_path"]), reviewer_terminal_output, "decision")
+        decision = load_json_artifact_with_fallback(
+            Path(reviewer_run["artifact_path"]),
+            reviewer_terminal_output,
+            "decision",
+            fallback_paths=legacy_supervisor_artifact_paths(config, Path(reviewer_run["artifact_path"])),
+        )
         decision = validate_reviewer_decision(phase, decision)
         decision["cycle"] = cycle
         decision["phase"] = phase
@@ -2831,6 +4000,23 @@ def main() -> int:
 
         decision_value = decision["decision"]
         enforce_terminal_decision(phase, decision_value, validation_summary)
+        if should_consider_branching(config, state, phase, decision):
+            preflight_error = branch_episode_preflight_error(config)
+            if preflight_error:
+                print(f"Skipping branch consideration for cycle {cycle}: {preflight_error}.")
+            else:
+                branch_strategy = run_branch_strategy_review(config, state, reviewer, phase, decision)
+                state["last_branch_consideration_cycle"] = cycle
+                save_state(config, state)
+                print("\n===== branch strategy decision =====")
+                print(json.dumps(branch_strategy, indent=2, ensure_ascii=False))
+                if branch_strategy["branch_decision"] == "BRANCH":
+                    episode = create_branch_episode(config, state, phase, decision, branch_strategy)
+                    print(
+                        f"Created branch episode {episode['id']} with {len(episode['branches'])} branch(es). "
+                        "Parent supervisor will monitor child branches until selection."
+                    )
+                    continue
         if decision_value != "STUCK" and stuck_recovery_attempts(state):
             clear_stuck_recovery(state)
             save_state(config, state)

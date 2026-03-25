@@ -127,6 +127,53 @@ class CommandTests(SupervisorTestCase):
 
         self.assertEqual(config.tmux.session_name, "arxiv-1702_07325-agents")
 
+    def test_load_config_uses_branching_defaults(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.branching.max_current_branches, 2)
+        self.assertEqual(config.branching.evaluation_cycle_budget, supervisor.DEFAULT_BRANCH_EVALUATION_CYCLES)
+        self.assertEqual(config.branching.poll_seconds, supervisor.DEFAULT_BRANCH_POLL_SECONDS)
+
+    def test_load_config_reads_branching_overrides(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "branching": {
+                        "max_current_branches": 4,
+                        "evaluation_cycle_budget": 27,
+                        "poll_seconds": 123.5,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.branching.max_current_branches, 4)
+        self.assertEqual(config.branching.evaluation_cycle_budget, 27)
+        self.assertEqual(config.branching.poll_seconds, 123.5)
+
     def test_codex_resume_uses_resume_safe_flags(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path)
@@ -345,6 +392,8 @@ class CommandTests(SupervisorTestCase):
         self.assertIn(".agents/skills/lean-formalizer/SKILL.md", prompt)
         self.assertIn("read or reread the installed `lean-formalizer` skill", prompt)
         self.assertIn("Follow the Lean-search, naming, proof-planning, and tool-usage suggestions", prompt)
+        self.assertIn("write your handoff JSON to `.agent-supervisor/worker_handoff.json`", prompt)
+        self.assertNotIn("write your handoff JSON to `supervisor/worker_handoff.json`", prompt)
         self.assertIn("paper-facing interface", prompt)
         self.assertIn("separate support files", prompt)
         self.assertIn("short wrappers around results proved elsewhere", prompt)
@@ -427,6 +476,167 @@ class CommandTests(SupervisorTestCase):
         self.assertIn("paper-facing", prompt)
         self.assertIn("separate support files would be cleaner", prompt)
 
+    def test_branch_strategy_prompt_mentions_eventual_whole_paper_success(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        prompt = supervisor.build_branch_strategy_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            "worker terminal output",
+            '{"status":"STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "confidence": 0.9,
+                "reason": "The route may need a rewrite.",
+                "next_prompt": "",
+                "cycle": 20,
+            },
+            False,
+        )
+
+        self.assertIn("At most 2 branches may run concurrently", prompt)
+        self.assertIn("eventually succeed at formalizing the whole paper", prompt)
+        self.assertIn("If `branch_decision` is `BRANCH`, include between 2 and 2 strategies.", prompt)
+
+    def test_branch_selection_prompt_mentions_eventual_whole_paper_success(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        prompt = supervisor.build_branch_selection_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            {
+                "id": "episode-001",
+                "selection_question": "Which branch seems more likely to eventually succeed at formalizing the whole paper?",
+            },
+            [
+                {"name": "continue-current-route", "progress_reviews": 5, "latest_review_decision": "CONTINUE"},
+                {"name": "major-rewrite", "progress_reviews": 5, "latest_review_decision": "CONTINUE"},
+            ],
+            False,
+        )
+
+        self.assertIn("Which branch seems more likely to eventually succeed at formalizing the whole paper?", prompt)
+        self.assertIn("Do not default to the branch that is merely furthest along today.", prompt)
+
+    def test_validate_branch_strategy_decision_accepts_configured_branch_limit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.branching.max_current_branches = 3
+
+        decision = supervisor.validate_branch_strategy_decision(
+            config,
+            "proof_formalization",
+            {
+                "phase": "proof_formalization",
+                "branch_decision": "branch",
+                "confidence": 0.7,
+                "reason": "There are three materially different routes.",
+                "strategies": [
+                    {
+                        "name": "Continue Current Route",
+                        "summary": "Keep the current support layer and push through.",
+                        "worker_prompt": "Continue the current route.",
+                        "why_this_might_eventually_succeed": "The local gap might still be bridgeable.",
+                        "rewrite_scope": "incremental",
+                    },
+                    {
+                        "name": "Paper Faithful Rewrite",
+                        "summary": "Replace the local interface with a weaker paper-faithful theorem.",
+                        "worker_prompt": "Rewrite the local continuation theorem.",
+                        "why_this_might_eventually_succeed": "It aligns better with the manuscript.",
+                        "rewrite_scope": "major",
+                    },
+                    {
+                        "name": "Topological Route",
+                        "summary": "Return to the topological surjectivity route.",
+                        "worker_prompt": "Reopen the topological route.",
+                        "why_this_might_eventually_succeed": "It may bypass the combinatorial bottleneck.",
+                        "rewrite_scope": "major",
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(decision["branch_decision"], "BRANCH")
+        self.assertEqual([item["name"] for item in decision["strategies"]], ["continue-current-route", "paper-faithful-rewrite", "topological-route"])
+
+    def test_should_consider_branching_for_cycle_20_style_route_pivot(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        should_branch = supervisor.should_consider_branching(
+            config,
+            {"cycle": 20, "last_branch_consideration_cycle": 0},
+            "proof_formalization",
+            {
+                "phase": "proof_formalization",
+                "decision": "CONTINUE",
+                "confidence": 0.92,
+                "reason": (
+                    "The topological route now depends on a substantial noncontractibility theorem "
+                    "that is not readily available in mathlib, but the paper still offers a "
+                    "combinatorial Section 5 route."
+                ),
+                "next_prompt": "Pivot decisively to the paper's combinatorial Section 5 proof.",
+                "cycle": 20,
+            },
+        )
+
+        self.assertTrue(should_branch)
+
+    def test_should_consider_branching_for_cycle_131_style_route_change(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        should_branch = supervisor.should_consider_branching(
+            config,
+            {"cycle": 131, "last_branch_consideration_cycle": 0},
+            "proof_formalization",
+            {
+                "phase": "proof_formalization",
+                "decision": "CONTINUE",
+                "confidence": 0.86,
+                "reason": (
+                    "The current next-milestone lower-containment field now appears to be stronger "
+                    "than what the manuscript actually states, and a more paper-faithful route has been identified."
+                ),
+                "next_prompt": (
+                    "Treat this as a route change and replace the overstrong local theorem with "
+                    "a same-level continuation witness."
+                ),
+                "cycle": 131,
+            },
+        )
+
+        self.assertTrue(should_branch)
+
+    def test_should_not_consider_branching_when_max_current_branches_is_one(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.branching.max_current_branches = 1
+
+        should_branch = supervisor.should_consider_branching(
+            config,
+            {"cycle": 130, "last_branch_consideration_cycle": 0},
+            "proof_formalization",
+            {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "confidence": 0.89,
+                "reason": "The route is blocked and may require a rewrite.",
+                "next_prompt": "",
+                "cycle": 130,
+            },
+        )
+
+        self.assertFalse(should_branch)
+
     def test_stuck_recovery_attempt_state_machine(self) -> None:
         state = {
             "cycle": 51,
@@ -476,6 +686,120 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(state["stuck_recovery_attempts"], [])
         self.assertIsNone(state["stuck_recovery_last_trigger_cycle"])
 
+    def test_monitor_active_branch_episode_selects_winner_and_returns(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "active_branch_episode": {
+                "id": "episode-001",
+                "phase": "proof_formalization",
+                "branches": [
+                    {"name": "continue-current-route"},
+                    {"name": "major-rewrite"},
+                ],
+            }
+        }
+        reviewer = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
+            config,
+            state,
+            ["bash", "-lc", "exit 0"],
+        )
+
+        with (
+            mock.patch.object(
+                supervisor,
+                "branch_episode_snapshots",
+                return_value=[
+                    {"name": "continue-current-route", "review_count": 30, "progress_reviews": 20, "cycle": 150},
+                    {"name": "major-rewrite", "review_count": 30, "progress_reviews": 20, "cycle": 150},
+                ],
+            ),
+            mock.patch.object(supervisor, "branch_episode_ready_for_selection", return_value=True),
+            mock.patch.object(
+                supervisor,
+                "run_branch_selection_review",
+                return_value={
+                    "phase": "proof_formalization",
+                    "selection_decision": "SELECT_BRANCH",
+                    "confidence": 0.9,
+                    "reason": "The rewrite is the better long-term route.",
+                    "selected_branch": "major-rewrite",
+                },
+            ),
+            mock.patch.object(
+                supervisor,
+                "prune_branch_episode",
+                return_value={
+                    "name": "major-rewrite",
+                    "worktree_path": "/tmp/major-rewrite",
+                    "config_path": "/tmp/major-rewrite.json",
+                    "supervisor_session": "major-rewrite-supervisor",
+                },
+            ) as prune_mock,
+        ):
+            result = supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
+
+        self.assertEqual(result, 0)
+        prune_mock.assert_called_once_with(
+            config,
+            state,
+            state["active_branch_episode"],
+            "major-rewrite",
+        )
+
+    def test_build_child_branch_state_preserves_history_and_extends_lineage(self) -> None:
+        state = {
+            "branch_episode_counter": 2,
+            "branch_history": [{"id": "episode-001", "selected_branch": "route-a", "status": "selected"}],
+            "branch_lineage": [{"episode_id": "episode-001", "branch_name": "route-a", "summary": "old", "rewrite_scope": "major"}],
+        }
+
+        child_state = supervisor.build_child_branch_state(
+            state,
+            episode_id="episode-002",
+            strategy={
+                "name": "route-b",
+                "summary": "new route",
+                "worker_prompt": "do the rewrite",
+                "why_this_might_eventually_succeed": "cleaner route",
+                "rewrite_scope": "major",
+            },
+        )
+
+        self.assertEqual(child_state["branch_episode_counter"], 2)
+        self.assertEqual(len(child_state["branch_history"]), 1)
+        self.assertEqual(
+            [entry["branch_name"] for entry in child_state["branch_lineage"]],
+            ["route-a", "route-b"],
+        )
+
+    def test_branch_overview_marks_dead_current_path(self) -> None:
+        overview = supervisor.branch_overview(
+            {
+                "branch_lineage": [{"episode_id": "episode-001", "branch_name": "losing-route"}],
+                "branch_history": [
+                    {
+                        "id": "episode-001",
+                        "status": "selected",
+                        "selected_branch": "winning-route",
+                        "trigger_cycle": 20,
+                        "phase": "proof_formalization",
+                        "lineage": [],
+                        "branches": [
+                            {"name": "winning-route", "summary": "keep going", "rewrite_scope": "incremental"},
+                            {"name": "losing-route", "summary": "dead end", "rewrite_scope": "major"},
+                        ],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(overview["current_path_status"], "dead")
+        self.assertEqual(overview["episodes"][0]["branches"][1]["status"], "dead")
+        self.assertTrue(overview["episodes"][0]["branches"][1]["is_current_path"])
+
 
 class ArtifactFallbackTests(SupervisorTestCase):
     def test_malformed_artifact_falls_back_to_last_matching_json_in_output(self) -> None:
@@ -492,6 +816,67 @@ more noise
 """
             data = supervisor.load_json_artifact_with_fallback(artifact_path, captured, "decision")
             self.assertEqual(data["decision"], "CONTINUE")
+
+    def test_legacy_supervisor_artifact_path_is_used_as_fallback(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = config.state_dir / "worker_handoff.json"
+        legacy_path = repo_path / "supervisor" / "worker_handoff.json"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps({"phase": "proof_formalization", "status": "STUCK"}, indent=2),
+            encoding="utf-8",
+        )
+
+        data = supervisor.load_json_artifact_with_fallback(
+            artifact_path,
+            "",
+            "status",
+            fallback_paths=supervisor.legacy_supervisor_artifact_paths(config, artifact_path),
+        )
+
+        self.assertEqual(data["status"], "STUCK")
+
+    def test_recover_interrupted_worker_state_from_legacy_artifact(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "logs").mkdir(parents=True, exist_ok=True)
+        legacy_path = repo_path / "supervisor" / "worker_handoff.json"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "phase": "proof_formalization",
+                    "status": "STUCK",
+                    "summary_of_changes": "none",
+                    "current_frontier": "frontier",
+                    "likely_next_step": "next",
+                    "input_request": "",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        (config.state_dir / "logs" / "worker-cycle-0012.ansi.log").write_text("worker output", encoding="utf-8")
+        state = {
+            "cycle": 12,
+            "last_review": {"cycle": 11, "decision": "CONTINUE"},
+        }
+
+        with (
+            mock.patch.object(supervisor, "run_validation", return_value={"cycle": 12, "build": {"ok": True}}) as validation_mock,
+            mock.patch.object(supervisor, "record_chat_event") as record_mock,
+        ):
+            recovered = supervisor.recover_interrupted_worker_state(config, state, "proof_formalization")
+
+        self.assertTrue(recovered)
+        self.assertEqual(state["last_worker_handoff"]["status"], "STUCK")
+        self.assertEqual(state["last_worker_output"], "worker output")
+        self.assertEqual(state["last_validation"]["cycle"], 12)
+        validation_mock.assert_called_once_with(config, "proof_formalization", 12)
+        self.assertEqual(record_mock.call_count, 2)
 
 
 class BurstRetryTests(SupervisorTestCase):
@@ -694,16 +1079,55 @@ class WorkflowTests(SupervisorTestCase):
         self.assertIn("repo/PLAN.md", exported_paths)
         self.assertTrue(all(entry.get("href") for entry in meta["markdown_files"]))
         self.assertTrue(all(entry.get("label") for entry in meta["markdown_files"]))
+        self.assertIsNone(meta["branch_overview"])
 
-        tasks_export = chat_root / config.chat.repo_name / "files" / "repo" / "TASKS.md"
-        plan_export = chat_root / config.chat.repo_name / "files" / "repo" / "PLAN.md"
-        self.assertEqual(tasks_export.read_text(encoding="utf-8"), "# Tasks\n\n- [ ] Do work.\n")
-        self.assertEqual(plan_export.read_text(encoding="utf-8"), "# High-Level Plan\n\n- Main step.\n")
+    def test_chat_event_export_includes_branch_overview(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="proof_formalization")
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 130,
+            "awaiting_human_input": False,
+            "branch_lineage": [{"episode_id": "episode-001", "branch_name": "paper-faithful-rewrite"}],
+            "branch_history": [
+                {
+                    "id": "episode-001",
+                    "status": "selected",
+                    "selected_branch": "paper-faithful-rewrite",
+                    "trigger_cycle": 130,
+                    "phase": "proof_formalization",
+                    "lineage": [],
+                    "branches": [
+                        {"name": "continue-current-route", "summary": "push forward", "rewrite_scope": "incremental"},
+                        {"name": "paper-faithful-rewrite", "summary": "major rewrite", "rewrite_scope": "major"},
+                    ],
+                }
+            ],
+        }
 
-        lines = (chat_root / config.chat.repo_name / "events.jsonl").read_text(encoding="utf-8").strip().splitlines()
-        self.assertEqual(len(lines), 2)
-        first_event = json.loads(lines[0])
-        self.assertEqual(first_event["kind"], "worker_prompt")
+        supervisor.record_chat_event(
+            config,
+            state,
+            cycle=130,
+            phase="proof_formalization",
+            kind="reviewer_decision",
+            actor="reviewer",
+            target="supervisor",
+            content={
+                "phase": "proof_formalization",
+                "decision": "CONTINUE",
+                "confidence": 0.9,
+                "reason": "A rewrite branch looks more promising.",
+                "next_prompt": "Keep going.",
+            },
+            content_type="json",
+        )
+
+        meta = json.loads((chat_root / config.chat.repo_name / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["branch_overview"]["current_path_newest_to_oldest"], ["paper-faithful-rewrite", "mainline"])
+        self.assertEqual(meta["branch_overview"]["episodes"][0]["branches"][1]["status"], "selected")
+        self.assertTrue(meta["branch_overview"]["episodes"][0]["branches"][1]["is_current_path"])
 
     def test_refresh_chat_markdown_metadata_updates_stale_export(self) -> None:
         repo_path = self.make_repo()
@@ -873,6 +1297,7 @@ Lean (version 4.28.0, x86_64-unknown-linux-gnu, commit abcdef, Release)
     def test_ensure_build_only_ci_workflow_rewrites_default_math_template(self) -> None:
         repo_path = self.make_repo()
         workflow_path = repo_path / ".github" / "workflows" / "lean_action_ci.yml"
+        release_path = repo_path / ".github" / "workflows" / "create-release.yml"
         workflow_path.parent.mkdir(parents=True, exist_ok=True)
         workflow_path.write_text(
             """name: Lean Action CI
@@ -898,6 +1323,16 @@ jobs:
 """,
             encoding="utf-8",
         )
+        release_path.write_text(
+            """name: Create Release
+
+on:
+  push:
+    paths:
+      - 'lean-toolchain'
+""",
+            encoding="utf-8",
+        )
 
         written = init_formalization_project.ensure_build_only_ci_workflow(repo_path)
         content = written.read_text(encoding="utf-8")
@@ -906,6 +1341,7 @@ jobs:
         self.assertIn("leanprover/lean-action@v1", content)
         self.assertNotIn("docgen-action", content)
         self.assertNotIn("pages: write", content)
+        self.assertFalse(release_path.exists())
 
     def test_build_config_json_uses_expected_defaults(self) -> None:
         repo_path = self.make_repo()
@@ -968,6 +1404,27 @@ jobs:
 
 @unittest.skipUnless(shutil.which("git"), "git is required for git integration tests")
 class GitSetupTests(SupervisorTestCase):
+    def test_branch_episode_preflight_error_requires_git_worktree(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        error = supervisor.branch_episode_preflight_error(config)
+
+        self.assertIn("already be a git worktree", error or "")
+
+    def test_branch_episode_preflight_error_accepts_clean_committed_repo(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        self.git(repo_path, "init", "-b", "main")
+        self.git(repo_path, "config", "user.name", "Test User")
+        self.git(repo_path, "config", "user.email", "test@example.com")
+        self.git(repo_path, "add", "GOAL.md", "paper.tex")
+        self.git(repo_path, "commit", "-m", "seed")
+
+        error = supervisor.branch_episode_preflight_error(config)
+
+        self.assertIsNone(error)
+
     def test_ensure_git_repository_initializes_repo_and_remote(self) -> None:
         repo_path = self.make_repo()
         remote_root = repo_path.parent / "remote.git"

@@ -16,11 +16,15 @@ const elements = {
   repoDocLinks: document.querySelector("#repo-doc-links"),
   cycleFilter: document.querySelector("#cycle-filter"),
   kindFilter: document.querySelector("#kind-filter"),
+  branchPanel: document.querySelector("#branch-panel"),
+  branchTitle: document.querySelector("#branch-title"),
+  branchMeta: document.querySelector("#branch-meta"),
+  branchCurrentPath: document.querySelector("#branch-current-path"),
+  branchEpisodes: document.querySelector("#branch-episodes"),
   emptyState: document.querySelector("#empty-state"),
   transcript: document.querySelector("#transcript"),
   refreshButton: document.querySelector("#refresh-button"),
   autoRefresh: document.querySelector("#auto-refresh"),
-  eventTemplate: document.querySelector("#event-template"),
 };
 
 function cacheBusted(path) {
@@ -67,27 +71,12 @@ function eventTitle(event) {
     input_request: "Supervisor -> human",
     human_input: "Human -> supervisor",
     phase_transition: "Phase transition",
+    branch_strategy_prompt: "Supervisor -> branch strategist",
+    branch_strategy_decision: "Branch strategy decision",
+    branch_selection_prompt: "Supervisor -> branch selector",
+    branch_selection_decision: "Branch selection decision",
   };
   return titles[event.kind] || event.kind.replaceAll("_", " ");
-}
-
-function eventBadges(event) {
-  return [
-    `cycle ${event.cycle}`,
-    event.phase,
-    `${event.actor} -> ${event.target}`,
-  ];
-}
-
-function prettyContent(event) {
-  if (event.content_type === "json") {
-    return JSON.stringify(event.content, null, 2);
-  }
-  return String(event.content ?? "");
-}
-
-function shouldOpen(event) {
-  return ["worker_handoff", "reviewer_decision", "input_request", "phase_transition", "human_input"].includes(event.kind);
 }
 
 function formatTimestamp(value) {
@@ -150,7 +139,7 @@ function renderRepoList() {
 }
 
 function populateFilters(events) {
-  const cycles = [...new Set(events.map((event) => String(event.cycle)))];
+  const cycles = [...new Set(events.map((event) => String(event.cycle)))].sort((left, right) => Number(right) - Number(left));
   const kinds = [...new Set(events.map((event) => event.kind))];
 
   const cycleValue = elements.cycleFilter.value;
@@ -180,10 +169,10 @@ function populateFilters(events) {
   }
 }
 
-function renderEvents() {
+function visibleEvents() {
   const cycleFilter = elements.cycleFilter.value;
   const kindFilter = elements.kindFilter.value;
-  const visibleEvents = state.currentEvents.filter((event) => {
+  return state.currentEvents.filter((event) => {
     if (cycleFilter !== "all" && String(event.cycle) !== cycleFilter) {
       return false;
     }
@@ -192,9 +181,103 @@ function renderEvents() {
     }
     return true;
   });
+}
+
+function cycleGroups(events) {
+  const groups = new Map();
+  events.forEach((event) => {
+    const key = String(event.cycle);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(event);
+  });
+  return [...groups.entries()]
+    .sort((left, right) => Number(right[0]) - Number(left[0]))
+    .map(([cycle, cycleEvents]) => ({ cycle, events: cycleEvents }));
+}
+
+function createBadge(text, className = "") {
+  const badge = document.createElement("span");
+  badge.className = `badge ${className}`.trim();
+  badge.textContent = text;
+  return badge;
+}
+
+function truncateText(value, limit = 280) {
+  const text = String(value || "").trim().replace(/\s+/g, " ");
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function cycleSummaryData(events) {
+  const byKind = new Map();
+  events.forEach((event) => {
+    byKind.set(event.kind, event);
+  });
+
+  const reviewerDecision = byKind.get("reviewer_decision");
+  const branchSelection = byKind.get("branch_selection_decision");
+  const branchStrategy = byKind.get("branch_strategy_decision");
+  const workerHandoff = byKind.get("worker_handoff");
+  const validation = byKind.get("validation_summary");
+  const phaseTransition = byKind.get("phase_transition");
+  const inputRequest = byKind.get("input_request");
+  const humanInput = byKind.get("human_input");
+  const promptFallback = events[events.length - 1];
+
+  const headlineEvent =
+    reviewerDecision ||
+    branchSelection ||
+    branchStrategy ||
+    workerHandoff ||
+    phaseTransition ||
+    inputRequest ||
+    humanInput ||
+    validation ||
+    promptFallback;
+
+  const lines = [];
+  if (workerHandoff && workerHandoff !== headlineEvent) {
+    lines.push(`Worker: ${truncateText(workerHandoff.summary || eventTitle(workerHandoff), 210)}`);
+  }
+  if (validation && validation !== headlineEvent) {
+    lines.push(`Validation: ${truncateText(validation.summary || eventTitle(validation), 120)}`);
+  }
+  if (reviewerDecision && reviewerDecision !== headlineEvent) {
+    lines.push(`Review: ${truncateText(reviewerDecision.summary || eventTitle(reviewerDecision), 220)}`);
+  }
+  if (branchStrategy && branchStrategy !== headlineEvent) {
+    lines.push(`Branch strategy: ${truncateText(branchStrategy.summary || eventTitle(branchStrategy), 180)}`);
+  }
+  if (branchSelection && branchSelection !== headlineEvent) {
+    lines.push(`Branch selection: ${truncateText(branchSelection.summary || eventTitle(branchSelection), 180)}`);
+  }
+  if (phaseTransition && phaseTransition !== headlineEvent) {
+    lines.push(`Transition: ${truncateText(phaseTransition.summary || eventTitle(phaseTransition), 120)}`);
+  }
+  if (inputRequest && inputRequest !== headlineEvent) {
+    lines.push(`Input: ${truncateText(inputRequest.summary || eventTitle(inputRequest), 120)}`);
+  }
+  if (humanInput && humanInput !== headlineEvent) {
+    lines.push(`Human: ${truncateText(humanInput.summary || eventTitle(humanInput), 120)}`);
+  }
+
+  return {
+    headline: truncateText(headlineEvent ? (headlineEvent.summary || eventTitle(headlineEvent)) : "No summary yet.", 320),
+    detailLines: lines.slice(0, 4),
+    reviewerDecision,
+    workerHandoff,
+  };
+}
+
+function renderEvents() {
+  const groupedCycles = cycleGroups(visibleEvents());
 
   elements.transcript.replaceChildren();
-  if (!visibleEvents.length) {
+  if (!groupedCycles.length) {
     elements.emptyState.hidden = false;
     elements.transcript.hidden = true;
     return;
@@ -203,44 +286,149 @@ function renderEvents() {
   elements.emptyState.hidden = true;
   elements.transcript.hidden = false;
 
-  let currentCycle = null;
-  let cycleBlock = null;
-  visibleEvents.forEach((event) => {
-    if (event.cycle !== currentCycle) {
-      currentCycle = event.cycle;
-      cycleBlock = document.createElement("section");
-      cycleBlock.className = "cycle-block";
-      const heading = document.createElement("h3");
-      heading.className = "cycle-heading";
-      heading.textContent = `Cycle ${currentCycle}`;
-      cycleBlock.append(heading);
-      elements.transcript.append(cycleBlock);
+  groupedCycles.forEach(({ cycle, events }) => {
+    const firstEvent = events[0];
+    const lastEvent = events[events.length - 1];
+    const summary = cycleSummaryData(events);
+
+    const cycleCard = document.createElement("article");
+    cycleCard.className = "cycle-card";
+
+    const header = document.createElement("div");
+    header.className = "cycle-card-header";
+
+    const heading = document.createElement("div");
+    heading.className = "cycle-card-heading";
+    const title = document.createElement("h3");
+    title.className = "cycle-heading";
+    title.textContent = `Cycle ${cycle}`;
+    const meta = document.createElement("p");
+    meta.className = "subtle cycle-meta";
+    meta.textContent = `${firstEvent?.phase || "unknown phase"} · ${events.length} event${events.length === 1 ? "" : "s"} · ${formatTimestamp(lastEvent?.timestamp)}`;
+    heading.append(title, meta);
+
+    const badges = document.createElement("div");
+    badges.className = "cycle-status-badges";
+    badges.append(createBadge(firstEvent?.phase || "unknown"));
+    if (summary.reviewerDecision?.content?.decision) {
+      badges.append(createBadge(String(summary.reviewerDecision.content.decision), `decision-${String(summary.reviewerDecision.content.decision).toLowerCase()}`));
     }
+    if (summary.workerHandoff?.content?.status) {
+      badges.append(createBadge(String(summary.workerHandoff.content.status), `status-${String(summary.workerHandoff.content.status).toLowerCase()}`));
+    }
+    header.append(heading, badges);
 
-    const fragment = elements.eventTemplate.content.cloneNode(true);
-    const card = fragment.querySelector(".event-card");
-    const badges = fragment.querySelector(".event-badges");
-    const title = fragment.querySelector(".event-title");
-    const time = fragment.querySelector(".event-time");
-    const details = fragment.querySelector(".event-details");
-    const summary = fragment.querySelector("summary");
-    const content = fragment.querySelector(".event-content");
+    const headline = document.createElement("p");
+    headline.className = "cycle-summary";
+    headline.textContent = summary.headline;
 
-    eventBadges(event).forEach((badgeText) => {
-      const badge = document.createElement("span");
-      badge.className = "badge";
-      badge.textContent = badgeText;
-      badges.append(badge);
+    const detailList = document.createElement("div");
+    detailList.className = "cycle-detail-list";
+    summary.detailLines.forEach((line) => {
+      const item = document.createElement("p");
+      item.className = "cycle-detail";
+      item.textContent = line;
+      detailList.append(item);
     });
-    title.textContent = event.summary || eventTitle(event);
-    time.textContent = formatTimestamp(event.timestamp);
-    summary.textContent = shouldOpen(event) ? "Hide content" : "Show content";
-    details.open = shouldOpen(event);
-    details.addEventListener("toggle", () => {
-      summary.textContent = details.open ? "Hide content" : "Show content";
+
+    cycleCard.append(header, headline);
+    if (summary.detailLines.length) {
+      cycleCard.append(detailList);
+    }
+    elements.transcript.append(cycleCard);
+  });
+}
+
+function statusLabel(branch) {
+  if (branch.is_current_path && branch.status === "dead") {
+    return "dead current path";
+  }
+  if (branch.is_current_path && branch.status === "selected") {
+    return "current winner";
+  }
+  if (branch.is_current_path) {
+    return "current path";
+  }
+  return branch.status;
+}
+
+function renderBranchOverview() {
+  const overview = state.currentMeta?.branch_overview;
+  if (!overview?.has_branching) {
+    elements.branchPanel.hidden = true;
+    elements.branchCurrentPath.replaceChildren();
+    elements.branchEpisodes.replaceChildren();
+    return;
+  }
+
+  elements.branchPanel.hidden = false;
+  elements.branchTitle.textContent = "Whole branch tree";
+  elements.branchMeta.textContent =
+    `${overview.episodes?.length || 0} branch episode${(overview.episodes?.length || 0) === 1 ? "" : "s"} · ` +
+    `${overview.current_path_status || "alive"} current path`;
+
+  elements.branchCurrentPath.replaceChildren();
+  const currentPathLabel = document.createElement("p");
+  currentPathLabel.className = "branch-current-label";
+  currentPathLabel.textContent = "Current path";
+  const currentPathValue = document.createElement("p");
+  currentPathValue.className = "branch-current-value";
+  currentPathValue.textContent = (overview.current_path_newest_to_oldest || []).join(" ← ");
+  elements.branchCurrentPath.append(currentPathLabel, currentPathValue);
+
+  elements.branchEpisodes.replaceChildren();
+  (overview.episodes || []).forEach((episode) => {
+    const card = document.createElement("article");
+    card.className = "branch-episode-card";
+
+    const header = document.createElement("div");
+    header.className = "branch-episode-header";
+    const title = document.createElement("h4");
+    title.className = "branch-episode-title";
+    title.textContent = `${episode.id} · cycle ${episode.trigger_cycle || "?"}`;
+    const meta = document.createElement("p");
+    meta.className = "subtle branch-episode-meta";
+    const contextPath = episode.lineage_newest_to_oldest?.length ? episode.lineage_newest_to_oldest.join(" ← ") : "mainline";
+    meta.textContent = `${episode.phase || "unknown phase"} · ${episode.status} · context ${contextPath}`;
+    header.append(title, meta);
+
+    const branchList = document.createElement("div");
+    branchList.className = "branch-list";
+    const branches = [...(episode.branches || [])].sort((left, right) => {
+      if (Boolean(right.is_current_path) !== Boolean(left.is_current_path)) {
+        return Number(Boolean(right.is_current_path)) - Number(Boolean(left.is_current_path));
+      }
+      const rank = { active: 3, selected: 2, dead: 1 };
+      return (rank[right.status] || 0) - (rank[left.status] || 0);
     });
-    content.textContent = prettyContent(event);
-    cycleBlock.append(card);
+    branches.forEach((branch) => {
+      const item = document.createElement("article");
+      item.className = `branch-item status-${branch.status}${branch.is_current_path ? " is-current-path" : ""}`;
+
+      const top = document.createElement("div");
+      top.className = "branch-item-top";
+      const name = document.createElement("h5");
+      name.className = "branch-item-name";
+      name.textContent = branch.name;
+      const status = document.createElement("span");
+      status.className = `branch-status status-${branch.status}`;
+      status.textContent = statusLabel(branch);
+      top.append(name, status);
+
+      const summary = document.createElement("p");
+      summary.className = "branch-item-summary";
+      summary.textContent = branch.summary || "No summary recorded.";
+
+      const path = document.createElement("p");
+      path.className = "branch-item-path subtle";
+      path.textContent = (branch.path_newest_to_oldest || []).join(" ← ");
+
+      item.append(top, summary, path);
+      branchList.append(item);
+    });
+
+    card.append(header, branchList);
+    elements.branchEpisodes.append(card);
   });
 }
 
@@ -251,6 +439,7 @@ function renderHeader() {
     elements.repoMeta.textContent = "Choose a repo from the left.";
     elements.repoDocLinks.replaceChildren();
     elements.repoDocPanel.hidden = true;
+    renderBranchOverview();
     return;
   }
   elements.repoKicker.textContent = state.currentMeta.current_phase || "Transcript";
@@ -272,6 +461,7 @@ function renderHeader() {
     link.title = file.path || file.label || "Markdown file";
     elements.repoDocLinks.append(link);
   });
+  renderBranchOverview();
 }
 
 async function selectRepo(repoName, updateHash = false) {

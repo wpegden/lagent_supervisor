@@ -13,7 +13,7 @@ It now supports either:
 
 The worker edits the repo and maintains shared workflow files such as `TASKS.md`, `PAPERNOTES.md`, `PLAN.md`, `PaperDefinitions.lean`, and `PaperTheorems.lean` as the current phase requires.
 
-The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to ten distinct stuck-recovery suggestions before finally stopping the run as stuck.
+The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to ten distinct stuck-recovery suggestions before finally stopping the run as stuck. In proof formalization, the supervisor can also open a branch episode when the reviewer has identified a genuine route split, such as continuing the current path versus a major rewrite.
 
 It supports:
 
@@ -36,10 +36,12 @@ Each cycle works like this:
 6. the reviewer writes `supervisor/review_decision.json`;
 7. if the decision is `CONTINUE`, the supervisor launches the next worker burst;
 8. if the decision is `STUCK`, the supervisor asks the reviewer for a creative stuck-recovery strategy and injects that guidance into the next worker burst, up to ten consecutive times before finally stopping as stuck.
+9. if the reviewer identifies a genuine strategic fork, the supervisor can spawn up to `branching.max_current_branches` child runs from the same git commit, let them run for `branching.evaluation_cycle_budget` review cycles each, and then ask which branch seems more likely to eventually succeed at formalizing the whole paper.
 
 So the agents are visible in real TTY windows while running, but the supervisor still gets a clean file-based handoff when they finish.
 If the supervisor itself exits mid-cycle, rerunning it resumes the failed stage of the current cycle rather than always starting a fresh worker cycle.
 If a provider CLI process exits nonzero, the supervisor automatically retries the same burst after 1 hour, then 2 hours, then 3 hours before finally surfacing the error.
+If a branch episode is active, the parent supervisor pauses its own mainline, monitors the child branch runs, and after selection leaves the winning child supervisor running in its own worktree.
 
 ## High-level architecture
 
@@ -194,6 +196,10 @@ Pick one of the example configs in `configs/` and update:
   - `startup_timeout_seconds` for launch failures before the burst script starts
   - `burst_timeout_seconds` for a single worker/reviewer burst that never exits
 - optional `tmux.session_name`
+- optional branching settings:
+  - `branching.max_current_branches` to cap concurrent strategic branches; default `2`
+  - `branching.evaluation_cycle_budget` to control how many reviewer cycles each branch gets before the next selection review; default `20`
+  - `branching.poll_seconds` to control how often the parent supervisor polls branch status while waiting; default `300`
 
 If `git.remote_url` is set, the supervisor will:
 

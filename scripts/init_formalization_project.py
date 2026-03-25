@@ -226,6 +226,10 @@ def ensure_lake_project(repo_path: Path, package_name: str) -> None:
 def ensure_build_only_ci_workflow(repo_path: Path) -> Path:
     workflow_path = repo_path / ".github" / "workflows" / "lean_action_ci.yml"
     workflow_path.parent.mkdir(parents=True, exist_ok=True)
+    for obsolete_name in ("create-release.yml", "create_release.yml"):
+        obsolete_path = workflow_path.parent / obsolete_name
+        if obsolete_path.exists():
+            obsolete_path.unlink()
     workflow_path.write_text(
         textwrap.dedent(
             """\
