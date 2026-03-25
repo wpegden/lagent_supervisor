@@ -25,7 +25,7 @@ CHAT_VIEWER_DIR = PACKAGE_DIR / "chat_viewer"
 PROVIDER_CONTEXT_DIR = PACKAGE_DIR / "provider_context"
 PROMPT_TOKEN = "__PROMPT__"
 DEFAULT_CHAT_BASE_URL = "https://packer.math.cmu.edu/lagent-chats/"
-MAX_STUCK_RECOVERY_ATTEMPTS = 3
+MAX_STUCK_RECOVERY_ATTEMPTS = 10
 PHASES: Tuple[str, ...] = (
     "paper_check",
     "planning",

@@ -265,7 +265,7 @@ class CommandTests(SupervisorTestCase):
         prompt = supervisor.build_worker_prompt(config, state, "proof_formalization", False)
 
         self.assertIn("Supervisor stuck-recovery guidance", prompt)
-        self.assertIn("recovery attempt 1 of 3", prompt)
+        self.assertIn(f"recovery attempt 1 of {supervisor.MAX_STUCK_RECOVERY_ATTEMPTS}", prompt)
         self.assertIn("carrier-set reformulation", prompt)
         self.assertIn("Prove the carrier-set reformulation", prompt)
 
@@ -309,35 +309,26 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(first["attempt"], 1)
         self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
 
-        state["last_review"] = {"decision": "STUCK", "cycle": 52}
-        self.assertTrue(supervisor.can_attempt_stuck_recovery(state))
-        supervisor.record_stuck_recovery_attempt(
-            state,
-            trigger_cycle=52,
-            phase="proof_formalization",
-            suggestion={
-                "phase": "proof_formalization",
-                "diagnosis": "d2",
-                "creative_suggestion": "s2",
-                "why_this_might_work": "w2",
-                "worker_prompt": "p2",
-            },
-        )
-        state["last_review"] = {"decision": "STUCK", "cycle": 53}
-        supervisor.record_stuck_recovery_attempt(
-            state,
-            trigger_cycle=53,
-            phase="proof_formalization",
-            suggestion={
-                "phase": "proof_formalization",
-                "diagnosis": "d3",
-                "creative_suggestion": "s3",
-                "why_this_might_work": "w3",
-                "worker_prompt": "p3",
-            },
-        )
+        for index in range(2, supervisor.MAX_STUCK_RECOVERY_ATTEMPTS + 1):
+            trigger_cycle = 50 + index
+            state["last_review"] = {"decision": "STUCK", "cycle": trigger_cycle}
+            self.assertTrue(supervisor.can_attempt_stuck_recovery(state))
+            attempt = supervisor.record_stuck_recovery_attempt(
+                state,
+                trigger_cycle=trigger_cycle,
+                phase="proof_formalization",
+                suggestion={
+                    "phase": "proof_formalization",
+                    "diagnosis": f"d{index}",
+                    "creative_suggestion": f"s{index}",
+                    "why_this_might_work": f"w{index}",
+                    "worker_prompt": f"p{index}",
+                },
+            )
+            self.assertEqual(attempt["attempt"], index)
+            self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
 
-        state["last_review"] = {"decision": "STUCK", "cycle": 54}
+        state["last_review"] = {"decision": "STUCK", "cycle": 51 + supervisor.MAX_STUCK_RECOVERY_ATTEMPTS}
         self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
 
         supervisor.clear_stuck_recovery(state)
