@@ -8,6 +8,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import supervisor
 
@@ -148,6 +149,40 @@ class CommandTests(SupervisorTestCase):
         self.assertNotIn("--ask-for-approval", continued)
         self.assertNotIn("--sandbox", continued)
         self.assertNotIn("--color", continued)
+
+    def test_determine_resume_cycle_and_stage_starts_new_cycle_after_completed_review(self) -> None:
+        cycle, stage = supervisor.determine_resume_cycle_and_stage(
+            {
+                "cycle": 12,
+                "last_review": {"cycle": 12, "decision": "CONTINUE"},
+            }
+        )
+
+        self.assertEqual((cycle, stage), (13, "worker"))
+
+    def test_determine_resume_cycle_and_stage_retries_worker_after_interrupted_worker_burst(self) -> None:
+        cycle, stage = supervisor.determine_resume_cycle_and_stage(
+            {
+                "cycle": 12,
+                "last_review": {"cycle": 11, "decision": "CONTINUE"},
+                "last_validation": {"cycle": 11},
+            }
+        )
+
+        self.assertEqual((cycle, stage), (12, "worker"))
+
+    def test_determine_resume_cycle_and_stage_retries_reviewer_after_interrupted_reviewer_burst(self) -> None:
+        cycle, stage = supervisor.determine_resume_cycle_and_stage(
+            {
+                "cycle": 87,
+                "last_review": {"cycle": 86, "decision": "CONTINUE"},
+                "last_validation": {"cycle": 87},
+                "last_worker_handoff": {"phase": "proof_formalization", "status": "NOT_STUCK"},
+                "last_worker_output": "worker output",
+            }
+        )
+
+        self.assertEqual((cycle, stage), (87, "reviewer"))
 
     def test_role_state_is_scoped_by_provider(self) -> None:
         repo_path = self.make_repo()
@@ -351,6 +386,93 @@ more noise
 """
             data = supervisor.load_json_artifact_with_fallback(artifact_path, captured, "decision")
             self.assertEqual(data["decision"], "CONTINUE")
+
+
+class BurstRetryTests(SupervisorTestCase):
+    def test_launch_tmux_burst_with_retries_retries_after_nonzero_exit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "worker",
+            config,
+            {},
+            ["bash", "-lc", "exit 0"],
+        )
+
+        failed = {
+            "captured_output": "capacity error",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "failed.log",
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[failed, succeeded]) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            run = supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                7,
+                "prompt",
+                stage_label="reviewer burst",
+            )
+
+        self.assertEqual(run, succeeded)
+        self.assertEqual(launch_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(supervisor.AGENT_CLI_RETRY_DELAYS_SECONDS[0])
+
+    def test_launch_tmux_burst_with_retries_raises_after_retry_budget(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
+            config,
+            {},
+            ["bash", "-lc", "exit 1"],
+        )
+
+        failed = {
+            "captured_output": "capacity error",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "failed.log",
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+
+        with (
+            mock.patch.object(
+                supervisor,
+                "launch_tmux_burst",
+                side_effect=[dict(failed) for _ in range(len(supervisor.AGENT_CLI_RETRY_DELAYS_SECONDS) + 1)],
+            ) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            with self.assertRaisesRegex(supervisor.SupervisorError, "after 3 retry attempts"):
+                supervisor.launch_tmux_burst_with_retries(
+                    adapter,
+                    11,
+                    "prompt",
+                    stage_label="reviewer burst",
+                )
+
+        self.assertEqual(launch_mock.call_count, len(supervisor.AGENT_CLI_RETRY_DELAYS_SECONDS) + 1)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            list(supervisor.AGENT_CLI_RETRY_DELAYS_SECONDS),
+        )
 
 
 class WorkflowTests(SupervisorTestCase):

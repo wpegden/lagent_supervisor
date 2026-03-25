@@ -38,6 +38,8 @@ Each cycle works like this:
 8. if the decision is `STUCK`, the supervisor asks the reviewer for a creative stuck-recovery strategy and injects that guidance into the next worker burst, up to ten consecutive times before finally stopping as stuck.
 
 So the agents are visible in real TTY windows while running, but the supervisor still gets a clean file-based handoff when they finish.
+If the supervisor itself exits mid-cycle, rerunning it resumes the failed stage of the current cycle rather than always starting a fresh worker cycle.
+If a provider CLI process exits nonzero, the supervisor automatically retries the same burst after 1 hour, then 2 hours, then 3 hours before finally surfacing the error.
 
 ## High-level architecture
 

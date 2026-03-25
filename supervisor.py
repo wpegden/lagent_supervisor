@@ -26,6 +26,7 @@ PROVIDER_CONTEXT_DIR = PACKAGE_DIR / "provider_context"
 PROMPT_TOKEN = "__PROMPT__"
 DEFAULT_CHAT_BASE_URL = "https://packer.math.cmu.edu/lagent-chats/"
 MAX_STUCK_RECOVERY_ATTEMPTS = 10
+AGENT_CLI_RETRY_DELAYS_SECONDS: Tuple[float, ...] = (3600.0, 7200.0, 10800.0)
 PHASES: Tuple[str, ...] = (
     "paper_check",
     "planning",
@@ -1143,6 +1144,35 @@ def last_review_cycle(state: Dict[str, Any]) -> int:
         return int(state.get("cycle", 0) or 0)
 
 
+def last_validation_cycle(state: Dict[str, Any]) -> int:
+    last_validation = state.get("last_validation") or {}
+    value = last_validation.get("cycle", 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def determine_resume_cycle_and_stage(state: Dict[str, Any]) -> Tuple[int, str]:
+    current_cycle = int(state.get("cycle", 0) or 0)
+    if current_cycle <= 0:
+        return 1, "worker"
+
+    if last_review_cycle(state) >= current_cycle:
+        return current_cycle + 1, "worker"
+
+    last_validation = state.get("last_validation")
+    if (
+        isinstance(last_validation, dict)
+        and last_validation_cycle(state) == current_cycle
+        and isinstance(state.get("last_worker_handoff"), dict)
+        and "last_worker_output" in state
+    ):
+        return current_cycle, "reviewer"
+
+    return current_cycle, "worker"
+
+
 def has_unhandled_stuck_review(state: Dict[str, Any]) -> bool:
     last_review = state.get("last_review") or {}
     if str(last_review.get("decision", "")).strip().upper() != "STUCK":
@@ -2157,6 +2187,44 @@ def launch_tmux_burst(
     }
 
 
+def launch_tmux_burst_with_retries(
+    adapter: ProviderAdapter,
+    cycle: int,
+    prompt: str,
+    *,
+    stage_label: str,
+    artifact_name: Optional[str] = None,
+    burst_tag: Optional[str] = None,
+) -> Dict[str, Any]:
+    max_attempts = len(AGENT_CLI_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(1, max_attempts + 1):
+        run = launch_tmux_burst(
+            adapter,
+            cycle,
+            prompt,
+            artifact_name=artifact_name,
+            burst_tag=burst_tag,
+        )
+        if run["exit_code"] == 0:
+            return run
+
+        if attempt > len(AGENT_CLI_RETRY_DELAYS_SECONDS):
+            raise SupervisorError(
+                f"{stage_label.capitalize()} process exited with code {run['exit_code']} after "
+                f"{len(AGENT_CLI_RETRY_DELAYS_SECONDS)} retry attempts. See {run['per_cycle_log']}"
+            )
+
+        delay_seconds = AGENT_CLI_RETRY_DELAYS_SECONDS[attempt - 1]
+        delay_hours = int(delay_seconds // 3600)
+        print(
+            f"{stage_label.capitalize()} process exited with code {run['exit_code']}. "
+            f"Retrying the same burst in {delay_hours} hour(s). See {run['per_cycle_log']}"
+        )
+        time.sleep(delay_seconds)
+
+    raise AssertionError("unreachable")
+
+
 def parse_json_object_file(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise SupervisorError(f"Expected JSON artifact not found: {path}")
@@ -2362,17 +2430,14 @@ def run_stuck_recovery_review(
         summary=f"Supervisor -> stuck-recovery prompt for cycle {trigger_cycle}",
     )
 
-    run = launch_tmux_burst(
+    run = launch_tmux_burst_with_retries(
         reviewer,
         trigger_cycle,
         prompt,
+        stage_label="reviewer stuck-recovery burst",
         artifact_name=stuck_recovery_suggestion_path(config).name,
         burst_tag=burst_tag,
     )
-    if run["exit_code"] != 0:
-        raise SupervisorError(
-            f"Reviewer stuck-recovery burst exited with code {run['exit_code']}. See {run['per_cycle_log']}"
-        )
     reviewer.mark_initialized()
     recovery_terminal_output = run["captured_output"].strip()
     suggestion = load_json_artifact_with_fallback(
@@ -2499,63 +2564,88 @@ def main() -> int:
     while True:
         phase = current_phase(config, state)
         ensure_repo_files(config, phase)
-        state["cycle"] = int(state.get("cycle", 0)) + 1
-        cycle = state["cycle"]
-        save_state(config, state)
+        cycle, stage = determine_resume_cycle_and_stage(state)
+        is_new_cycle = cycle > int(state.get("cycle", 0) or 0)
+        if is_new_cycle:
+            if config.max_cycles and cycle > config.max_cycles:
+                print(f"Reached max_cycles={config.max_cycles}; stopping.")
+                break
+            state["cycle"] = cycle
+            save_state(config, state)
+        elif stage == "worker":
+            print(f"Resuming interrupted worker burst for cycle {cycle}.")
+        else:
+            print(f"Resuming interrupted reviewer burst for cycle {cycle}.")
 
-        if config.max_cycles and cycle > config.max_cycles:
-            print(f"Reached max_cycles={config.max_cycles}; stopping.")
-            break
+        if stage == "worker":
+            print(f"\n===== cycle {cycle}: worker | phase={phase} =====")
+            worker_prompt = build_worker_prompt(config, state, phase, worker.needs_initial_run())
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                kind="worker_prompt",
+                actor="supervisor",
+                target="worker",
+                content=worker_prompt,
+                content_type="text",
+                summary=f"Supervisor -> worker prompt for cycle {cycle}",
+            )
+            worker_run = launch_tmux_burst_with_retries(
+                worker,
+                cycle,
+                worker_prompt,
+                stage_label="worker burst",
+            )
+            worker.mark_initialized()
+            worker_terminal_output = worker_run["captured_output"].strip()
+            worker_handoff = load_json_artifact_with_fallback(
+                Path(worker_run["artifact_path"]),
+                worker_terminal_output,
+                "status",
+            )
+            worker_handoff = validate_worker_handoff(phase, worker_handoff)
+            state["last_worker_output"] = worker_terminal_output
+            state["last_worker_handoff"] = worker_handoff
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                kind="worker_handoff",
+                actor="worker",
+                target="supervisor",
+                content=worker_handoff,
+                content_type="json",
+            )
 
-        print(f"\n===== cycle {cycle}: worker | phase={phase} =====")
-        worker_prompt = build_worker_prompt(config, state, phase, worker.needs_initial_run())
-        record_chat_event(
-            config,
-            state,
-            cycle=cycle,
-            phase=phase,
-            kind="worker_prompt",
-            actor="supervisor",
-            target="worker",
-            content=worker_prompt,
-            content_type="text",
-            summary=f"Supervisor -> worker prompt for cycle {cycle}",
-        )
-        worker_run = launch_tmux_burst(worker, cycle, worker_prompt)
-        if worker_run["exit_code"] != 0:
-            raise SupervisorError(f"Worker process exited with code {worker_run['exit_code']}. See {worker_run['per_cycle_log']}")
-        worker.mark_initialized()
-        worker_terminal_output = worker_run["captured_output"].strip()
-        worker_handoff = load_json_artifact_with_fallback(Path(worker_run["artifact_path"]), worker_terminal_output, "status")
-        worker_handoff = validate_worker_handoff(phase, worker_handoff)
-        state["last_worker_output"] = worker_terminal_output
-        state["last_worker_handoff"] = worker_handoff
-        record_chat_event(
-            config,
-            state,
-            cycle=cycle,
-            phase=phase,
-            kind="worker_handoff",
-            actor="worker",
-            target="supervisor",
-            content=worker_handoff,
-            content_type="json",
-        )
-
-        validation_summary = run_validation(config, phase, cycle)
-        state["last_validation"] = validation_summary
-        record_chat_event(
-            config,
-            state,
-            cycle=cycle,
-            phase=phase,
-            kind="validation_summary",
-            actor="supervisor",
-            target="reviewer",
-            content=validation_summary,
-            content_type="json",
-        )
-        save_state(config, state)
+            validation_summary = run_validation(config, phase, cycle)
+            state["last_validation"] = validation_summary
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                kind="validation_summary",
+                actor="supervisor",
+                target="reviewer",
+                content=validation_summary,
+                content_type="json",
+            )
+            save_state(config, state)
+        else:
+            worker_terminal_output = str(state.get("last_worker_output") or "").strip()
+            worker_handoff = state.get("last_worker_handoff")
+            validation_summary = state.get("last_validation")
+            if not isinstance(worker_handoff, dict):
+                raise SupervisorError(
+                    f"Cannot resume reviewer cycle {cycle}: missing worker handoff in supervisor state."
+                )
+            if not isinstance(validation_summary, dict) or last_validation_cycle(state) != cycle:
+                raise SupervisorError(
+                    f"Cannot resume reviewer cycle {cycle}: missing validation summary for that cycle."
+                )
 
         print(f"\n===== cycle {cycle}: reviewer | phase={phase} =====")
         worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
@@ -2590,9 +2680,12 @@ def main() -> int:
             content_type="text",
             summary=f"Supervisor -> reviewer prompt for cycle {cycle}",
         )
-        reviewer_run = launch_tmux_burst(reviewer, cycle, reviewer_prompt)
-        if reviewer_run["exit_code"] != 0:
-            raise SupervisorError(f"Reviewer process exited with code {reviewer_run['exit_code']}. See {reviewer_run['per_cycle_log']}")
+        reviewer_run = launch_tmux_burst_with_retries(
+            reviewer,
+            cycle,
+            reviewer_prompt,
+            stage_label="reviewer burst",
+        )
         reviewer.mark_initialized()
         reviewer_terminal_output = reviewer_run["captured_output"].strip()
         decision = load_json_artifact_with_fallback(Path(reviewer_run["artifact_path"]), reviewer_terminal_output, "decision")
