@@ -25,6 +25,7 @@ CHAT_VIEWER_DIR = PACKAGE_DIR / "chat_viewer"
 PROVIDER_CONTEXT_DIR = PACKAGE_DIR / "provider_context"
 PROMPT_TOKEN = "__PROMPT__"
 DEFAULT_CHAT_BASE_URL = "https://packer.math.cmu.edu/lagent-chats/"
+MAX_STUCK_RECOVERY_ATTEMPTS = 3
 PHASES: Tuple[str, ...] = (
     "paper_check",
     "planning",
@@ -961,6 +962,10 @@ def summarize_chat_event(kind: str, content: Any) -> str:
         return "Reviewer requested human input."
     if kind == "human_input":
         return "Human input consumed for resume."
+    if kind == "stuck_recovery_suggestion" and isinstance(content, dict):
+        attempt = content.get("attempt", "?")
+        suggestion = str(content.get("creative_suggestion", "")).strip()
+        return f"Recovery attempt {attempt}: {suggestion}".strip(": ")
     return kind.replace("_", " ")
 
 
@@ -1079,6 +1084,8 @@ def load_state(config: Config) -> Dict[str, Any]:
     state.setdefault("review_log", [])
     state.setdefault("phase_history", [])
     state.setdefault("awaiting_human_input", False)
+    state.setdefault("stuck_recovery_attempts", [])
+    state.setdefault("stuck_recovery_last_trigger_cycle", None)
     current_phase(config, state)
     return state
 
@@ -1103,6 +1110,66 @@ def phase_specific_reviewer_decisions(phase: str) -> Sequence[str]:
 
 def format_json_enum(values: Sequence[str]) -> str:
     return " | ".join(json.dumps(value) for value in values)
+
+
+def stuck_recovery_attempts(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    attempts = state.get("stuck_recovery_attempts")
+    if isinstance(attempts, list):
+        return attempts
+    state["stuck_recovery_attempts"] = []
+    return state["stuck_recovery_attempts"]
+
+
+def clear_stuck_recovery(state: Dict[str, Any]) -> None:
+    state["stuck_recovery_attempts"] = []
+    state["stuck_recovery_last_trigger_cycle"] = None
+
+
+def latest_stuck_recovery_attempt(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    attempts = stuck_recovery_attempts(state)
+    return attempts[-1] if attempts else None
+
+
+def current_stuck_recovery_attempt_number(state: Dict[str, Any]) -> int:
+    return len(stuck_recovery_attempts(state)) + 1
+
+
+def last_review_cycle(state: Dict[str, Any]) -> int:
+    last_review = state.get("last_review") or {}
+    value = last_review.get("cycle", state.get("cycle", 0))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(state.get("cycle", 0) or 0)
+
+
+def has_unhandled_stuck_review(state: Dict[str, Any]) -> bool:
+    last_review = state.get("last_review") or {}
+    if str(last_review.get("decision", "")).strip().upper() != "STUCK":
+        return False
+    trigger_cycle = last_review_cycle(state)
+    return state.get("stuck_recovery_last_trigger_cycle") != trigger_cycle
+
+
+def can_attempt_stuck_recovery(state: Dict[str, Any]) -> bool:
+    return has_unhandled_stuck_review(state) and len(stuck_recovery_attempts(state)) < MAX_STUCK_RECOVERY_ATTEMPTS
+
+
+def record_stuck_recovery_attempt(
+    state: Dict[str, Any],
+    *,
+    trigger_cycle: int,
+    phase: str,
+    suggestion: Dict[str, Any],
+) -> Dict[str, Any]:
+    attempts = stuck_recovery_attempts(state)
+    entry = dict(suggestion)
+    entry["phase"] = phase
+    entry["attempt"] = len(attempts) + 1
+    entry["trigger_cycle"] = trigger_cycle
+    attempts.append(entry)
+    state["stuck_recovery_last_trigger_cycle"] = trigger_cycle
+    return entry
 
 
 def approved_axioms(config: Config) -> List[str]:
@@ -1173,6 +1240,27 @@ def validation_summary_path(config: Config) -> Path:
     return config.state_dir / "validation_summary.json"
 
 
+def stuck_recovery_suggestion_path(config: Config) -> Path:
+    return config.state_dir / "stuck_recovery_suggestion.json"
+
+
+def stuck_recovery_context_text(state: Dict[str, Any]) -> str:
+    latest = latest_stuck_recovery_attempt(state)
+    if not latest:
+        return ""
+    return textwrap.dedent(
+        f"""\
+        Active stuck-recovery guidance:
+        - Attempt {latest.get('attempt', '?')} of {MAX_STUCK_RECOVERY_ATTEMPTS} for the current stuck episode.
+        - Trigger cycle: {latest.get('trigger_cycle', '?')}
+        - Diagnosis: {str(latest.get('diagnosis', '')).strip()}
+        - Creative suggestion: {str(latest.get('creative_suggestion', '')).strip()}
+        - Why it might work: {str(latest.get('why_this_might_work', '')).strip()}
+        - Worker focus prompt: {str(latest.get('worker_prompt', '')).strip()}
+        """
+    ).strip()
+
+
 def phase_context_text(config: Config, state: Dict[str, Any], phase: str) -> str:
     parts = [
         f"Current phase: {phase}",
@@ -1206,6 +1294,9 @@ def phase_context_text(config: Config, state: Dict[str, Any], phase: str) -> str
     if human_input_text:
         parts.append(f"Latest human input from `{relative_repo_label(config, config.workflow.human_input_path)}`:")
         parts.append(human_input_text)
+    stuck_recovery_text = stuck_recovery_context_text(state)
+    if stuck_recovery_text:
+        parts.append(stuck_recovery_text)
     approved = approved_axioms(config)
     parts.append(f"Approved axioms: {approved if approved else '[]'}")
     return "\n".join(parts)
@@ -1336,6 +1427,17 @@ def build_worker_prompt(config: Config, state: Dict[str, Any], phase: str, is_in
             - Next prompt: {(last_review.get("next_prompt") or "Continue from the current frontier.").strip()}
             """
         )
+    stuck_recovery_notes = ""
+    latest_recovery = latest_stuck_recovery_attempt(state)
+    if latest_recovery:
+        stuck_recovery_notes = textwrap.dedent(
+            f"""\
+            Supervisor stuck-recovery guidance:
+            - This burst is recovery attempt {latest_recovery.get('attempt', '?')} of {MAX_STUCK_RECOVERY_ATTEMPTS} for the current stuck episode.
+            - Focus prompt: {str(latest_recovery.get('worker_prompt', '')).strip()}
+            - Creative suggestion: {str(latest_recovery.get('creative_suggestion', '')).strip()}
+            """
+        )
     provider_notes = provider_context_worker_instructions(config)
     git_notes = git_worker_instructions(config)
     return textwrap.dedent(
@@ -1349,7 +1451,7 @@ def build_worker_prompt(config: Config, state: Dict[str, Any], phase: str, is_in
 
         {phase_context_text(config, state, phase)}
 
-        {review_guidance}{provider_notes}
+        {review_guidance}{stuck_recovery_notes}{provider_notes}
         {phase_worker_instructions(config, phase)}
         {git_notes}
 
@@ -1469,6 +1571,92 @@ def build_reviewer_prompt(
           "reason": "brief reason",
           "next_prompt": "short prompt for the worker; empty only if there is no next worker burst"
         }}
+        """
+    ).strip()
+
+
+def build_stuck_recovery_prompt(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    worker_terminal_output: str,
+    worker_handoff_text: str,
+    validation_summary: Dict[str, Any],
+    last_review: Dict[str, Any],
+    is_initial: bool,
+    *,
+    include_terminal_output: bool = True,
+) -> str:
+    goal_text = read_text(config.goal_file).strip()
+    attempts = stuck_recovery_attempts(state)
+    attempt_number = len(attempts) + 1
+    terminal_section = (
+        trim_text(worker_terminal_output, 18000)
+        if include_terminal_output
+        else "[omitted from the web transcript; raw terminal output is only kept in local logs]"
+    )
+    prior_attempts = [
+        {
+            "attempt": attempt.get("attempt"),
+            "diagnosis": attempt.get("diagnosis"),
+            "creative_suggestion": attempt.get("creative_suggestion"),
+            "why_this_might_work": attempt.get("why_this_might_work"),
+            "worker_prompt": attempt.get("worker_prompt"),
+        }
+        for attempt in attempts
+    ]
+    preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
+    return textwrap.dedent(
+        f"""\
+        You are temporarily acting as the supervisor's stuck-recovery reviewer.
+
+        {preface}
+
+        The normal reviewer has already concluded that the current workflow is genuinely stuck.
+        Your job is not to decide `STUCK` versus `CONTINUE`.
+        Instead, review the blocker carefully and propose one creative but concrete recovery strategy for the worker to try next.
+
+        Global goal:
+        {goal_text}
+
+        {phase_context_text(config, state, phase)}
+
+        Triggering stuck review:
+        {json.dumps(last_review, indent=2, ensure_ascii=False)}
+
+        Prior stuck-recovery attempts for this same stuck episode:
+        {json.dumps(prior_attempts, indent=2, ensure_ascii=False) if prior_attempts else "[]"}
+
+        Worker handoff JSON from `supervisor/worker_handoff.json`:
+        {worker_handoff_text}
+
+        Supervisor validation summary from `supervisor/{validation_summary_path(config).name}`:
+        {trim_text(json.dumps(validation_summary, indent=2, ensure_ascii=False), 16000)}
+
+        Worker's latest terminal output:
+        {terminal_section}
+
+        Requirements:
+        - Propose a materially different strategy from any prior stuck-recovery attempts listed above.
+        - Be creative, but keep the suggestion technically grounded in the actual blocker.
+        - Prefer suggestions that could unblock the worker without human input, new axioms, or abandoning the paper-facing interface.
+        - Focus on a concrete next experiment, refactor, alternative reduction, counterexample check, or route change the worker can actually try in the next burst.
+        - If the best idea is an explicit route change, say so directly and explain why it is different from the failed route.
+
+        Before ending this turn:
+        - write your recovery JSON to `supervisor/{stuck_recovery_suggestion_path(config).name}`
+        - also print the same JSON as the final thing in your terminal output
+
+        Return exactly this JSON shape:
+        {{
+          "phase": "{phase}",
+          "diagnosis": "brief diagnosis of the blocker",
+          "creative_suggestion": "one creative but concrete recovery strategy",
+          "why_this_might_work": "brief rationale",
+          "worker_prompt": "a short direct prompt telling the worker exactly what to try next"
+        }}
+
+        This is recovery attempt {attempt_number} of {MAX_STUCK_RECOVERY_ATTEMPTS} for the current stuck episode.
         """
     ).strip()
 
@@ -1733,10 +1921,14 @@ def build_burst_script(
     prompt_file: Path,
     start_file: Path,
     exit_file: Path,
+    *,
+    script_tag: Optional[str] = None,
 ) -> Path:
     runtime_dir = adapter.config.state_dir / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    script_path = runtime_dir / f"{adapter.role}-cycle-{cycle:04d}.sh"
+    safe_script_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", script_tag).strip("-") if script_tag else None
+    script_stem = f"{adapter.role}-{safe_script_tag}" if safe_script_tag else f"{adapter.role}-cycle-{cycle:04d}"
+    script_path = runtime_dir / f"{script_stem}.sh"
     scope_dir = adapter.scope_dir()
 
     lines = [
@@ -1856,28 +2048,39 @@ class ChatMarkdownRefresher:
         self.next_refresh_at = now + self.interval_seconds
 
 
-def launch_tmux_burst(adapter: ProviderAdapter, cycle: int, prompt: str) -> Dict[str, Any]:
+def launch_tmux_burst(
+    adapter: ProviderAdapter,
+    cycle: int,
+    prompt: str,
+    *,
+    artifact_name: Optional[str] = None,
+    burst_tag: Optional[str] = None,
+) -> Dict[str, Any]:
     state_dir = adapter.config.state_dir
     prompts_dir = state_dir / "prompts"
     logs_dir = state_dir / "logs"
     runtime_dir = state_dir / "runtime"
-    prompt_file = prompts_dir / f"{adapter.role}-cycle-{cycle:04d}.txt"
+    safe_burst_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", burst_tag).strip("-") if burst_tag else None
+    prompt_stem = f"{adapter.role}-{safe_burst_tag}" if safe_burst_tag else f"{adapter.role}-cycle-{cycle:04d}"
+    prompt_file = prompts_dir / f"{prompt_stem}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
 
-    if adapter.role == "worker":
+    if artifact_name is not None:
+        artifact_path = state_dir / artifact_name
+    elif adapter.role == "worker":
         artifact_path = state_dir / "worker_handoff.json"
     else:
         artifact_path = state_dir / "review_decision.json"
     artifact_path.unlink(missing_ok=True)  # type: ignore[arg-type]
 
-    start_file = runtime_dir / f"{adapter.role}-cycle-{cycle:04d}.started"
+    start_file = runtime_dir / f"{prompt_stem}.started"
     start_file.unlink(missing_ok=True)  # type: ignore[arg-type]
-    exit_file = runtime_dir / f"{adapter.role}-cycle-{cycle:04d}.exit"
+    exit_file = runtime_dir / f"{prompt_stem}.exit"
     exit_file.unlink(missing_ok=True)  # type: ignore[arg-type]
 
-    script_path = build_burst_script(adapter, cycle, prompt_file, start_file, exit_file)
+    script_path = build_burst_script(adapter, cycle, prompt_file, start_file, exit_file, script_tag=safe_burst_tag)
 
-    per_cycle_log = logs_dir / f"{adapter.role}-cycle-{cycle:04d}.ansi.log"
+    per_cycle_log = logs_dir / f"{prompt_stem}.ansi.log"
     aggregate_log = logs_dir / f"{adapter.role}.all.ansi.log"
     latest_log = logs_dir / f"{adapter.role}.latest.ansi.log"
 
@@ -1889,7 +2092,7 @@ def launch_tmux_burst(adapter: ProviderAdapter, cycle: int, prompt: str) -> Dict
     write_log_header(aggregate_log, header)
 
     session = adapter.config.tmux.session_name
-    window_name = f"{adapter.role}-{cycle:04d}"
+    window_name = f"{adapter.role}-{cycle:04d}" if safe_burst_tag is None else f"{adapter.role}-{safe_burst_tag}"
     proc = tmux_cmd("new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-t", session, "-n", window_name)
     window_id, pane_id = proc.stdout.strip().split()
 
@@ -2032,6 +2235,24 @@ def validate_reviewer_decision(phase: str, decision: Dict[str, Any]) -> Dict[str
     return decision
 
 
+def validate_stuck_recovery_suggestion(phase: str, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+    required_keys = {"phase", "diagnosis", "creative_suggestion", "why_this_might_work", "worker_prompt"}
+    missing = required_keys.difference(suggestion)
+    if missing:
+        raise SupervisorError(f"Stuck-recovery suggestion missing keys: {sorted(missing)}")
+    if str(suggestion.get("phase")).strip().lower() != phase:
+        raise SupervisorError(
+            f"Stuck-recovery suggestion phase mismatch: expected {phase}, got {suggestion.get('phase')}"
+        )
+    for key in ("diagnosis", "creative_suggestion", "why_this_might_work", "worker_prompt"):
+        suggestion[key] = str(suggestion.get(key, "")).strip()
+    if not suggestion["creative_suggestion"]:
+        raise SupervisorError("Stuck-recovery suggestion must include a non-empty creative_suggestion.")
+    if not suggestion["worker_prompt"]:
+        raise SupervisorError("Stuck-recovery suggestion must include a non-empty worker_prompt.")
+    return suggestion
+
+
 def maybe_consume_human_input(config: Config, state: Dict[str, Any]) -> bool:
     if not state.get("awaiting_human_input"):
         return True
@@ -2090,6 +2311,96 @@ def write_input_request(
         """
     )
     config.workflow.input_request_path.write_text(body, encoding="utf-8")
+
+
+def run_stuck_recovery_review(
+    config: Config,
+    state: Dict[str, Any],
+    reviewer: ProviderAdapter,
+    phase: str,
+) -> Dict[str, Any]:
+    last_review = dict(state.get("last_review") or {})
+    trigger_cycle = last_review_cycle(state)
+    validation_summary = state.get("last_validation") or {}
+    worker_terminal_output = str(state.get("last_worker_output") or "").strip()
+    worker_handoff = state.get("last_worker_handoff") or {}
+    worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
+    attempt_number = current_stuck_recovery_attempt_number(state)
+    burst_tag = f"stuck-recovery-{trigger_cycle:04d}-{attempt_number:02d}"
+
+    prompt = build_stuck_recovery_prompt(
+        config,
+        state,
+        phase,
+        worker_terminal_output,
+        worker_handoff_text,
+        validation_summary,
+        last_review,
+        reviewer.needs_initial_run(),
+    )
+    prompt_for_chat = build_stuck_recovery_prompt(
+        config,
+        state,
+        phase,
+        worker_terminal_output,
+        worker_handoff_text,
+        validation_summary,
+        last_review,
+        reviewer.needs_initial_run(),
+        include_terminal_output=False,
+    )
+    record_chat_event(
+        config,
+        state,
+        cycle=trigger_cycle,
+        phase=phase,
+        kind="stuck_recovery_prompt",
+        actor="supervisor",
+        target="reviewer",
+        content=prompt_for_chat,
+        content_type="text",
+        summary=f"Supervisor -> stuck-recovery prompt for cycle {trigger_cycle}",
+    )
+
+    run = launch_tmux_burst(
+        reviewer,
+        trigger_cycle,
+        prompt,
+        artifact_name=stuck_recovery_suggestion_path(config).name,
+        burst_tag=burst_tag,
+    )
+    if run["exit_code"] != 0:
+        raise SupervisorError(
+            f"Reviewer stuck-recovery burst exited with code {run['exit_code']}. See {run['per_cycle_log']}"
+        )
+    reviewer.mark_initialized()
+    recovery_terminal_output = run["captured_output"].strip()
+    suggestion = load_json_artifact_with_fallback(
+        Path(run["artifact_path"]),
+        recovery_terminal_output,
+        "worker_prompt",
+    )
+    suggestion = validate_stuck_recovery_suggestion(phase, suggestion)
+    suggestion = record_stuck_recovery_attempt(
+        state,
+        trigger_cycle=trigger_cycle,
+        phase=phase,
+        suggestion=suggestion,
+    )
+    record_chat_event(
+        config,
+        state,
+        cycle=trigger_cycle,
+        phase=phase,
+        kind="stuck_recovery_suggestion",
+        actor="reviewer",
+        target="supervisor",
+        content=suggestion,
+        content_type="json",
+    )
+    save_state(config, state)
+    append_jsonl(config.state_dir / "stuck_recovery_log.jsonl", suggestion)
+    return suggestion
 
 
 def enforce_terminal_decision(
@@ -2154,6 +2465,19 @@ def main() -> int:
 
     worker = make_adapter("worker", config, state)
     reviewer = make_adapter("reviewer", config, state)
+
+    if can_attempt_stuck_recovery(state):
+        suggestion = run_stuck_recovery_review(config, state, reviewer, phase)
+        print(
+            f"Prepared stuck-recovery attempt {suggestion['attempt']}/{MAX_STUCK_RECOVERY_ATTEMPTS} "
+            f"from prior STUCK review."
+        )
+    elif has_unhandled_stuck_review(state):
+        print(
+            "Stopping because the current stuck episode already exhausted all "
+            f"{MAX_STUCK_RECOVERY_ATTEMPTS} stuck-recovery attempts."
+        )
+        return 0
 
     print(f"repo_path={config.repo_path}")
     print(f"goal_file={config.goal_file}")
@@ -2296,6 +2620,9 @@ def main() -> int:
 
         decision_value = decision["decision"]
         enforce_terminal_decision(phase, decision_value, validation_summary)
+        if decision_value != "STUCK" and stuck_recovery_attempts(state):
+            clear_stuck_recovery(state)
+            save_state(config, state)
         if decision_value == "ADVANCE_PHASE":
             next_value = next_phase(phase)
             state.setdefault("phase_history", []).append(
@@ -2346,8 +2673,22 @@ def main() -> int:
             save_state(config, state)
             print(f"Stopping because reviewer requested human input. See {config.workflow.input_request_path}")
             break
-        if decision_value in {"DONE", "STUCK"}:
-            print(f"Stopping because reviewer returned {decision_value}.")
+        if decision_value == "STUCK":
+            if can_attempt_stuck_recovery(state):
+                suggestion = run_stuck_recovery_review(config, state, reviewer, phase)
+                print(
+                    f"Reviewer returned STUCK; queued stuck-recovery attempt "
+                    f"{suggestion['attempt']}/{MAX_STUCK_RECOVERY_ATTEMPTS}."
+                )
+                time.sleep(config.sleep_seconds)
+                continue
+            print(
+                "Stopping because reviewer returned STUCK after exhausting "
+                f"{MAX_STUCK_RECOVERY_ATTEMPTS} stuck-recovery attempts."
+            )
+            break
+        if decision_value == "DONE":
+            print("Stopping because reviewer returned DONE.")
             break
 
         time.sleep(config.sleep_seconds)

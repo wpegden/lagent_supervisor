@@ -13,7 +13,7 @@ It now supports either:
 
 The worker edits the repo and maintains shared workflow files such as `TASKS.md`, `PAPERNOTES.md`, `PLAN.md`, `PaperDefinitions.lean`, and `PaperTheorems.lean` as the current phase requires.
 
-The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`.
+The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to three distinct stuck-recovery suggestions before finally stopping the run as stuck.
 
 It supports:
 
@@ -34,7 +34,8 @@ Each cycle works like this:
 4. when the worker process exits, the supervisor reads `supervisor/worker_handoff.json` and captures the terminal output from the pane;
 5. the supervisor launches the reviewer the same way;
 6. the reviewer writes `supervisor/review_decision.json`;
-7. if the decision is `CONTINUE`, the supervisor launches the next worker burst.
+7. if the decision is `CONTINUE`, the supervisor launches the next worker burst;
+8. if the decision is `STUCK`, the supervisor asks the reviewer for a creative stuck-recovery strategy and injects that guidance into the next worker burst, up to three consecutive times before finally stopping as stuck.
 
 So the agents are visible in real TTY windows while running, but the supervisor still gets a clean file-based handoff when they finish.
 
@@ -413,7 +414,8 @@ Each cycle:
 7. reviewer writes `supervisor/review_decision.json`;
 8. if `ADVANCE_PHASE`, the supervisor moves to the next workflow phase;
 9. if `NEED_INPUT`, the supervisor writes `INPUT_REQUEST.md` and pauses until `HUMAN_INPUT.md` is provided;
-10. if `CONTINUE`, the supervisor launches the next worker burst.
+10. if `CONTINUE`, the supervisor launches the next worker burst;
+11. if `STUCK`, the supervisor runs a stuck-recovery pass and gives the worker up to three distinct creative recovery attempts before finally stopping as stuck.
 
 ## First recommendation
 

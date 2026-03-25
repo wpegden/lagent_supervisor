@@ -238,6 +238,37 @@ class CommandTests(SupervisorTestCase):
         self.assertIn("separate support files", prompt)
         self.assertIn("short wrappers around results proved elsewhere", prompt)
 
+    def test_worker_prompt_includes_active_stuck_recovery_guidance(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "last_review": {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "reason": "The current route is blocked.",
+                "next_prompt": "",
+                "cycle": 12,
+            },
+            "stuck_recovery_attempts": [
+                {
+                    "phase": "proof_formalization",
+                    "attempt": 1,
+                    "trigger_cycle": 12,
+                    "diagnosis": "Missing support lemma.",
+                    "creative_suggestion": "Switch to a local carrier-set reformulation first.",
+                    "why_this_might_work": "It reduces the blocker to a finite combinatorial lemma.",
+                    "worker_prompt": "Prove the carrier-set reformulation before touching the vertical-door argument.",
+                }
+            ],
+        }
+
+        prompt = supervisor.build_worker_prompt(config, state, "proof_formalization", False)
+
+        self.assertIn("Supervisor stuck-recovery guidance", prompt)
+        self.assertIn("recovery attempt 1 of 3", prompt)
+        self.assertIn("carrier-set reformulation", prompt)
+        self.assertIn("Prove the carrier-set reformulation", prompt)
+
     def test_proof_phase_reviewer_prompt_prefers_support_file_refactors(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path)
@@ -254,6 +285,64 @@ class CommandTests(SupervisorTestCase):
 
         self.assertIn("paper-facing", prompt)
         self.assertIn("separate support files would be cleaner", prompt)
+
+    def test_stuck_recovery_attempt_state_machine(self) -> None:
+        state = {
+            "cycle": 51,
+            "last_review": {"decision": "STUCK", "cycle": 51},
+        }
+
+        self.assertTrue(supervisor.can_attempt_stuck_recovery(state))
+
+        first = supervisor.record_stuck_recovery_attempt(
+            state,
+            trigger_cycle=51,
+            phase="proof_formalization",
+            suggestion={
+                "phase": "proof_formalization",
+                "diagnosis": "d1",
+                "creative_suggestion": "s1",
+                "why_this_might_work": "w1",
+                "worker_prompt": "p1",
+            },
+        )
+        self.assertEqual(first["attempt"], 1)
+        self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
+
+        state["last_review"] = {"decision": "STUCK", "cycle": 52}
+        self.assertTrue(supervisor.can_attempt_stuck_recovery(state))
+        supervisor.record_stuck_recovery_attempt(
+            state,
+            trigger_cycle=52,
+            phase="proof_formalization",
+            suggestion={
+                "phase": "proof_formalization",
+                "diagnosis": "d2",
+                "creative_suggestion": "s2",
+                "why_this_might_work": "w2",
+                "worker_prompt": "p2",
+            },
+        )
+        state["last_review"] = {"decision": "STUCK", "cycle": 53}
+        supervisor.record_stuck_recovery_attempt(
+            state,
+            trigger_cycle=53,
+            phase="proof_formalization",
+            suggestion={
+                "phase": "proof_formalization",
+                "diagnosis": "d3",
+                "creative_suggestion": "s3",
+                "why_this_might_work": "w3",
+                "worker_prompt": "p3",
+            },
+        )
+
+        state["last_review"] = {"decision": "STUCK", "cycle": 54}
+        self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
+
+        supervisor.clear_stuck_recovery(state)
+        self.assertEqual(state["stuck_recovery_attempts"], [])
+        self.assertIsNone(state["stuck_recovery_last_trigger_cycle"])
 
 
 class ArtifactFallbackTests(SupervisorTestCase):
