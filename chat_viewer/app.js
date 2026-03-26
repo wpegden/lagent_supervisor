@@ -81,6 +81,8 @@ function eventTitle(event) {
     branch_strategy_decision: "Branch strategy decision",
     branch_selection_prompt: "Supervisor -> branch selector",
     branch_selection_decision: "Branch selection decision",
+    branch_replacement_prompt: "Supervisor -> branch frontier selector",
+    branch_replacement_decision: "Branch frontier decision",
   };
   return titles[event.kind] || event.kind.replaceAll("_", " ");
 }

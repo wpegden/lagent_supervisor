@@ -13,7 +13,7 @@ It now supports either:
 
 The worker edits the repo and maintains shared workflow files such as `TASKS.md`, `PAPERNOTES.md`, `PLAN.md`, `PaperDefinitions.lean`, and `PaperTheorems.lean` as the current phase requires.
 
-The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to ten distinct stuck-recovery suggestions before finally stopping the run as stuck. In proof formalization, the supervisor can also open a branch episode when the reviewer has identified a genuine route split, such as continuing the current path versus a major rewrite.
+The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to ten distinct stuck-recovery suggestions before finally stopping the run as stuck. Inside a branch run, that branch-local stuck-recovery budget is shorter: four failed recovery attempts cause the branch to be pruned. In proof formalization, the supervisor can also open a branch episode when the reviewer has identified a genuine route split, such as continuing the current path versus a major rewrite.
 
 It supports:
 
@@ -35,13 +35,14 @@ Each cycle works like this:
 5. the supervisor launches the reviewer the same way;
 6. the reviewer writes `supervisor/review_decision.json`;
 7. if the decision is `CONTINUE`, the supervisor launches the next worker burst;
-8. if the decision is `STUCK`, the supervisor asks the reviewer for a creative stuck-recovery strategy and injects that guidance into the next worker burst, up to ten consecutive times before finally stopping as stuck.
-9. if the reviewer identifies a genuine strategic fork, the supervisor can spawn up to `branching.max_current_branches` child runs from the same git commit, let them run for `branching.evaluation_cycle_budget` review cycles each, and then ask which branch seems more likely to eventually succeed at formalizing the whole paper.
+8. if the decision is `STUCK`, the supervisor asks the reviewer for a creative stuck-recovery strategy and injects that guidance into the next worker burst, up to ten consecutive times before finally stopping as stuck; branch-local runs instead use a four-attempt budget and are pruned automatically if they exhaust it.
+9. if the reviewer identifies a genuine strategic fork, the supervisor can spawn up to `branching.max_current_branches` child runs from the same git commit, let them run to the initial branch-selection checkpoint given by `branching.evaluation_cycle_budget`, and then ask which branch seems more likely to eventually succeed at formalizing the whole paper; if the selector says `CONTINUE_BRANCHING`, later checkpoints use shorter recheck increments (default `+10`, then `+5` thereafter).
 
 So the agents are visible in real TTY windows while running, but the supervisor still gets a clean file-based handoff when they finish.
 If the supervisor itself exits mid-cycle, rerunning it resumes the failed stage of the current cycle rather than always starting a fresh worker cycle.
 If a provider CLI process exits nonzero, the supervisor automatically retries the same burst after 1 hour, then 2 hours, then 3 hours before finally surfacing the error.
-If a branch episode is active, the parent supervisor pauses its own mainline, monitors the child branch runs, and after selection leaves the winning child supervisor running in its own worktree.
+If a branch episode is active, the parent supervisor pauses its own mainline, monitors the child branch runs, automatically prunes child branches that exhaust their branch-local stuck-recovery budget, and after selection leaves the winning child supervisor running in its own worktree.
+If a child branch later finds a compelling replacement split while the frontier is already at the branch cap, it can still propose that split upward. The parent supervisor then decides whether to keep the current frontier or replace it by selecting that branch and immediately branching it again.
 
 ## High-level architecture
 
@@ -196,10 +197,33 @@ Pick one of the example configs in `configs/` and update:
   - `startup_timeout_seconds` for launch failures before the burst script starts
   - `burst_timeout_seconds` for a single worker/reviewer burst that never exits
 - optional `tmux.session_name`
+- optional `policy_path`
 - optional branching settings:
   - `branching.max_current_branches` to cap concurrent strategic branches; default `2`
-  - `branching.evaluation_cycle_budget` to control how many reviewer cycles each branch gets before the next selection review; default `20`
-  - `branching.poll_seconds` to control how often the parent supervisor polls branch status while waiting; default `300`
+  - `branching.evaluation_cycle_budget` seeds the initial branch-selection checkpoint in the live policy file; default `20`
+  - `branching.selection_recheck_increments_reviews` controls later checkpoint increments after a `CONTINUE_BRANCHING` decision; default `[10, 5]`, with the last value reused for any further rechecks
+  - `branching.poll_seconds` seeds the default branch-monitor poll interval in the live policy file; default `300`
+
+The supervisor also supports a shared hot-reloadable policy file. By default it lives next to the config as `<config>.policy.json`, or you can set `policy_path` explicitly. Child branch configs inherit the same `policy_path`, so one edit affects the whole project frontier on the next loop/poll boundary without restarting the supervisors.
+
+Phase-1 live policy settings are:
+
+- `stuck_recovery.mainline_max_attempts`
+- `stuck_recovery.branch_max_attempts`
+- `branching.evaluation_cycle_budget`
+- `branching.selection_recheck_increments_reviews`
+- `branching.poll_seconds`
+- `branching.proposal_cooldown_reviews`
+- `branching.replacement_min_confidence`
+- `timing.sleep_seconds`
+- `timing.agent_retry_delays_seconds`
+- `prompt_notes.worker`
+- `prompt_notes.reviewer`
+- `prompt_notes.branching`
+
+If the policy file is invalid, the supervisor keeps using the last known good policy and prints a warning instead of crashing mid-run.
+
+When the frontier is already at `branching.max_current_branches`, the current implementation only allows a replacement split if the proposing branch offers a full new capped frontier by itself. In the default two-branch setup, that means one active branch can propose a two-way split that fully replaces the current frontier if the parent reviewer judges it clearly superior.
 
 If `git.remote_url` is set, the supervisor will:
 
@@ -423,7 +447,7 @@ Each cycle:
 8. if `ADVANCE_PHASE`, the supervisor moves to the next workflow phase;
 9. if `NEED_INPUT`, the supervisor writes `INPUT_REQUEST.md` and pauses until `HUMAN_INPUT.md` is provided;
 10. if `CONTINUE`, the supervisor launches the next worker burst;
-11. if `STUCK`, the supervisor runs a stuck-recovery pass and gives the worker up to ten distinct creative recovery attempts before finally stopping as stuck.
+11. if `STUCK`, the supervisor runs a stuck-recovery pass and gives the worker up to ten distinct creative recovery attempts before finally stopping as stuck; branch-local runs instead get four recovery attempts before that branch is pruned.
 
 ## First recommendation
 

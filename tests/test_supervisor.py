@@ -78,6 +78,7 @@ class SupervisorTestCase(unittest.TestCase):
             sleep_seconds=0.0,
             startup_timeout_seconds=startup_timeout_seconds,
             burst_timeout_seconds=burst_timeout_seconds,
+            policy_path=repo_path.parent / "policy.json",
         )
 
     def make_repo(self) -> Path:
@@ -148,6 +149,27 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(config.branching.max_current_branches, 2)
         self.assertEqual(config.branching.evaluation_cycle_budget, supervisor.DEFAULT_BRANCH_EVALUATION_CYCLES)
         self.assertEqual(config.branching.poll_seconds, supervisor.DEFAULT_BRANCH_POLL_SECONDS)
+        self.assertEqual(config.policy_path, config_path.with_suffix(".policy.json"))
+
+    def test_load_config_reads_explicit_relative_policy_path(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "policy_path": "policies/runtime-policy.json",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.policy_path, (config_path.parent / "policies" / "runtime-policy.json").resolve())
 
     def test_load_config_reads_branching_overrides(self) -> None:
         repo_path = self.make_repo()
@@ -219,6 +241,119 @@ class CommandTests(SupervisorTestCase):
 
         self.assertEqual(config.chat.repo_name, "child-branch")
         self.assertEqual(config.chat.project_name, "paper-project")
+
+
+class PolicyTests(SupervisorTestCase):
+    def test_policy_manager_writes_default_policy_file_and_records_state(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = supervisor.load_state(config)
+
+        manager = supervisor.PolicyManager(config)
+        policy = manager.reload(state=state, force=True, persist=True)
+
+        self.assertTrue(config.policy_path.exists())
+        self.assertEqual(policy.branching.evaluation_cycle_budget, config.branching.evaluation_cycle_budget)
+        self.assertEqual(policy.branching.poll_seconds, config.branching.poll_seconds)
+        self.assertEqual(
+            policy.branching.selection_recheck_increments_reviews,
+            supervisor.DEFAULT_BRANCH_SELECTION_RECHECK_INCREMENTS_REVIEWS,
+        )
+        self.assertEqual(policy.timing.sleep_seconds, config.sleep_seconds)
+        self.assertEqual(
+            state["policy"]["effective"]["stuck_recovery"]["mainline_max_attempts"],
+            supervisor.DEFAULT_MAINLINE_STUCK_RECOVERY_ATTEMPTS,
+        )
+
+    def test_policy_manager_reloads_updated_values(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = supervisor.load_state(config)
+        manager = supervisor.PolicyManager(config)
+        manager.reload(state=state, force=True)
+        supervisor.JsonFile.dump(
+            config.policy_path,
+            {
+                "stuck_recovery": {
+                    "mainline_max_attempts": 7,
+                    "branch_max_attempts": 3,
+                },
+                "branching": {
+                    "evaluation_cycle_budget": 31,
+                    "poll_seconds": 17.5,
+                    "proposal_cooldown_reviews": 9,
+                    "replacement_min_confidence": 0.93,
+                    "selection_recheck_increments_reviews": [12, 6],
+                },
+                "timing": {
+                    "sleep_seconds": 2.5,
+                    "agent_retry_delays_seconds": [11, 22],
+                },
+                "prompt_notes": {
+                    "worker": "Use the paper-facing interface.",
+                    "reviewer": "Prefer the narrowest sound frontier.",
+                    "branching": "Avoid speculative rewrites.",
+                },
+            },
+        )
+
+        policy = manager.reload(state=state, force=True)
+
+        self.assertEqual(policy.stuck_recovery.mainline_max_attempts, 7)
+        self.assertEqual(policy.stuck_recovery.branch_max_attempts, 3)
+        self.assertEqual(policy.branching.evaluation_cycle_budget, 31)
+        self.assertEqual(policy.branching.poll_seconds, 17.5)
+        self.assertEqual(policy.branching.proposal_cooldown_reviews, 9)
+        self.assertEqual(policy.branching.replacement_min_confidence, 0.93)
+        self.assertEqual(policy.branching.selection_recheck_increments_reviews, (12, 6))
+        self.assertEqual(policy.timing.sleep_seconds, 2.5)
+        self.assertEqual(policy.timing.agent_retry_delays_seconds, (11.0, 22.0))
+        self.assertEqual(policy.prompt_notes.worker, "Use the paper-facing interface.")
+
+    def test_branch_selection_schedule_helpers_and_legacy_migration(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {"active_branch_episode": None}
+        episode = {
+            "id": "episode-002",
+            "phase": "proof_formalization",
+            "base_review_count": 44,
+            "next_selection_review_target": 84,
+            "evaluation_cycle_budget": 20,
+        }
+
+        continue_count = supervisor.branch_selection_continue_count(config, episode)
+        self.assertEqual(continue_count, 1)
+        self.assertEqual(
+            supervisor.branch_selection_target_for_continue_count(config, episode, continue_count),
+            74,
+        )
+
+        supervisor.normalize_branch_episode_selection_schedule(config, state, episode)
+        self.assertEqual(episode["selection_continue_count"], 1)
+        self.assertEqual(episode["next_selection_review_target"], 74)
+
+        episode["selection_continue_count"] = 1
+        self.assertEqual(
+            supervisor.branch_selection_target_for_continue_count(config, episode, 2),
+            79,
+        )
+
+    def test_policy_manager_keeps_last_good_policy_after_invalid_edit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = supervisor.load_state(config)
+        manager = supervisor.PolicyManager(config)
+        original = manager.reload(state=state, force=True)
+        config.policy_path.write_text("{not json", encoding="utf-8")
+
+        with mock.patch("builtins.print") as print_mock:
+            fallback = manager.reload(state=state, force=True)
+
+        self.assertEqual(fallback, original)
+        self.assertIn("warning", state["policy"])
+        self.assertTrue(state["policy"]["warning"])
+        print_mock.assert_called()
 
     def test_codex_resume_uses_resume_safe_flags(self) -> None:
         repo_path = self.make_repo()
@@ -501,9 +636,48 @@ class CommandTests(SupervisorTestCase):
         prompt = supervisor.build_worker_prompt(config, state, "proof_formalization", False)
 
         self.assertIn("Supervisor stuck-recovery guidance", prompt)
-        self.assertIn(f"recovery attempt 1 of {supervisor.MAX_STUCK_RECOVERY_ATTEMPTS}", prompt)
+        self.assertIn(f"recovery attempt 1 of {supervisor.stuck_recovery_attempt_limit(state)}", prompt)
         self.assertIn("carrier-set reformulation", prompt)
         self.assertIn("Prove the carrier-set reformulation", prompt)
+
+    def test_branch_worker_prompt_uses_branch_stuck_recovery_limit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "branch_lineage": [
+                {
+                    "episode_id": "episode-001",
+                    "branch_name": "major-rewrite",
+                    "summary": "rewrite",
+                    "rewrite_scope": "major",
+                }
+            ],
+            "last_review": {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "reason": "The current branch is blocked.",
+                "next_prompt": "",
+                "cycle": 12,
+            },
+            "stuck_recovery_attempts": [
+                {
+                    "phase": "proof_formalization",
+                    "attempt": 1,
+                    "trigger_cycle": 12,
+                    "diagnosis": "Missing support lemma.",
+                    "creative_suggestion": "Try a branch-local rewrite.",
+                    "why_this_might_work": "It weakens the local target.",
+                    "worker_prompt": "Rewrite the local target first.",
+                }
+            ],
+        }
+
+        prompt = supervisor.build_worker_prompt(config, state, "proof_formalization", False)
+
+        self.assertIn(
+            f"recovery attempt 1 of {supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS}",
+            prompt,
+        )
 
     def test_proof_phase_reviewer_prompt_prefers_support_file_refactors(self) -> None:
         repo_path = self.make_repo()
@@ -521,6 +695,68 @@ class CommandTests(SupervisorTestCase):
 
         self.assertIn("paper-facing", prompt)
         self.assertIn("separate support files would be cleaner", prompt)
+
+    def test_prompts_include_policy_notes_when_configured(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        policy = supervisor.Policy(
+            stuck_recovery=supervisor.StuckRecoveryPolicy(),
+            branching=supervisor.BranchingPolicy(
+                evaluation_cycle_budget=config.branching.evaluation_cycle_budget,
+                poll_seconds=config.branching.poll_seconds,
+                proposal_cooldown_reviews=4,
+                replacement_min_confidence=0.85,
+            ),
+            timing=supervisor.TimingPolicy(
+                sleep_seconds=config.sleep_seconds,
+                agent_retry_delays_seconds=supervisor.DEFAULT_AGENT_CLI_RETRY_DELAYS_SECONDS,
+            ),
+            prompt_notes=supervisor.PromptNotesPolicy(
+                worker="Prefer paper-facing names.",
+                reviewer="Require a narrower frontier before continuing.",
+                branching="Prefer materially different routes.",
+            ),
+        )
+
+        worker_prompt = supervisor.build_worker_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            False,
+            policy=policy,
+        )
+        reviewer_prompt = supervisor.build_reviewer_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            "worker terminal output",
+            '{"status":"NOT_STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            False,
+            policy=policy,
+        )
+        branching_prompt = supervisor.build_branch_strategy_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            "worker terminal output",
+            '{"status":"STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "confidence": 0.9,
+                "reason": "The route may need a rewrite.",
+                "next_prompt": "",
+                "cycle": 20,
+            },
+            False,
+            policy=policy,
+        )
+
+        self.assertIn("Prefer paper-facing names.", worker_prompt)
+        self.assertIn("Require a narrower frontier before continuing.", reviewer_prompt)
+        self.assertIn("Prefer materially different routes.", branching_prompt)
 
     def test_branch_strategy_prompt_mentions_eventual_whole_paper_success(self) -> None:
         repo_path = self.make_repo()
@@ -547,6 +783,32 @@ class CommandTests(SupervisorTestCase):
         self.assertIn("At most 2 branches may run concurrently", prompt)
         self.assertIn("eventually succeed at formalizing the whole paper", prompt)
         self.assertIn("If `branch_decision` is `BRANCH`, include between 2 and 2 strategies.", prompt)
+
+    def test_branch_strategy_prompt_mentions_parent_managed_replacement_mode(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.branching.max_current_branches = 1
+
+        prompt = supervisor.build_branch_strategy_prompt(
+            config,
+            {"review_log": [], "branch_parent_max_current_branches": 2},
+            "proof_formalization",
+            "worker terminal output",
+            '{"status":"STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "confidence": 0.9,
+                "reason": "The route may need a rewrite.",
+                "next_prompt": "",
+                "cycle": 20,
+            },
+            False,
+        )
+
+        self.assertIn("parent-managed branch frontier", prompt)
+        self.assertIn("proposing up to 2 replacement child strategies", prompt)
 
     def test_branch_selection_prompt_mentions_eventual_whole_paper_success(self) -> None:
         repo_path = self.make_repo()
@@ -611,6 +873,42 @@ class CommandTests(SupervisorTestCase):
 
         self.assertEqual(decision["branch_decision"], "BRANCH")
         self.assertEqual([item["name"] for item in decision["strategies"]], ["continue-current-route", "paper-faithful-rewrite", "topological-route"])
+
+    def test_validate_branch_strategy_decision_accepts_parent_controlled_limit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.branching.max_current_branches = 1
+
+        decision = supervisor.validate_branch_strategy_decision(
+            config,
+            "proof_formalization",
+            {
+                "phase": "proof_formalization",
+                "branch_decision": "branch",
+                "confidence": 0.85,
+                "reason": "The parent frontier should consider a replacement split.",
+                "strategies": [
+                    {
+                        "name": "Local Transversality",
+                        "summary": "Push the endpoint-face extraction route.",
+                        "worker_prompt": "Pursue the local transversality route.",
+                        "why_this_might_eventually_succeed": "It may isolate the exact missing one-cell hypothesis.",
+                        "rewrite_scope": "incremental",
+                    },
+                    {
+                        "name": "Boundary Genericity",
+                        "summary": "Switch to the boundary genericity route.",
+                        "worker_prompt": "Pursue the boundary genericity route.",
+                        "why_this_might_eventually_succeed": "It matches the paper's local geometry more closely.",
+                        "rewrite_scope": "major",
+                    },
+                ],
+            },
+            {"branch_parent_max_current_branches": 2},
+        )
+
+        self.assertEqual(decision["branch_decision"], "BRANCH")
+        self.assertEqual(len(decision["strategies"]), 2)
 
     def test_should_consider_branching_for_cycle_20_style_route_pivot(self) -> None:
         repo_path = self.make_repo()
@@ -683,6 +981,31 @@ class CommandTests(SupervisorTestCase):
 
         self.assertFalse(should_branch)
 
+    def test_should_consider_branching_when_parent_coordinated_replacement_is_enabled(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.branching.max_current_branches = 1
+
+        should_branch = supervisor.should_consider_branching(
+            config,
+            {
+                "cycle": 130,
+                "last_branch_consideration_cycle": 0,
+                "branch_parent_max_current_branches": 2,
+            },
+            "proof_formalization",
+            {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "confidence": 0.89,
+                "reason": "The route is blocked and now clearly splits into two better alternatives.",
+                "next_prompt": "",
+                "cycle": 130,
+            },
+        )
+
+        self.assertTrue(should_branch)
+
     def test_stuck_recovery_attempt_state_machine(self) -> None:
         state = {
             "cycle": 51,
@@ -731,6 +1054,106 @@ class CommandTests(SupervisorTestCase):
         supervisor.clear_stuck_recovery(state)
         self.assertEqual(state["stuck_recovery_attempts"], [])
         self.assertIsNone(state["stuck_recovery_last_trigger_cycle"])
+
+    def test_branch_stuck_recovery_attempt_state_machine_uses_branch_limit(self) -> None:
+        state = {
+            "cycle": 51,
+            "branch_lineage": [
+                {
+                    "episode_id": "episode-001",
+                    "branch_name": "major-rewrite",
+                    "summary": "rewrite",
+                    "rewrite_scope": "major",
+                }
+            ],
+            "last_review": {"decision": "STUCK", "cycle": 51},
+        }
+
+        self.assertEqual(
+            supervisor.stuck_recovery_attempt_limit(state),
+            supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+        )
+        for index in range(1, supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS + 1):
+            self.assertTrue(supervisor.can_attempt_stuck_recovery(state))
+            attempt = supervisor.record_stuck_recovery_attempt(
+                state,
+                trigger_cycle=50 + index,
+                phase="proof_formalization",
+                suggestion={
+                    "phase": "proof_formalization",
+                    "diagnosis": f"d{index}",
+                    "creative_suggestion": f"s{index}",
+                    "why_this_might_work": f"w{index}",
+                    "worker_prompt": f"p{index}",
+                },
+            )
+            self.assertEqual(attempt["attempt"], index)
+            self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
+            if index < supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS:
+                state["last_review"] = {"decision": "STUCK", "cycle": 51 + index}
+
+        state["last_review"] = {
+            "decision": "STUCK",
+            "cycle": 51 + supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+        }
+        self.assertTrue(supervisor.stuck_recovery_exhausted(state))
+        self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
+
+    def test_branch_episode_snapshots_marks_exhausted_stuck_branch(self) -> None:
+        repo_path = self.make_repo()
+        branch_path = repo_path.parent / "branch"
+        branch_path.mkdir(parents=True, exist_ok=True)
+        state_dir = branch_path / ".agent-supervisor"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        supervisor.JsonFile.dump(
+            state_dir / "state.json",
+            {
+                "branch_lineage": [
+                    {
+                        "episode_id": "episode-001",
+                        "branch_name": "major-rewrite",
+                        "summary": "rewrite",
+                        "rewrite_scope": "major",
+                    }
+                ],
+                "cycle": 40,
+                "phase": "proof_formalization",
+                "last_review": {
+                    "decision": "STUCK",
+                    "reason": "Still blocked.",
+                    "cycle": 40,
+                },
+                "stuck_recovery_last_trigger_cycle": 39,
+                "stuck_recovery_attempts": [
+                    {"attempt": 1, "trigger_cycle": 11},
+                    {"attempt": 2, "trigger_cycle": 18},
+                    {"attempt": 3, "trigger_cycle": 27},
+                    {"attempt": 4, "trigger_cycle": 39},
+                ],
+            },
+        )
+
+        snapshots = supervisor.branch_episode_snapshots(
+            {
+                "base_review_count": 0,
+                "branches": [
+                    {
+                        "name": "major-rewrite",
+                        "status": "active",
+                        "worktree_path": str(branch_path),
+                        "config_path": str(branch_path / "branch.json"),
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["branch_status"], "active")
+        self.assertEqual(
+            snapshots[0]["stuck_recovery_attempt_limit"],
+            supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+        )
+        self.assertTrue(snapshots[0]["stuck_recovery_exhausted"])
 
     def test_monitor_active_branch_episode_selects_winner_and_returns(self) -> None:
         repo_path = self.make_repo()
@@ -788,12 +1211,375 @@ class CommandTests(SupervisorTestCase):
             result = supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
 
         self.assertEqual(result, 0)
-        prune_mock.assert_called_once_with(
+        prune_mock.assert_called_once()
+        self.assertEqual(prune_mock.call_args.args[:4], (config, state, state["active_branch_episode"], "major-rewrite"))
+        self.assertIn("policy", prune_mock.call_args.kwargs)
+
+    def test_monitor_active_branch_episode_auto_selects_last_survivor_after_pruning_exhausted_branch(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "cycle": 44,
+            "active_branch_episode": {
+                "id": "episode-002",
+                "phase": "proof_formalization",
+                "branches": [
+                    {"name": "boundary-genericity", "status": "active"},
+                    {"name": "local-transversality", "status": "active"},
+                ],
+            },
+        }
+        reviewer = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
             config,
             state,
-            state["active_branch_episode"],
-            "major-rewrite",
+            ["bash", "-lc", "exit 0"],
         )
+
+        first_snapshots = [
+            {
+                "name": "boundary-genericity",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": True,
+                "stuck_recovery_attempt_limit": supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+                "cycle": 44,
+                "review_count": 50,
+                "progress_reviews": 6,
+                "phase": "proof_formalization",
+            },
+            {
+                "name": "local-transversality",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": False,
+                "stuck_recovery_attempt_limit": supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+                "cycle": 45,
+                "review_count": 51,
+                "progress_reviews": 7,
+                "phase": "proof_formalization",
+            },
+        ]
+        second_snapshots = [
+            {
+                "name": "boundary-genericity",
+                "branch_status": "dead",
+                "stuck_recovery_exhausted": False,
+                "stuck_recovery_attempt_limit": supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+                "cycle": 44,
+                "review_count": 50,
+                "progress_reviews": 6,
+                "phase": "proof_formalization",
+            },
+            {
+                "name": "local-transversality",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": False,
+                "stuck_recovery_attempt_limit": supervisor.MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS,
+                "cycle": 45,
+                "review_count": 51,
+                "progress_reviews": 7,
+                "phase": "proof_formalization",
+            },
+        ]
+
+        def fake_mark_dead(_config, _state, episode, branch_name, *, reason, cycle):
+            for branch in episode["branches"]:
+                if branch["name"] == branch_name:
+                    branch["status"] = "dead"
+                    branch["pruned_reason"] = reason
+                    branch["pruned_cycle"] = cycle
+                    return True
+            return False
+
+        with (
+            mock.patch.object(supervisor, "branch_episode_snapshots", side_effect=[first_snapshots, second_snapshots]),
+            mock.patch.object(supervisor, "mark_branch_dead_in_episode", side_effect=fake_mark_dead) as mark_dead_mock,
+            mock.patch.object(
+                supervisor,
+                "record_automatic_branch_selection",
+                return_value={
+                    "phase": "proof_formalization",
+                    "selection_decision": "SELECT_BRANCH",
+                    "confidence": 1.0,
+                    "reason": "All other branches were pruned.",
+                    "selected_branch": "local-transversality",
+                    "automatic": True,
+                },
+            ) as auto_select_mock,
+            mock.patch.object(supervisor, "run_branch_selection_review") as selection_review_mock,
+            mock.patch.object(
+                supervisor,
+                "prune_branch_episode",
+                return_value={
+                    "name": "local-transversality",
+                    "worktree_path": "/tmp/local-transversality",
+                },
+            ) as prune_mock,
+        ):
+            result = supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
+
+        self.assertEqual(result, 0)
+        mark_dead_mock.assert_called_once()
+        auto_select_mock.assert_called_once()
+        selection_review_mock.assert_not_called()
+        prune_mock.assert_called_once()
+        self.assertEqual(
+            prune_mock.call_args.args[:4],
+            (config, state, state["active_branch_episode"], "local-transversality"),
+        )
+        self.assertIn("policy", prune_mock.call_args.kwargs)
+
+    def test_monitor_active_branch_episode_rejects_pending_replacement_and_restarts_branch(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "cycle": 44,
+            "active_branch_episode": {
+                "id": "episode-002",
+                "phase": "proof_formalization",
+                "branches": [
+                    {"name": "boundary-genericity", "status": "active"},
+                    {"name": "local-transversality", "status": "active"},
+                ],
+            },
+        }
+        reviewer = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
+            config,
+            state,
+            ["bash", "-lc", "exit 0"],
+        )
+        snapshots = [
+            {
+                "name": "boundary-genericity",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": False,
+                "config_path": "/tmp/boundary-genericity.json",
+                "supervisor_session": "boundary-genericity-supervisor",
+                "review_count": 50,
+                "progress_reviews": 6,
+                "cycle": 44,
+                "phase": "proof_formalization",
+                "pending_branch_proposal": {
+                    "branch_decision": "BRANCH",
+                    "confidence": 0.91,
+                    "strategies": [
+                        {"name": "route-a"},
+                        {"name": "route-b"},
+                    ],
+                },
+                "pending_branch_proposal_confidence": 0.91,
+                "pending_branch_proposal_strategy_count": 2,
+            },
+            {
+                "name": "local-transversality",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": False,
+                "config_path": "/tmp/local-transversality.json",
+                "supervisor_session": "local-transversality-supervisor",
+                "review_count": 51,
+                "progress_reviews": 7,
+                "cycle": 45,
+                "phase": "proof_formalization",
+            },
+        ]
+        snapshots_after_reject = [
+            {
+                **snapshots[0],
+                "pending_branch_proposal": None,
+                "pending_branch_proposal_confidence": None,
+                "pending_branch_proposal_strategy_count": 0,
+            },
+            dict(snapshots[1]),
+        ]
+
+        with (
+            mock.patch.object(supervisor, "branch_episode_snapshots", side_effect=[snapshots, snapshots_after_reject]),
+            mock.patch.object(
+                supervisor,
+                "run_branch_replacement_review",
+                return_value={
+                    "phase": "proof_formalization",
+                    "replacement_decision": "KEEP_FRONTIER",
+                    "confidence": 0.72,
+                    "reason": "The proposal is still too speculative.",
+                },
+            ) as replacement_mock,
+            mock.patch.object(supervisor, "clear_pending_branch_proposal_in_snapshot") as clear_mock,
+            mock.patch.object(supervisor, "restart_branch_supervisor_from_snapshot") as restart_mock,
+            mock.patch.object(supervisor, "branch_episode_ready_for_selection", return_value=False),
+            mock.patch.object(supervisor.time, "sleep", side_effect=RuntimeError("stop loop")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop loop"):
+                supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
+
+        replacement_mock.assert_called_once()
+        clear_mock.assert_called_once_with(snapshots[0], cooldown_reviews=supervisor.BRANCH_PROPOSAL_COOLDOWN_REVIEWS)
+        restart_mock.assert_called_once_with(snapshots[0])
+
+    def test_monitor_active_branch_episode_accepts_pending_replacement_and_launches_nested_episode(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "cycle": 44,
+            "active_branch_episode": {
+                "id": "episode-002",
+                "phase": "proof_formalization",
+                "branches": [
+                    {"name": "boundary-genericity", "status": "active"},
+                    {"name": "local-transversality", "status": "active"},
+                ],
+            },
+        }
+        reviewer = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
+            config,
+            state,
+            ["bash", "-lc", "exit 0"],
+        )
+        proposal = {
+            "phase": "proof_formalization",
+            "branch_decision": "BRANCH",
+            "confidence": 0.91,
+            "reason": "Both proposed child routes are better long-term bets.",
+            "strategies": [
+                {"name": "route-a", "summary": "a", "worker_prompt": "a", "why_this_might_eventually_succeed": "a", "rewrite_scope": "major"},
+                {"name": "route-b", "summary": "b", "worker_prompt": "b", "why_this_might_eventually_succeed": "b", "rewrite_scope": "major"},
+            ],
+        }
+        snapshots = [
+            {
+                "name": "boundary-genericity",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": False,
+                "config_path": "/tmp/boundary-genericity.json",
+                "supervisor_session": "boundary-genericity-supervisor",
+                "review_count": 50,
+                "progress_reviews": 6,
+                "cycle": 44,
+                "phase": "proof_formalization",
+                "pending_branch_proposal": proposal,
+                "pending_branch_proposal_confidence": 0.91,
+                "pending_branch_proposal_strategy_count": 2,
+            },
+            {
+                "name": "local-transversality",
+                "branch_status": "active",
+                "stuck_recovery_exhausted": False,
+                "config_path": "/tmp/local-transversality.json",
+                "supervisor_session": "local-transversality-supervisor",
+                "review_count": 51,
+                "progress_reviews": 7,
+                "cycle": 45,
+                "phase": "proof_formalization",
+            },
+        ]
+
+        with (
+            mock.patch.object(supervisor, "branch_episode_snapshots", return_value=snapshots),
+            mock.patch.object(
+                supervisor,
+                "run_branch_replacement_review",
+                return_value={
+                    "phase": "proof_formalization",
+                    "replacement_decision": "REPLACE_WITH_PROPOSAL",
+                    "confidence": 0.91,
+                    "reason": "The proposed split is clearly superior.",
+                },
+            ) as replacement_mock,
+            mock.patch.object(
+                supervisor,
+                "record_branch_selection_decision",
+                return_value={
+                    "phase": "proof_formalization",
+                    "selection_decision": "SELECT_BRANCH",
+                    "confidence": 0.91,
+                    "reason": "The proposed split is clearly superior.",
+                    "selected_branch": "boundary-genericity",
+                    "replacement": True,
+                },
+            ) as record_selection_mock,
+            mock.patch.object(
+                supervisor,
+                "prune_branch_episode",
+                return_value={
+                    "name": "boundary-genericity",
+                    "config_path": "/tmp/boundary-genericity.json",
+                    "supervisor_session": "boundary-genericity-supervisor",
+                },
+            ) as prune_mock,
+            mock.patch.object(
+                supervisor,
+                "launch_nested_branch_episode_from_snapshot",
+                return_value={"id": "episode-003", "branches": [{"name": "route-a"}, {"name": "route-b"}]},
+            ) as launch_mock,
+        ):
+            result = supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
+
+        self.assertEqual(result, 0)
+        replacement_mock.assert_called_once()
+        record_selection_mock.assert_called_once()
+        prune_mock.assert_called_once()
+        self.assertEqual(
+            prune_mock.call_args.args[:4],
+            (config, state, state["active_branch_episode"], "boundary-genericity"),
+        )
+        self.assertIn("policy", prune_mock.call_args.kwargs)
+        launch_mock.assert_called_once()
+
+    def test_monitor_active_branch_episode_continue_branching_uses_shorter_rechecks(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "active_branch_episode": {
+                "id": "episode-002",
+                "phase": "proof_formalization",
+                "base_review_count": 44,
+                "next_selection_review_target": 64,
+                "evaluation_cycle_budget": 20,
+                "selection_continue_count": 0,
+                "branches": [
+                    {"name": "boundary-genericity", "status": "active"},
+                    {"name": "local-transversality", "status": "active"},
+                ],
+            }
+        }
+        reviewer = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
+            config,
+            state,
+            ["bash", "-lc", "exit 0"],
+        )
+        snapshots = [
+            {"name": "boundary-genericity", "branch_status": "active", "review_count": 64, "progress_reviews": 20, "cycle": 65},
+            {"name": "local-transversality", "branch_status": "active", "review_count": 64, "progress_reviews": 12, "cycle": 60},
+        ]
+
+        with (
+            mock.patch.object(supervisor, "branch_episode_snapshots", return_value=snapshots),
+            mock.patch.object(supervisor, "branch_episode_ready_for_selection", return_value=True),
+            mock.patch.object(
+                supervisor,
+                "run_branch_selection_review",
+                return_value={
+                    "phase": "proof_formalization",
+                    "selection_decision": "CONTINUE_BRANCHING",
+                    "confidence": 0.82,
+                    "reason": "Too early to prune.",
+                    "selected_branch": "",
+                },
+            ),
+            mock.patch.object(supervisor.time, "sleep", side_effect=RuntimeError("stop loop")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop loop"):
+                supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
+
+        episode = state["active_branch_episode"]
+        self.assertEqual(episode["selection_continue_count"], 1)
+        self.assertEqual(episode["next_selection_review_target"], 74)
 
     def test_build_child_branch_state_preserves_history_and_extends_lineage(self) -> None:
         state = {
@@ -812,10 +1598,12 @@ class CommandTests(SupervisorTestCase):
                 "why_this_might_eventually_succeed": "cleaner route",
                 "rewrite_scope": "major",
             },
+            parent_max_current_branches=2,
         )
 
         self.assertEqual(child_state["branch_episode_counter"], 2)
         self.assertEqual(len(child_state["branch_history"]), 1)
+        self.assertEqual(child_state["branch_parent_max_current_branches"], 2)
         self.assertEqual(
             [entry["branch_name"] for entry in child_state["branch_lineage"]],
             ["route-a", "route-b"],
@@ -1145,6 +1933,61 @@ class BurstRetryTests(SupervisorTestCase):
             [call.args[0] for call in sleep_mock.call_args_list],
             list(supervisor.AGENT_CLI_RETRY_DELAYS_SECONDS),
         )
+
+    def test_launch_tmux_burst_with_retries_uses_policy_retry_delays(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "worker",
+            config,
+            {},
+            ["bash", "-lc", "exit 0"],
+        )
+        policy = supervisor.Policy(
+            stuck_recovery=supervisor.StuckRecoveryPolicy(),
+            branching=supervisor.BranchingPolicy(
+                evaluation_cycle_budget=config.branching.evaluation_cycle_budget,
+                poll_seconds=config.branching.poll_seconds,
+                proposal_cooldown_reviews=5,
+                replacement_min_confidence=0.8,
+            ),
+            timing=supervisor.TimingPolicy(
+                sleep_seconds=config.sleep_seconds,
+                agent_retry_delays_seconds=(5.0, 7.0),
+            ),
+            prompt_notes=supervisor.PromptNotesPolicy(),
+        )
+        failed = {
+            "captured_output": "capacity error",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "failed.log",
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[failed, succeeded]),
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                9,
+                "prompt",
+                stage_label="worker burst",
+                policy=policy,
+            )
+
+        sleep_mock.assert_called_once_with(5.0)
 
 
 class WorkflowTests(SupervisorTestCase):
@@ -1740,6 +2583,49 @@ class TmuxBurstTests(SupervisorTestCase):
                 supervisor.launch_tmux_burst(adapter, 1, "ignored prompt")
         finally:
             self.cleanup_tmux_session(config.tmux.session_name)
+
+    def test_launch_tmux_burst_reuses_existing_live_window(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, kill_windows_after_capture=False)
+        supervisor.ensure_repo_files(config, "proof_formalization")
+
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="claude", model=None, extra_args=[]),
+            "worker",
+            config,
+            {},
+            ["bash", "-lc", "echo should-not-run"],
+        )
+
+        prompt_stem = "worker-cycle-0007"
+        runtime_dir = config.state_dir / "runtime"
+        logs_dir = config.state_dir / "logs"
+        start_file = runtime_dir / f"{prompt_stem}.started"
+        exit_file = runtime_dir / f"{prompt_stem}.exit"
+        per_cycle_log = logs_dir / f"{prompt_stem}.ansi.log"
+        start_file.write_text("started\n", encoding="utf-8")
+        exit_file.write_text("0\n", encoding="utf-8")
+        per_cycle_log.write_text("existing-output\n", encoding="utf-8")
+
+        def fake_tmux_cmd(*args: str, **kwargs):
+            if args[:3] == ("capture-pane", "-p", "-t"):
+                return subprocess.CompletedProcess(args, 0, stdout="pane-capture\n", stderr="")
+            raise AssertionError(f"unexpected tmux call: {args}")
+
+        with mock.patch.object(
+            supervisor,
+            "find_live_tmux_burst_pane",
+            return_value={"window_id": "@1", "pane_id": "%9"},
+        ), mock.patch.object(supervisor, "tmux_cmd", side_effect=fake_tmux_cmd):
+            run = supervisor.launch_tmux_burst(adapter, 7, "ignored prompt", reuse_existing_window=True)
+
+        self.assertEqual(run["window_id"], "@1")
+        self.assertEqual(run["pane_id"], "%9")
+        self.assertEqual(run["exit_code"], 0)
+        self.assertIn("existing-output", run["captured_output"])
+        latest_log = config.state_dir / "logs" / "worker.latest.ansi.log"
+        self.assertTrue(latest_log.exists())
+        self.assertIn("existing-output", latest_log.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
