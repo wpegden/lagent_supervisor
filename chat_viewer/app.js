@@ -397,12 +397,68 @@ function createBadge(text, className = "") {
   return badge;
 }
 
+function normalizedText(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
 function truncateText(value, limit = 280) {
-  const text = String(value || "").trim().replace(/\s+/g, " ");
+  const text = normalizedText(value);
   if (text.length <= limit) {
     return text;
   }
   return `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function truncationData(value, limit = 280) {
+  const fullText = normalizedText(value);
+  const collapsedText = truncateText(fullText, limit);
+  return {
+    fullText,
+    collapsedText,
+    isTruncated: fullText.length > limit,
+  };
+}
+
+function labeledTruncation(label, value, limit) {
+  const summary = truncationData(value, limit);
+  return {
+    fullText: `${label}: ${summary.fullText}`,
+    collapsedText: `${label}: ${summary.collapsedText}`,
+    isTruncated: summary.isTruncated,
+  };
+}
+
+function setExpandableText(element, summary) {
+  if (!summary || !summary.isTruncated) {
+    element.textContent = summary?.collapsedText || "";
+    return;
+  }
+
+  let expanded = false;
+  const render = () => {
+    element.textContent = expanded ? summary.fullText : summary.collapsedText;
+    element.classList.toggle("is-expanded", expanded);
+    element.classList.toggle("is-collapsed", !expanded);
+    element.setAttribute("aria-expanded", expanded ? "true" : "false");
+    element.title = expanded ? "Click to collapse" : "Click to expand";
+  };
+
+  element.classList.add("expandable-text", "is-collapsed");
+  element.tabIndex = 0;
+  element.setAttribute("role", "button");
+  element.addEventListener("click", () => {
+    expanded = !expanded;
+    render();
+  });
+  element.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    event.preventDefault();
+    expanded = !expanded;
+    render();
+  });
+  render();
 }
 
 function cycleSummaryData(events) {
@@ -434,32 +490,32 @@ function cycleSummaryData(events) {
 
   const lines = [];
   if (workerHandoff && workerHandoff !== headlineEvent) {
-    lines.push(`Worker: ${truncateText(workerHandoff.summary || eventTitle(workerHandoff), 210)}`);
+    lines.push(labeledTruncation("Worker", workerHandoff.summary || eventTitle(workerHandoff), 210));
   }
   if (validation && validation !== headlineEvent) {
-    lines.push(`Validation: ${truncateText(validation.summary || eventTitle(validation), 120)}`);
+    lines.push(labeledTruncation("Validation", validation.summary || eventTitle(validation), 120));
   }
   if (reviewerDecision && reviewerDecision !== headlineEvent) {
-    lines.push(`Review: ${truncateText(reviewerDecision.summary || eventTitle(reviewerDecision), 220)}`);
+    lines.push(labeledTruncation("Review", reviewerDecision.summary || eventTitle(reviewerDecision), 220));
   }
   if (branchStrategy && branchStrategy !== headlineEvent) {
-    lines.push(`Branch strategy: ${truncateText(branchStrategy.summary || eventTitle(branchStrategy), 180)}`);
+    lines.push(labeledTruncation("Branch strategy", branchStrategy.summary || eventTitle(branchStrategy), 180));
   }
   if (branchSelection && branchSelection !== headlineEvent) {
-    lines.push(`Branch selection: ${truncateText(branchSelection.summary || eventTitle(branchSelection), 180)}`);
+    lines.push(labeledTruncation("Branch selection", branchSelection.summary || eventTitle(branchSelection), 180));
   }
   if (phaseTransition && phaseTransition !== headlineEvent) {
-    lines.push(`Transition: ${truncateText(phaseTransition.summary || eventTitle(phaseTransition), 120)}`);
+    lines.push(labeledTruncation("Transition", phaseTransition.summary || eventTitle(phaseTransition), 120));
   }
   if (inputRequest && inputRequest !== headlineEvent) {
-    lines.push(`Input: ${truncateText(inputRequest.summary || eventTitle(inputRequest), 120)}`);
+    lines.push(labeledTruncation("Input", inputRequest.summary || eventTitle(inputRequest), 120));
   }
   if (humanInput && humanInput !== headlineEvent) {
-    lines.push(`Human: ${truncateText(humanInput.summary || eventTitle(humanInput), 120)}`);
+    lines.push(labeledTruncation("Human", humanInput.summary || eventTitle(humanInput), 120));
   }
 
   return {
-    headline: truncateText(headlineEvent ? (headlineEvent.summary || eventTitle(headlineEvent)) : "No summary yet.", 320),
+    headline: truncationData(headlineEvent ? (headlineEvent.summary || eventTitle(headlineEvent)) : "No summary yet.", 320),
     detailLines: lines.slice(0, 4),
     reviewerDecision,
     workerHandoff,
@@ -510,7 +566,7 @@ function buildCycleCard(cycle, events, extraClass = "") {
 
   const headline = document.createElement("p");
   headline.className = "cycle-summary";
-  headline.textContent = summary.headline;
+  setExpandableText(headline, summary.headline);
 
   cycleCard.append(header, headline);
   if (summary.detailLines.length) {
@@ -519,7 +575,7 @@ function buildCycleCard(cycle, events, extraClass = "") {
     summary.detailLines.forEach((line) => {
       const item = document.createElement("p");
       item.className = "cycle-detail";
-      item.textContent = line;
+      setExpandableText(item, line);
       detailList.append(item);
     });
     cycleCard.append(detailList);
@@ -533,15 +589,28 @@ function projectIsBranched() {
 }
 
 function projectBranchOverview() {
-  const overview = state.currentMeta?.branch_overview;
-  if (!overview?.has_branching) {
+  const nodes = projectTimelineNodes();
+  if (!nodes.size) {
     return null;
   }
-  const derivedPath = derivedCurrentProjectPath();
+  const episodesByContext = projectEpisodesByContext(nodes);
+  const episodes = [...episodesByContext.values()]
+    .flat()
+    .sort((left, right) => Number(right.trigger_cycle || 0) - Number(left.trigger_cycle || 0))
+    .map(({ sourceRepo: _sourceRepo, sourceScore: _sourceScore, contextKey, contextNode, branchEvent, selectionEvent, branchTimestamp, selectionTimestamp, ...episode }) => episode);
+  if (!episodes.length) {
+    return null;
+  }
+
+  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
+  const derivedPath = liveLeaves.length === 1 ? liveLeaves[0].pathNewToOld : null;
   return {
-    ...overview,
-    current_path_newest_to_oldest: derivedPath || overview.current_path_newest_to_oldest,
-    current_path_status: derivedPath ? "alive" : overview.current_path_status,
+    has_branching: true,
+    episodes,
+    current_path_newest_to_oldest: derivedPath || null,
+    current_path_status: liveLeaves.length === 1 ? "alive" : null,
+    active_leaf_paths: liveLeaves.map((leaf) => leaf.pathNewToOld),
+    active_leaf_count: liveLeaves.length,
   };
 }
 
@@ -571,16 +640,27 @@ function renderBranchOverview() {
   elements.branchTitle.textContent = "Project tree so far";
   elements.branchMeta.textContent =
     `${overview.episodes?.length || 0} branch episode${(overview.episodes?.length || 0) === 1 ? "" : "s"} · ` +
-    `${overview.current_path_status || "alive"} current path`;
+    `${overview.active_leaf_count || 0} active leaf timeline${(overview.active_leaf_count || 0) === 1 ? "" : "s"}`;
 
   elements.branchCurrentPath.replaceChildren();
   const currentPathLabel = document.createElement("p");
   currentPathLabel.className = "branch-current-label";
-  currentPathLabel.textContent = "Current path";
-  const currentPathValue = document.createElement("p");
-  currentPathValue.className = "branch-current-value";
-  currentPathValue.textContent = (overview.current_path_newest_to_oldest || []).join(" ← ");
-  elements.branchCurrentPath.append(currentPathLabel, currentPathValue);
+  if ((overview.active_leaf_count || 0) === 1) {
+    currentPathLabel.textContent = "Current path";
+    const currentPathValue = document.createElement("p");
+    currentPathValue.className = "branch-current-value";
+    currentPathValue.textContent = (overview.current_path_newest_to_oldest || []).join(" ← ");
+    elements.branchCurrentPath.append(currentPathLabel, currentPathValue);
+  } else {
+    currentPathLabel.textContent = "Current frontier";
+    elements.branchCurrentPath.append(currentPathLabel);
+    (overview.active_leaf_paths || []).forEach((path) => {
+      const item = document.createElement("p");
+      item.className = "branch-current-value";
+      item.textContent = path.join(" ← ");
+      elements.branchCurrentPath.append(item);
+    });
+  }
 
   elements.branchEpisodes.replaceChildren();
   (overview.episodes || []).forEach((episode) => {
@@ -891,7 +971,7 @@ function segmentSummary(events, fallback) {
   if (!grouped.length) {
     return fallback;
   }
-  return cycleSummaryData(grouped[0].events).headline;
+  return cycleSummaryData(grouped[0].events).headline.collapsedText;
 }
 
 function strippedBoundarySummary(label, summary) {

@@ -485,6 +485,20 @@ button:hover {
   line-height: 1.55;
 }
 
+.expandable-text {
+  cursor: pointer;
+}
+
+.expandable-text.is-collapsed::after {
+  content: "";
+}
+
+.expandable-text:focus-visible {
+  outline: 2px solid rgba(31, 106, 82, 0.34);
+  outline-offset: 0.2rem;
+  border-radius: 0.35rem;
+}
+
 .cycle-detail-list {
   display: grid;
   gap: 0.3rem;
