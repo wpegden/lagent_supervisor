@@ -264,6 +264,10 @@ class PolicyTests(SupervisorTestCase):
             state["policy"]["effective"]["stuck_recovery"]["mainline_max_attempts"],
             supervisor.DEFAULT_MAINLINE_STUCK_RECOVERY_ATTEMPTS,
         )
+        self.assertEqual(
+            state["policy"]["effective"]["codex_budget_pause"]["weekly_percent_left_threshold"],
+            supervisor.DEFAULT_CODEX_WEEKLY_BUDGET_PAUSE_THRESHOLD_PERCENT_LEFT,
+        )
 
     def test_policy_manager_reloads_updated_values(self) -> None:
         repo_path = self.make_repo()
@@ -289,6 +293,10 @@ class PolicyTests(SupervisorTestCase):
                     "sleep_seconds": 2.5,
                     "agent_retry_delays_seconds": [11, 22],
                 },
+                "codex_budget_pause": {
+                    "weekly_percent_left_threshold": 12.5,
+                    "poll_seconds": 123,
+                },
                 "prompt_notes": {
                     "worker": "Use the paper-facing interface.",
                     "reviewer": "Prefer the narrowest sound frontier.",
@@ -308,7 +316,110 @@ class PolicyTests(SupervisorTestCase):
         self.assertEqual(policy.branching.selection_recheck_increments_reviews, (12, 6))
         self.assertEqual(policy.timing.sleep_seconds, 2.5)
         self.assertEqual(policy.timing.agent_retry_delays_seconds, (11.0, 22.0))
+        self.assertEqual(policy.codex_budget_pause.weekly_percent_left_threshold, 12.5)
+        self.assertEqual(policy.codex_budget_pause.poll_seconds, 123.0)
         self.assertEqual(policy.prompt_notes.worker, "Use the paper-facing interface.")
+
+    def test_latest_codex_token_count_event_in_file_reads_tail_record(self) -> None:
+        repo_path = self.make_repo()
+        session_log = repo_path.parent / "session.jsonl"
+        session_log.write_text(
+            "\n".join(
+                [
+                    json.dumps({"timestamp": "2026-03-26T18:00:00Z", "payload": {"type": "agent_message"}}),
+                    json.dumps(
+                        {
+                            "timestamp": "2026-03-26T18:01:00Z",
+                            "payload": {
+                                "type": "token_count",
+                                "rate_limits": {
+                                    "plan_type": "pro",
+                                    "primary": {"used_percent": 22.0, "window_minutes": 300},
+                                    "secondary": {
+                                        "used_percent": 44.0,
+                                        "window_minutes": 10080,
+                                        "resets_at": 1775081890,
+                                    },
+                                },
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        record = supervisor.latest_codex_token_count_event_in_file(session_log)
+
+        self.assertIsNotNone(record)
+        self.assertEqual(record["timestamp"], "2026-03-26T18:01:00Z")
+
+    def test_wait_for_codex_weekly_budget_if_needed_pauses_until_threshold_clears(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = supervisor.load_state(config)
+
+        low = {
+            "timestamp": "2026-03-26T18:34:00Z",
+            "source_path": "/tmp/session.jsonl",
+            "used_percent": 90.0,
+            "percent_left": 10.0,
+            "window_minutes": 10080,
+            "resets_at": 1775081890,
+        }
+        recovered = {
+            "timestamp": "2026-03-26T18:40:00Z",
+            "source_path": "/tmp/session.jsonl",
+            "used_percent": 80.0,
+            "percent_left": 20.0,
+            "window_minutes": 10080,
+            "resets_at": 1775081890,
+        }
+
+        with (
+            mock.patch.object(supervisor, "latest_codex_weekly_budget_status", side_effect=[low, recovered]),
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            supervisor.wait_for_codex_weekly_budget_if_needed(
+                config,
+                state,
+                phase="proof_formalization",
+                stage_label="worker burst",
+            )
+
+        sleep_mock.assert_called_once_with(
+            supervisor.DEFAULT_CODEX_WEEKLY_BUDGET_PAUSE_POLL_SECONDS
+        )
+        self.assertIsNone(state["codex_budget_pause"])
+
+    def test_wait_for_codex_weekly_budget_if_needed_skips_when_threshold_disabled(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        supervisor.JsonFile.dump(
+            config.policy_path,
+            {
+                "codex_budget_pause": {
+                    "weekly_percent_left_threshold": 0,
+                    "poll_seconds": 123,
+                }
+            },
+        )
+        state = supervisor.load_state(config)
+
+        with (
+            mock.patch.object(supervisor, "latest_codex_weekly_budget_status") as status_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            supervisor.wait_for_codex_weekly_budget_if_needed(
+                config,
+                state,
+                phase="proof_formalization",
+                stage_label="worker burst",
+            )
+
+        status_mock.assert_not_called()
+        sleep_mock.assert_not_called()
 
     def test_branch_selection_schedule_helpers_and_legacy_migration(self) -> None:
         repo_path = self.make_repo()
@@ -326,17 +437,17 @@ class PolicyTests(SupervisorTestCase):
         self.assertEqual(continue_count, 1)
         self.assertEqual(
             supervisor.branch_selection_target_for_continue_count(config, episode, continue_count),
-            74,
+            69,
         )
 
         supervisor.normalize_branch_episode_selection_schedule(config, state, episode)
         self.assertEqual(episode["selection_continue_count"], 1)
-        self.assertEqual(episode["next_selection_review_target"], 74)
+        self.assertEqual(episode["next_selection_review_target"], 69)
 
         episode["selection_continue_count"] = 1
         self.assertEqual(
             supervisor.branch_selection_target_for_continue_count(config, episode, 2),
-            79,
+            74,
         )
 
     def test_policy_manager_keeps_last_good_policy_after_invalid_edit(self) -> None:
@@ -711,6 +822,7 @@ class PolicyTests(SupervisorTestCase):
                 sleep_seconds=config.sleep_seconds,
                 agent_retry_delays_seconds=supervisor.DEFAULT_AGENT_CLI_RETRY_DELAYS_SECONDS,
             ),
+            codex_budget_pause=supervisor.CodexBudgetPausePolicy(),
             prompt_notes=supervisor.PromptNotesPolicy(
                 worker="Prefer paper-facing names.",
                 reviewer="Require a narrower frontier before continuing.",
@@ -1605,7 +1717,7 @@ class PolicyTests(SupervisorTestCase):
 
         episode = state["active_branch_episode"]
         self.assertEqual(episode["selection_continue_count"], 1)
-        self.assertEqual(episode["next_selection_review_target"], 74)
+        self.assertEqual(episode["next_selection_review_target"], 69)
 
     def test_build_child_branch_state_preserves_history_and_extends_lineage(self) -> None:
         state = {
@@ -1982,6 +2094,7 @@ class BurstRetryTests(SupervisorTestCase):
                 sleep_seconds=config.sleep_seconds,
                 agent_retry_delays_seconds=(5.0, 7.0),
             ),
+            codex_budget_pause=supervisor.CodexBudgetPausePolicy(),
             prompt_notes=supervisor.PromptNotesPolicy(),
         )
         failed = {

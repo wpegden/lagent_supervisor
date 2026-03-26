@@ -29,8 +29,10 @@ DEFAULT_MAINLINE_STUCK_RECOVERY_ATTEMPTS = 10
 DEFAULT_BRANCH_STUCK_RECOVERY_ATTEMPTS = 4
 DEFAULT_BRANCH_FRONTIER_REPLACEMENT_MIN_CONFIDENCE = 0.8
 DEFAULT_BRANCH_PROPOSAL_COOLDOWN_REVIEWS = 5
-DEFAULT_BRANCH_SELECTION_RECHECK_INCREMENTS_REVIEWS: Tuple[int, ...] = (10, 5)
+DEFAULT_BRANCH_SELECTION_RECHECK_INCREMENTS_REVIEWS: Tuple[int, ...] = (5,)
 DEFAULT_AGENT_CLI_RETRY_DELAYS_SECONDS: Tuple[float, ...] = (3600.0, 7200.0, 10800.0)
+DEFAULT_CODEX_WEEKLY_BUDGET_PAUSE_THRESHOLD_PERCENT_LEFT = 15.0
+DEFAULT_CODEX_WEEKLY_BUDGET_PAUSE_POLL_SECONDS = 300.0
 MAX_STUCK_RECOVERY_ATTEMPTS = DEFAULT_MAINLINE_STUCK_RECOVERY_ATTEMPTS
 MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS = DEFAULT_BRANCH_STUCK_RECOVERY_ATTEMPTS
 BRANCH_FRONTIER_REPLACEMENT_MIN_CONFIDENCE = DEFAULT_BRANCH_FRONTIER_REPLACEMENT_MIN_CONFIDENCE
@@ -130,6 +132,12 @@ class TimingPolicy:
 
 
 @dataclass(frozen=True)
+class CodexBudgetPausePolicy:
+    weekly_percent_left_threshold: float = DEFAULT_CODEX_WEEKLY_BUDGET_PAUSE_THRESHOLD_PERCENT_LEFT
+    poll_seconds: float = DEFAULT_CODEX_WEEKLY_BUDGET_PAUSE_POLL_SECONDS
+
+
+@dataclass(frozen=True)
 class PromptNotesPolicy:
     worker: str = ""
     reviewer: str = ""
@@ -141,6 +149,7 @@ class Policy:
     stuck_recovery: StuckRecoveryPolicy
     branching: BranchingPolicy
     timing: TimingPolicy
+    codex_budget_pause: CodexBudgetPausePolicy
     prompt_notes: PromptNotesPolicy
 
 
@@ -225,6 +234,7 @@ def default_policy_for_config(config: Config) -> Policy:
             sleep_seconds=config.sleep_seconds,
             agent_retry_delays_seconds=DEFAULT_AGENT_CLI_RETRY_DELAYS_SECONDS,
         ),
+        codex_budget_pause=CodexBudgetPausePolicy(),
         prompt_notes=PromptNotesPolicy(),
     )
 
@@ -245,6 +255,10 @@ def policy_to_raw_dict(policy: Policy) -> Dict[str, Any]:
         "timing": {
             "sleep_seconds": policy.timing.sleep_seconds,
             "agent_retry_delays_seconds": list(policy.timing.agent_retry_delays_seconds),
+        },
+        "codex_budget_pause": {
+            "weekly_percent_left_threshold": policy.codex_budget_pause.weekly_percent_left_threshold,
+            "poll_seconds": policy.codex_budget_pause.poll_seconds,
         },
         "prompt_notes": {
             "worker": policy.prompt_notes.worker,
@@ -269,6 +283,9 @@ def parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
     timing_block = raw.get("timing", {})
     if not isinstance(timing_block, dict):
         raise SupervisorError(f"Policy field timing must be an object: {path}")
+    codex_budget_pause_block = raw.get("codex_budget_pause", {})
+    if not isinstance(codex_budget_pause_block, dict):
+        raise SupervisorError(f"Policy field codex_budget_pause must be an object: {path}")
     prompt_notes_block = raw.get("prompt_notes", {})
     if not isinstance(prompt_notes_block, dict):
         raise SupervisorError(f"Policy field prompt_notes must be an object: {path}")
@@ -349,6 +366,25 @@ def parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
             ),
             agent_retry_delays_seconds=retry_delays,
         ),
+        codex_budget_pause=CodexBudgetPausePolicy(
+            weekly_percent_left_threshold=coerce_float(
+                codex_budget_pause_block.get(
+                    "weekly_percent_left_threshold",
+                    defaults.codex_budget_pause.weekly_percent_left_threshold,
+                ),
+                "policy.codex_budget_pause.weekly_percent_left_threshold",
+                minimum=0.0,
+                maximum=100.0,
+            ),
+            poll_seconds=coerce_float(
+                codex_budget_pause_block.get(
+                    "poll_seconds",
+                    defaults.codex_budget_pause.poll_seconds,
+                ),
+                "policy.codex_budget_pause.poll_seconds",
+                strictly_positive=True,
+            ),
+        ),
         prompt_notes=PromptNotesPolicy(
             worker=str(prompt_notes_block.get("worker", defaults.prompt_notes.worker)).strip(),
             reviewer=str(prompt_notes_block.get("reviewer", defaults.prompt_notes.reviewer)).strip(),
@@ -427,6 +463,205 @@ class PolicyManager:
                 if persist:
                     JsonFile.dump(self.config.state_dir / "state.json", state)
             return self._policy
+
+
+def codex_session_logs_root() -> Path:
+    return Path.home() / ".codex" / "sessions"
+
+
+def recent_codex_session_log_paths(*, limit: int = 10) -> List[Path]:
+    root = codex_session_logs_root()
+    if not root.exists():
+        return []
+    files = [path for path in root.rglob("*.jsonl") if path.is_file()]
+    files.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    return files[:limit]
+
+
+def read_text_tail(path: Path, *, max_bytes: int = 1_000_000) -> str:
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > max_bytes:
+            f.seek(max(0, size - max_bytes))
+        data = f.read()
+    text = data.decode("utf-8", errors="replace")
+    if size > max_bytes and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return text
+
+
+def latest_codex_token_count_event_in_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        tail_text = read_text_tail(path)
+    except OSError:
+        return None
+    for line in reversed(tail_text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+            continue
+        rate_limits = payload.get("rate_limits")
+        if not isinstance(rate_limits, dict):
+            continue
+        secondary = rate_limits.get("secondary")
+        if not isinstance(secondary, dict):
+            continue
+        return record
+    return None
+
+
+def latest_codex_weekly_budget_status() -> Optional[Dict[str, Any]]:
+    latest_record: Optional[Dict[str, Any]] = None
+    latest_path: Optional[Path] = None
+    for path in recent_codex_session_log_paths():
+        record = latest_codex_token_count_event_in_file(path)
+        if record is None:
+            continue
+        timestamp = str(record.get("timestamp") or "")
+        if latest_record is None or timestamp > str(latest_record.get("timestamp") or ""):
+            latest_record = record
+            latest_path = path
+    if latest_record is None or latest_path is None:
+        return None
+    payload = latest_record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        return None
+    secondary = rate_limits.get("secondary")
+    if not isinstance(secondary, dict):
+        return None
+    used_percent = float(secondary.get("used_percent") or 0.0)
+    percent_left = max(0.0, 100.0 - used_percent)
+    return {
+        "timestamp": str(latest_record.get("timestamp") or ""),
+        "source_path": str(latest_path),
+        "plan_type": rate_limits.get("plan_type"),
+        "used_percent": used_percent,
+        "percent_left": percent_left,
+        "window_minutes": int(secondary.get("window_minutes") or 0),
+        "resets_at": secondary.get("resets_at"),
+    }
+
+
+def set_codex_budget_pause_state(
+    config: Config,
+    state: Dict[str, Any],
+    *,
+    active: bool,
+    phase: str,
+    stage_label: str,
+    status: Optional[Dict[str, Any]],
+    threshold_percent_left: float,
+) -> None:
+    current = state.get("codex_budget_pause")
+    if active:
+        payload = {
+            "active": True,
+            "phase": phase,
+            "cycle": int(state.get("cycle", 0) or 0),
+            "stage_label": stage_label,
+            "threshold_percent_left": threshold_percent_left,
+            "percent_left": None if status is None else float(status.get("percent_left") or 0.0),
+            "used_percent": None if status is None else float(status.get("used_percent") or 0.0),
+            "window_minutes": None if status is None else int(status.get("window_minutes") or 0),
+            "resets_at": None if status is None else status.get("resets_at"),
+            "source_path": None if status is None else str(status.get("source_path") or ""),
+            "checked_at": timestamp_now(),
+        }
+        if current != payload:
+            state["codex_budget_pause"] = payload
+            save_state(config, state)
+        return
+
+    if current is not None:
+        state["codex_budget_pause"] = None
+        save_state(config, state)
+
+
+def wait_for_codex_weekly_budget_if_needed(
+    config: Config,
+    state: Dict[str, Any],
+    *,
+    phase: str,
+    stage_label: str,
+) -> None:
+    policy_manager = PolicyManager(config)
+    announced_pause = False
+    while True:
+        policy = policy_manager.reload(state=state, persist=True)
+        threshold = codex_weekly_budget_pause_threshold_percent_left(config, policy)
+        if threshold <= 0:
+            set_codex_budget_pause_state(
+                config,
+                state,
+                active=False,
+                phase=phase,
+                stage_label=stage_label,
+                status=None,
+                threshold_percent_left=threshold,
+            )
+            return
+
+        status = latest_codex_weekly_budget_status()
+        if status is None:
+            set_codex_budget_pause_state(
+                config,
+                state,
+                active=False,
+                phase=phase,
+                stage_label=stage_label,
+                status=None,
+                threshold_percent_left=threshold,
+            )
+            return
+
+        percent_left = float(status.get("percent_left") or 0.0)
+        if percent_left >= threshold:
+            if announced_pause:
+                print(
+                    "Resuming after Codex weekly budget pause: "
+                    f"{percent_left:.1f}% left (threshold {threshold:.1f}%)."
+                )
+            set_codex_budget_pause_state(
+                config,
+                state,
+                active=False,
+                phase=phase,
+                stage_label=stage_label,
+                status=status,
+                threshold_percent_left=threshold,
+            )
+            return
+
+        set_codex_budget_pause_state(
+            config,
+            state,
+            active=True,
+            phase=phase,
+            stage_label=stage_label,
+            status=status,
+            threshold_percent_left=threshold,
+        )
+        if not announced_pause:
+            print(
+                "Pausing before launching a new Codex burst because weekly budget is low: "
+                f"{percent_left:.1f}% left (threshold {threshold:.1f}%)."
+            )
+            announced_pause = True
+        print(
+            f"Rechecking Codex weekly budget in "
+            f"{codex_weekly_budget_pause_poll_seconds(config, policy):.0f}s "
+            f"(source: {status.get('source_path')})."
+        )
+        time.sleep(codex_weekly_budget_pause_poll_seconds(config, policy))
 
 def load_config(path: Path) -> Config:
     path = path.expanduser().resolve()
@@ -721,6 +956,16 @@ def supervisor_sleep_seconds(config: Config, policy: Optional[Policy] = None) ->
 
 def agent_retry_delays_seconds(config: Config, policy: Optional[Policy] = None) -> Tuple[float, ...]:
     return effective_policy(config, policy=policy).timing.agent_retry_delays_seconds
+
+
+def codex_weekly_budget_pause_threshold_percent_left(
+    config: Config, policy: Optional[Policy] = None
+) -> float:
+    return effective_policy(config, policy=policy).codex_budget_pause.weekly_percent_left_threshold
+
+
+def codex_weekly_budget_pause_poll_seconds(config: Config, policy: Optional[Policy] = None) -> float:
+    return effective_policy(config, policy=policy).codex_budget_pause.poll_seconds
 
 
 def phase_index(phase: str) -> int:
@@ -1803,6 +2048,7 @@ def load_state(config: Config) -> Dict[str, Any]:
     state.setdefault("pending_branch_proposal", None)
     state.setdefault("next_branch_proposal_review_count", 0)
     state.setdefault("last_branch_consideration_cycle", 0)
+    state.setdefault("codex_budget_pause", None)
     state.setdefault("policy", None)
     current_phase(config, state)
     return state
@@ -3454,6 +3700,8 @@ def launch_tmux_burst(
     cycle: int,
     prompt: str,
     *,
+    state: Optional[Dict[str, Any]] = None,
+    phase: Optional[str] = None,
     artifact_name: Optional[str] = None,
     burst_tag: Optional[str] = None,
     reuse_existing_window: bool = False,
@@ -3498,6 +3746,14 @@ def launch_tmux_burst(
                 session=session,
                 window_name=window_name,
             )
+
+    if state is not None and phase is not None:
+        wait_for_codex_weekly_budget_if_needed(
+            adapter.config,
+            state,
+            phase=phase,
+            stage_label=f"{adapter.role} burst",
+        )
 
     artifact_path.unlink(missing_ok=True)  # type: ignore[arg-type]
     start_file.unlink(missing_ok=True)  # type: ignore[arg-type]
@@ -3545,6 +3801,8 @@ def launch_tmux_burst_with_retries(
     cycle: int,
     prompt: str,
     *,
+    state: Optional[Dict[str, Any]] = None,
+    phase: Optional[str] = None,
     stage_label: str,
     artifact_name: Optional[str] = None,
     burst_tag: Optional[str] = None,
@@ -3558,6 +3816,8 @@ def launch_tmux_burst_with_retries(
             adapter,
             cycle,
             prompt,
+            state=state,
+            phase=phase,
             artifact_name=artifact_name,
             burst_tag=burst_tag,
             reuse_existing_window=reuse_existing_window and attempt == 1,
@@ -3994,6 +4254,8 @@ def run_stuck_recovery_review(
         reviewer,
         trigger_cycle,
         prompt,
+        state=state,
+        phase=phase,
         stage_label="reviewer stuck-recovery burst",
         artifact_name=stuck_recovery_suggestion_path(config).name,
         burst_tag=burst_tag,
@@ -4397,6 +4659,8 @@ def run_branch_strategy_review(
         reviewer,
         cycle,
         prompt,
+        state=state,
+        phase=phase,
         stage_label="reviewer branch-strategy burst",
         artifact_name=branch_strategy_artifact_path(config).name,
         burst_tag=f"branch-strategy-{cycle:04d}",
@@ -4462,6 +4726,8 @@ def run_branch_selection_review(
         reviewer,
         cycle,
         prompt,
+        state=state,
+        phase=phase,
         stage_label="reviewer branch-selection burst",
         artifact_name=branch_selection_artifact_path(config).name,
         burst_tag=f"branch-selection-{cycle:04d}",
@@ -4530,6 +4796,8 @@ def run_branch_replacement_review(
         reviewer,
         cycle,
         prompt,
+        state=state,
+        phase=phase,
         stage_label="reviewer branch-frontier burst",
         artifact_name=branch_replacement_artifact_path(config).name,
         burst_tag=f"branch-replacement-{cycle:04d}",
@@ -5172,6 +5440,11 @@ def main() -> int:
         f"evaluation_cycle_budget={policy.branching.evaluation_cycle_budget} "
         f"poll_seconds={policy.branching.poll_seconds}"
     )
+    print(
+        "codex_budget_pause="
+        f"weekly_percent_left_threshold={policy.codex_budget_pause.weekly_percent_left_threshold} "
+        f"poll_seconds={policy.codex_budget_pause.poll_seconds}"
+    )
     print(f"policy_path={resolved_policy_path(config)}")
 
     while True:
@@ -5221,6 +5494,8 @@ def main() -> int:
                 worker,
                 cycle,
                 worker_prompt,
+                state=state,
+                phase=phase,
                 stage_label="worker burst",
                 policy=policy,
                 reuse_existing_window=not is_new_cycle,
@@ -5315,6 +5590,8 @@ def main() -> int:
             reviewer,
             cycle,
             reviewer_prompt,
+            state=state,
+            phase=phase,
             stage_label="reviewer burst",
             policy=policy,
             reuse_existing_window=not is_new_cycle,

@@ -36,11 +36,12 @@ Each cycle works like this:
 6. the reviewer writes `supervisor/review_decision.json`;
 7. if the decision is `CONTINUE`, the supervisor launches the next worker burst;
 8. if the decision is `STUCK`, the supervisor asks the reviewer for a creative stuck-recovery strategy and injects that guidance into the next worker burst, up to ten consecutive times before finally stopping as stuck; branch-local runs instead use a four-attempt budget and are pruned automatically if they exhaust it.
-9. if the reviewer identifies a genuine strategic fork, the supervisor can spawn up to `branching.max_current_branches` child runs from the same git commit, let them run to the initial branch-selection checkpoint given by `branching.evaluation_cycle_budget`, and then ask which branch seems more likely to eventually succeed at formalizing the whole paper; if the selector says `CONTINUE_BRANCHING`, later checkpoints use shorter recheck increments (default `+10`, then `+5` thereafter), and after the initial checkpoint continuing both branches is treated as a higher-bar choice that should be reserved for genuinely close calls.
+9. if the reviewer identifies a genuine strategic fork, the supervisor can spawn up to `branching.max_current_branches` child runs from the same git commit, let them run to the initial branch-selection checkpoint given by `branching.evaluation_cycle_budget`, and then ask which branch seems more likely to eventually succeed at formalizing the whole paper; if the selector says `CONTINUE_BRANCHING`, later checkpoints use shorter recheck increments (default `+5`, reused thereafter), and after the initial checkpoint continuing both branches is treated as a higher-bar choice that should be reserved for genuinely close calls.
 
 So the agents are visible in real TTY windows while running, but the supervisor still gets a clean file-based handoff when they finish.
 If the supervisor itself exits mid-cycle, rerunning it resumes the failed stage of the current cycle rather than always starting a fresh worker cycle.
 If a provider CLI process exits nonzero, the supervisor automatically retries the same burst after 1 hour, then 2 hours, then 3 hours before finally surfacing the error.
+If the latest Codex weekly budget drops below the configured policy threshold, the supervisor pauses before launching any new Codex burst and periodically rechecks until the budget recovers; it stays in-process rather than exiting, so resuming does not require a restart.
 If a branch episode is active, the parent supervisor pauses its own mainline, monitors the child branch runs, automatically prunes child branches that exhaust their branch-local stuck-recovery budget, and after selection leaves the winning child supervisor running in its own worktree.
 If a child branch later finds a compelling replacement split while the frontier is already at the branch cap, it can still propose that split upward. The parent supervisor then decides whether to keep the current frontier or replace it by selecting that branch and immediately branching it again.
 
@@ -201,7 +202,7 @@ Pick one of the example configs in `configs/` and update:
 - optional branching settings:
   - `branching.max_current_branches` to cap concurrent strategic branches; default `2`
   - `branching.evaluation_cycle_budget` seeds the initial branch-selection checkpoint in the live policy file; default `20`
-  - `branching.selection_recheck_increments_reviews` controls later checkpoint increments after a `CONTINUE_BRANCHING` decision; default `[10, 5]`, with the last value reused for any further rechecks
+  - `branching.selection_recheck_increments_reviews` controls later checkpoint increments after a `CONTINUE_BRANCHING` decision; default `[5]`, with the last value reused for any further rechecks
   - `branching.poll_seconds` seeds the default branch-monitor poll interval in the live policy file; default `300`
 
 The supervisor also supports a shared hot-reloadable policy file. By default it lives next to the config as `<config>.policy.json`, or you can set `policy_path` explicitly. Child branch configs inherit the same `policy_path`, so one edit affects the whole project frontier on the next loop/poll boundary without restarting the supervisors.
@@ -217,6 +218,8 @@ Phase-1 live policy settings are:
 - `branching.replacement_min_confidence`
 - `timing.sleep_seconds`
 - `timing.agent_retry_delays_seconds`
+- `codex_budget_pause.weekly_percent_left_threshold`
+- `codex_budget_pause.poll_seconds`
 - `prompt_notes.worker`
 - `prompt_notes.reviewer`
 - `prompt_notes.branching`
