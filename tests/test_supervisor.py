@@ -64,6 +64,7 @@ class SupervisorTestCase(unittest.TestCase):
             chat=supervisor.ChatConfig(
                 root_dir=chat_root_dir or (repo_path.parent / "lagent-chats"),
                 repo_name=supervisor.sanitize_repo_name(repo_path.name),
+                project_name=supervisor.sanitize_repo_name(repo_path.name),
                 public_base_url="https://packer.math.cmu.edu/lagent-chats/",
             ),
             git=supervisor.GitConfig(
@@ -173,6 +174,51 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(config.branching.max_current_branches, 4)
         self.assertEqual(config.branching.evaluation_cycle_budget, 27)
         self.assertEqual(config.branching.poll_seconds, 123.5)
+
+    def test_load_config_defaults_chat_project_name_to_repo_name(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "chat": {"repo_name": "child-branch"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.chat.repo_name, "child-branch")
+        self.assertEqual(config.chat.project_name, "child-branch")
+
+    def test_load_config_reads_chat_project_name_override(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "chat": {
+                        "repo_name": "child-branch",
+                        "project_name": "paper-project",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.chat.repo_name, "child-branch")
+        self.assertEqual(config.chat.project_name, "paper-project")
 
     def test_codex_resume_uses_resume_safe_flags(self) -> None:
         repo_path = self.make_repo()
@@ -775,6 +821,42 @@ class CommandTests(SupervisorTestCase):
             ["route-a", "route-b"],
         )
 
+    def test_child_branch_config_payload_preserves_project_name(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config = supervisor.Config(
+            repo_path=config.repo_path,
+            goal_file=config.goal_file,
+            state_dir=config.state_dir,
+            worker=config.worker,
+            reviewer=config.reviewer,
+            tmux=config.tmux,
+            workflow=config.workflow,
+            chat=supervisor.ChatConfig(
+                root_dir=config.chat.root_dir,
+                repo_name="paper-project",
+                project_name="paper-project",
+                public_base_url=config.chat.public_base_url,
+            ),
+            git=config.git,
+            max_cycles=config.max_cycles,
+            sleep_seconds=config.sleep_seconds,
+            startup_timeout_seconds=config.startup_timeout_seconds,
+            burst_timeout_seconds=config.burst_timeout_seconds,
+            branching=config.branching,
+        )
+
+        payload = supervisor.child_branch_config_payload(
+            config,
+            episode_id="episode-001",
+            strategy={"name": "rewrite-route"},
+            worktree_path=repo_path.parent / "paper-project--episode-001--rewrite-route",
+            config_path=repo_path.parent / "episode-001" / "rewrite-route.json",
+        )
+
+        self.assertEqual(payload["chat"]["repo_name"], "paper-project-episode-001-rewrite-route")
+        self.assertEqual(payload["chat"]["project_name"], "paper-project")
+
     def test_branch_overview_marks_dead_current_path(self) -> None:
         overview = supervisor.branch_overview(
             {
@@ -799,6 +881,34 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(overview["current_path_status"], "dead")
         self.assertEqual(overview["episodes"][0]["branches"][1]["status"], "dead")
         self.assertTrue(overview["episodes"][0]["branches"][1]["is_current_path"])
+
+    def test_branch_overview_includes_child_chat_repo_names(self) -> None:
+        overview = supervisor.branch_overview(
+            {
+                "branch_history": [
+                    {
+                        "id": "episode-001",
+                        "status": "active",
+                        "trigger_cycle": 17,
+                        "phase": "proof_formalization",
+                        "lineage": [],
+                        "branches": [
+                            {
+                                "name": "boundary-subdivision",
+                                "chat_repo_name": "paper-project-episode-001-boundary-subdivision",
+                                "summary": "Incremental support-layer repair.",
+                                "rewrite_scope": "incremental",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            overview["episodes"][0]["branches"][0]["repo_name"],
+            "paper-project-episode-001-boundary-subdivision",
+        )
 
 
 class ArtifactFallbackTests(SupervisorTestCase):
@@ -1068,9 +1178,13 @@ class WorkflowTests(SupervisorTestCase):
 
         manifest = json.loads((chat_root / "repos.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["repos"][0]["repo_name"], config.chat.repo_name)
+        self.assertEqual(manifest["repos"][0]["project_name"], config.chat.project_name)
+        self.assertFalse(manifest["repos"][0]["is_branch"])
         self.assertEqual(manifest["repos"][0]["last_reviewer_decision"], "CONTINUE")
 
         meta = json.loads((chat_root / config.chat.repo_name / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["project_name"], config.chat.project_name)
+        self.assertFalse(meta["is_branch"])
         self.assertEqual(meta["current_cycle"], 2)
         self.assertEqual(meta["last_event_kind"], "reviewer_decision")
         exported_paths = {entry["path"] for entry in meta["markdown_files"]}
@@ -1128,6 +1242,7 @@ class WorkflowTests(SupervisorTestCase):
         self.assertEqual(meta["branch_overview"]["current_path_newest_to_oldest"], ["paper-faithful-rewrite", "mainline"])
         self.assertEqual(meta["branch_overview"]["episodes"][0]["branches"][1]["status"], "selected")
         self.assertTrue(meta["branch_overview"]["episodes"][0]["branches"][1]["is_current_path"])
+        self.assertIsNone(meta["branch_overview"]["episodes"][0]["branches"][0]["repo_name"])
 
     def test_refresh_chat_markdown_metadata_updates_stale_export(self) -> None:
         repo_path = self.make_repo()

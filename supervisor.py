@@ -78,6 +78,7 @@ class WorkflowConfig:
 class ChatConfig:
     root_dir: Path
     repo_name: str
+    project_name: str
     public_base_url: str
 
 
@@ -208,6 +209,7 @@ def load_config(path: Path) -> Config:
     if not chat_root_dir.is_absolute():
         chat_root_dir = (repo_path / chat_root_dir).resolve()
     chat_repo_name = sanitize_repo_name(str(chat_block.get("repo_name", repo_path.name)))
+    chat_project_name = sanitize_repo_name(str(chat_block.get("project_name", chat_repo_name)))
     chat_public_base_url = str(chat_block.get("public_base_url", DEFAULT_CHAT_BASE_URL)).strip() or DEFAULT_CHAT_BASE_URL
     if not chat_public_base_url.endswith("/"):
         chat_public_base_url += "/"
@@ -257,6 +259,7 @@ def load_config(path: Path) -> Config:
         chat=ChatConfig(
             root_dir=chat_root_dir,
             repo_name=chat_repo_name,
+            project_name=chat_project_name,
             public_base_url=chat_public_base_url,
         ),
         git=GitConfig(
@@ -902,6 +905,8 @@ def install_chat_viewer_assets(root_dir: Path) -> None:
 def default_chat_meta(config: Config) -> Dict[str, Any]:
     return {
         "repo_name": config.chat.repo_name,
+        "project_name": config.chat.project_name,
+        "is_branch": config.chat.repo_name != config.chat.project_name,
         "repo_display_name": config.repo_path.name,
         "repo_path": str(config.repo_path),
         "goal_file": relative_repo_label(config, config.goal_file),
@@ -919,6 +924,16 @@ def default_chat_meta(config: Config) -> Dict[str, Any]:
         "markdown_files": [],
         "branch_overview": None,
     }
+
+
+def load_chat_meta(config: Config) -> Dict[str, Any]:
+    meta = JsonFile.load(chat_repo_meta_path(config), None)
+    defaults = default_chat_meta(config)
+    if not isinstance(meta, dict):
+        return defaults
+    merged = dict(defaults)
+    merged.update(meta)
+    return merged
 
 
 def branch_lineage_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -989,6 +1004,7 @@ def branch_overview(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             branches_payload.append(
                 {
                     "name": branch_name,
+                    "repo_name": str(raw_branch.get("chat_repo_name", "")).strip() or None,
                     "summary": str(raw_branch.get("summary", "")).strip(),
                     "rewrite_scope": str(raw_branch.get("rewrite_scope", "")).strip(),
                     "status": branch_status,
@@ -1034,7 +1050,7 @@ def sync_chat_state_metadata(config: Config, state: Dict[str, Any]) -> None:
     meta_path = chat_repo_meta_path(config)
     if not meta_path.exists():
         return
-    meta = JsonFile.load(meta_path, default_chat_meta(config))
+    meta = load_chat_meta(config)
     overview = branch_overview(state)
     if meta.get("branch_overview") != overview:
         meta["branch_overview"] = overview
@@ -1139,7 +1155,7 @@ def refresh_chat_markdown_metadata(config: Config, *, update_manifest: bool) -> 
     meta_path = chat_repo_meta_path(config)
     if not repo_dir.exists() or not meta_path.exists():
         return []
-    meta = JsonFile.load(meta_path, default_chat_meta(config))
+    meta = load_chat_meta(config)
     markdown_files = sync_chat_markdown_files(config)
     if meta.get("markdown_files") != markdown_files:
         meta["markdown_files"] = markdown_files
@@ -1170,7 +1186,7 @@ def ensure_chat_site(config: Config) -> None:
     )
     chat_repo_index_path(config).write_text(redirect, encoding="utf-8")
     meta_path = chat_repo_meta_path(config)
-    meta = JsonFile.load(meta_path, default_chat_meta(config))
+    meta = load_chat_meta(config)
     JsonFile.dump(meta_path, meta)
     meta["markdown_files"] = refresh_chat_markdown_metadata(config, update_manifest=False)
     if not meta["markdown_files"]:
@@ -2311,7 +2327,7 @@ def record_chat_event(
     }
     append_jsonl(chat_repo_events_path(config), event)
 
-    meta = JsonFile.load(chat_repo_meta_path(config), default_chat_meta(config))
+    meta = load_chat_meta(config)
     meta.update(
         {
             "updated_at": timestamp,
@@ -3239,6 +3255,7 @@ def config_to_raw_dict(config: Config) -> Dict[str, Any]:
         "chat": {
             "root_dir": str(config.chat.root_dir),
             "repo_name": config.chat.repo_name,
+            "project_name": config.chat.project_name,
             "public_base_url": config.chat.public_base_url,
         },
         "git": {
@@ -3345,6 +3362,7 @@ def child_branch_config_payload(
     if config.workflow.paper_tex_path is not None:
         payload["workflow"]["paper_tex_path"] = str(worktree_path / config.workflow.paper_tex_path.relative_to(config.repo_path))
     payload["chat"]["repo_name"] = child_repo_name
+    payload["chat"]["project_name"] = config.chat.project_name
     payload["git"]["branch"] = branch_strategy_branch_name(config, episode_id, strategy["name"])
     payload["branching"]["max_current_branches"] = 1
     return payload
@@ -3440,6 +3458,7 @@ def create_branch_episode(
         branches.append(
             {
                 "name": label,
+                "chat_repo_name": payload["chat"]["repo_name"],
                 "summary": strategy["summary"],
                 "worker_prompt": strategy["worker_prompt"],
                 "why_this_might_eventually_succeed": strategy["why_this_might_eventually_succeed"],

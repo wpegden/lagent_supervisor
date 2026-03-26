@@ -12,12 +12,12 @@
       <div class="sidebar-header">
         <p class="eyebrow">LAgent Chats</p>
         <h1>Supervisor transcripts</h1>
-        <p class="subtle">Structured prompts, handoffs, and review decisions by repository.</p>
+        <p class="subtle">Structured prompts, handoffs, and review decisions by project.</p>
       </div>
 
       <label class="search">
-        <span>Find repo</span>
-        <input id="repo-search" type="search" placeholder="repo name">
+        <span>Find project</span>
+        <input id="repo-search" type="search" placeholder="project name">
       </label>
 
       <div id="repo-list" class="repo-list"></div>
@@ -43,7 +43,7 @@
         </div>
       </header>
 
-      <section class="filters">
+      <section id="filters" class="filters">
         <label>
           <span>Cycle</span>
           <select id="cycle-filter">
@@ -68,6 +68,17 @@
         </div>
         <div id="branch-current-path" class="branch-current-path"></div>
         <div id="branch-episodes" class="branch-episodes"></div>
+      </section>
+
+      <section id="branch-board" class="branch-board" hidden>
+        <div class="branch-board-header">
+          <div>
+            <p class="eyebrow">Branch Timelines</p>
+            <h3 id="branch-board-title">No branch timelines yet</h3>
+            <p id="branch-board-meta" class="subtle"></p>
+          </div>
+        </div>
+        <div id="branch-board-grid" class="branch-board-grid"></div>
       </section>
 
       <section id="empty-state" class="empty-state">

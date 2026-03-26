@@ -161,10 +161,12 @@ button:hover {
 .topbar,
 .filters,
 .branch-panel,
+.branch-board,
 .empty-state,
 .cycle-card,
 .branch-episode-card,
-.branch-item {
+.branch-item,
+.timeline-column {
   border: 1px solid var(--line);
   background: var(--panel);
   box-shadow: var(--shadow);
@@ -174,6 +176,7 @@ button:hover {
 .topbar,
 .filters,
 .branch-panel,
+.branch-board,
 .empty-state {
   border-radius: 1.3rem;
   padding: 1.2rem 1.3rem;
@@ -352,9 +355,15 @@ button:hover {
   gap: 1rem;
 }
 
+.branch-board {
+  display: grid;
+  gap: 1rem;
+}
+
 .branch-panel-header h3,
 .branch-episode-title,
-.cycle-heading {
+.cycle-heading,
+.timeline-column-title {
   margin: 0;
   font-family: var(--serif);
   line-height: 1.1;
@@ -392,6 +401,11 @@ button:hover {
   gap: 0.9rem;
 }
 
+.branch-board-grid {
+  display: grid;
+  gap: 1rem;
+}
+
 .branch-episode-card {
   border-radius: 1.15rem;
   padding: 1rem 1.05rem;
@@ -415,7 +429,9 @@ button:hover {
 .branch-item-top,
 .cycle-card-header,
 .cycle-card-heading,
-.branch-episode-header {
+.branch-episode-header,
+.timeline-column-header,
+.timeline-column-heading-row {
   display: grid;
   gap: 0.35rem;
 }
@@ -476,7 +492,9 @@ button:hover {
 .cycle-detail,
 .branch-item-path,
 .branch-episode-meta,
-.cycle-meta {
+.cycle-meta,
+.timeline-column-path,
+.timeline-empty {
   color: var(--muted);
   font-size: 0.83rem;
   line-height: 1.45;
@@ -491,6 +509,48 @@ button:hover {
 .branch-item-top {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
+}
+
+.timeline-column {
+  border-radius: 1.15rem;
+  padding: 1rem;
+  display: grid;
+  gap: 0.9rem;
+  min-width: 0;
+  width: 100%;
+}
+
+.timeline-column-heading-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.timeline-column-title {
+  font-size: 1.1rem;
+}
+
+.timeline-column-badges,
+.timeline-column-docs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.timeline-column-summary {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.timeline-column-cycles {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.branch-cycle-card {
+  max-width: 100%;
+  width: 100%;
+  background: rgba(255, 251, 243, 0.94);
 }
 
 .branch-status {
@@ -518,11 +578,42 @@ button:hover {
   background: linear-gradient(135deg, rgba(31, 106, 82, 0.1), rgba(255, 252, 245, 0.95));
 }
 
+.status-mainline {
+  background: rgba(44, 57, 66, 0.08);
+  color: #2c3942;
+}
+
 .status-dead,
 .decision-stuck,
 .decision-need_input {
   background: rgba(124, 56, 34, 0.1);
   color: #7c3822;
+}
+
+.timeline-column.status-dead {
+  opacity: 0.74;
+}
+
+.branch-tree-row {
+  display: grid;
+  gap: 1rem;
+  align-items: start;
+}
+
+.branch-tree-node {
+  max-width: 100%;
+}
+
+.branch-tree-node.continuation-only {
+  padding: 0.7rem 0.9rem;
+  background: rgba(248, 243, 232, 0.85);
+}
+
+.branch-tree-continuation {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  letter-spacing: 0.02em;
 }
 
 @media (max-width: 900px) {
@@ -544,10 +635,19 @@ button:hover {
     justify-content: space-between;
   }
 
+  .branch-board-grid {
+    overflow-x: visible;
+  }
+
   .branch-item,
   .cycle-card,
-  .branch-episode-card {
+  .branch-episode-card,
+  .timeline-column {
     width: 100%;
     max-width: 100%;
+  }
+
+  .branch-tree-row {
+    grid-template-columns: 1fr !important;
   }
 }
