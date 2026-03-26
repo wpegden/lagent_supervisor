@@ -933,6 +933,8 @@ def load_chat_meta(config: Config) -> Dict[str, Any]:
         return defaults
     merged = dict(defaults)
     merged.update(meta)
+    for key in ("repo_name", "project_name", "is_branch", "repo_display_name", "repo_path", "goal_file", "chat_url", "direct_url"):
+        merged[key] = defaults[key]
     return merged
 
 
@@ -2616,6 +2618,13 @@ def write_log_header(path: Path, header: str) -> None:
         f.write(header)
 
 
+def burst_captured_output(log_path: Path, pane_capture: str) -> str:
+    log_text = read_text(log_path)
+    if log_text.strip():
+        return log_text
+    return pane_capture
+
+
 def pane_is_dead(pane_id: str) -> bool:
     proc = tmux_cmd("display-message", "-p", "-t", pane_id, "#{pane_dead}", check=False)
     if proc.returncode != 0:
@@ -2770,7 +2779,8 @@ def launch_tmux_burst(
         time.sleep(0.3)
         chat_markdown_refresher.maybe_refresh(force=True)
         capture = tmux_cmd("capture-pane", "-p", "-t", pane_id, "-S", "-2000", check=False)
-        captured_text = capture.stdout if capture.returncode == 0 else ""
+        pane_capture = capture.stdout if capture.returncode == 0 else ""
+        captured_text = burst_captured_output(per_cycle_log, pane_capture)
         latest_log.write_text(read_text(per_cycle_log), encoding="utf-8")
 
     exit_code_text = read_text(exit_file).strip()
@@ -2851,10 +2861,19 @@ def extract_json_objects(text: str) -> List[Dict[str, Any]]:
     return results
 
 
-def extract_json_object(text: str, required_key: Optional[str] = None) -> Dict[str, Any]:
+def normalize_required_keys(required_key: Optional[Union[str, Sequence[str]]]) -> List[str]:
+    if required_key is None:
+        return []
+    if isinstance(required_key, str):
+        return [required_key]
+    return [str(key) for key in required_key]
+
+
+def extract_json_object(text: str, required_key: Optional[Union[str, Sequence[str]]] = None) -> Dict[str, Any]:
     candidates = extract_json_objects(text)
-    if required_key is not None:
-        candidates = [candidate for candidate in candidates if required_key in candidate]
+    required_keys = normalize_required_keys(required_key)
+    if required_keys:
+        candidates = [candidate for candidate in candidates if all(key in candidate for key in required_keys)]
     if candidates:
         return candidates[-1]
     raise SupervisorError("Could not parse JSON object from captured text")
@@ -2863,23 +2882,24 @@ def extract_json_object(text: str, required_key: Optional[str] = None) -> Dict[s
 def load_json_artifact_with_fallback(
     path: Path,
     captured_text: str,
-    required_key: str,
+    required_key: Union[str, Sequence[str]],
     *,
     fallback_paths: Sequence[Path] = (),
 ) -> Dict[str, Any]:
+    required_keys = normalize_required_keys(required_key)
     errors: List[str] = []
     for candidate in [path, *fallback_paths]:
         if not candidate.exists():
             continue
         try:
             data = parse_json_object_file(candidate)
-            if required_key in data:
+            if all(key in data for key in required_keys):
                 return data
-            errors.append(f"Artifact missing required key {required_key!r}: {candidate}")
+            errors.append(f"Artifact missing required keys {required_keys!r}: {candidate}")
         except SupervisorError as exc:
             errors.append(str(exc))
     try:
-        return extract_json_object(captured_text, required_key=required_key)
+        return extract_json_object(captured_text, required_key=required_keys)
     except SupervisorError as exc:
         errors.append(str(exc))
     raise SupervisorError(" | ".join(errors))
@@ -3030,18 +3050,20 @@ def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phas
 
     artifact_path = config.state_dir / "worker_handoff.json"
     fallback_paths = legacy_supervisor_artifact_paths(config, artifact_path)
-    if not artifact_path.exists() and not any(path.exists() for path in fallback_paths):
-        return False
-
     log_path = config.state_dir / "logs" / f"worker-cycle-{cycle:04d}.ansi.log"
     worker_terminal_output = read_text(log_path).strip() if log_path.exists() else ""
+    if not artifact_path.exists() and not any(path.exists() for path in fallback_paths) and not worker_terminal_output:
+        return False
 
-    worker_handoff = load_json_artifact_with_fallback(
-        artifact_path,
-        worker_terminal_output,
-        "status",
-        fallback_paths=fallback_paths,
-    )
+    try:
+        worker_handoff = load_json_artifact_with_fallback(
+            artifact_path,
+            worker_terminal_output,
+            ("phase", "status", "summary_of_changes", "current_frontier", "likely_next_step", "input_request"),
+            fallback_paths=fallback_paths,
+        )
+    except SupervisorError:
+        return False
     worker_handoff = validate_worker_handoff(phase, worker_handoff)
     state["last_worker_output"] = worker_terminal_output
     state["last_worker_handoff"] = worker_handoff
@@ -3196,7 +3218,7 @@ def run_stuck_recovery_review(
     suggestion = load_json_artifact_with_fallback(
         Path(run["artifact_path"]),
         recovery_terminal_output,
-        "worker_prompt",
+        ("phase", "diagnosis", "creative_suggestion", "why_this_might_work", "worker_prompt"),
         fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
     )
     suggestion = validate_stuck_recovery_suggestion(phase, suggestion)
@@ -3550,7 +3572,7 @@ def run_branch_strategy_review(
     strategy = load_json_artifact_with_fallback(
         Path(run["artifact_path"]),
         run["captured_output"].strip(),
-        "branch_decision",
+        ("phase", "branch_decision", "confidence", "reason", "strategies"),
         fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
     )
     strategy = validate_branch_strategy_decision(config, phase, strategy)
@@ -3612,7 +3634,7 @@ def run_branch_selection_review(
     selection = load_json_artifact_with_fallback(
         Path(run["artifact_path"]),
         run["captured_output"].strip(),
-        "selection_decision",
+        ("phase", "selection_decision", "confidence", "reason", "selected_branch"),
         fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
     )
     selection = validate_branch_selection_decision(phase, selection, allowed)
@@ -3903,7 +3925,7 @@ def main() -> int:
             worker_handoff = load_json_artifact_with_fallback(
                 Path(worker_run["artifact_path"]),
                 worker_terminal_output,
-                "status",
+                ("phase", "status", "summary_of_changes", "current_frontier", "likely_next_step", "input_request"),
                 fallback_paths=legacy_supervisor_artifact_paths(config, Path(worker_run["artifact_path"])),
             )
             worker_handoff = validate_worker_handoff(phase, worker_handoff)
@@ -3992,7 +4014,7 @@ def main() -> int:
         decision = load_json_artifact_with_fallback(
             Path(reviewer_run["artifact_path"]),
             reviewer_terminal_output,
-            "decision",
+            ("phase", "decision", "confidence", "reason", "next_prompt"),
             fallback_paths=legacy_supervisor_artifact_paths(config, Path(reviewer_run["artifact_path"])),
         )
         decision = validate_reviewer_decision(phase, decision)

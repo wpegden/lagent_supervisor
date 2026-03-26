@@ -126,7 +126,9 @@ function branchRepoName(projectRepoName, episode, branch) {
 
 function inferredProjectName(repo, repos) {
   const explicit = String(repo?.project_name || "").trim();
-  if (explicit) {
+  const branchPath = repo?.branch_overview?.current_path_newest_to_oldest;
+  const looksLikeBranchRepo = Array.isArray(branchPath) && branchPath.length > 1;
+  if (explicit && (!looksLikeBranchRepo || explicit !== repo.repo_name)) {
     return explicit;
   }
   for (const candidate of repos) {
@@ -145,7 +147,7 @@ function inferredProjectName(repo, repos) {
       }
     }
   }
-  return repo.repo_name;
+  return explicit || repo.repo_name;
 }
 
 function timelinePath(meta) {
@@ -510,6 +512,19 @@ function projectIsBranched() {
   return Boolean(state.currentMeta?.branch_overview?.has_branching) || state.currentProjectRepos.length > 1;
 }
 
+function projectBranchOverview() {
+  const overview = state.currentMeta?.branch_overview;
+  if (!overview?.has_branching) {
+    return null;
+  }
+  const derivedPath = derivedCurrentProjectPath();
+  return {
+    ...overview,
+    current_path_newest_to_oldest: derivedPath || overview.current_path_newest_to_oldest,
+    current_path_status: derivedPath ? "alive" : overview.current_path_status,
+  };
+}
+
 function statusLabel(branch) {
   if (branch.is_current_path && branch.status === "dead") {
     return "dead current path";
@@ -524,7 +539,7 @@ function statusLabel(branch) {
 }
 
 function renderBranchOverview() {
-  const overview = state.currentMeta?.branch_overview;
+  const overview = projectBranchOverview();
   if (!overview?.has_branching) {
     elements.branchPanel.hidden = true;
     elements.branchCurrentPath.replaceChildren();
@@ -665,6 +680,19 @@ function projectTimelineNodes() {
   return nodes;
 }
 
+function liveLeafNodes(nodes) {
+  return [...nodes.values()].filter((node) => node.children.length === 0 && node.status !== "dead");
+}
+
+function derivedCurrentProjectPath() {
+  const nodes = projectTimelineNodes();
+  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
+  if (liveLeaves.length !== 1) {
+    return null;
+  }
+  return liveLeaves[0].pathNewToOld;
+}
+
 function leafSort(left, right) {
   const statusRank = { selected: 4, active: 3, dead: 2, mainline: 1 };
   const timeDiff = timestampValue(right.projectRepo.meta.updated_at) - timestampValue(left.projectRepo.meta.updated_at);
@@ -697,8 +725,38 @@ function paddedLeafChain(chain, targetLength) {
   return padded;
 }
 
-function buildBranchTreeRows() {
-  const nodes = projectTimelineNodes();
+function eventsAfterTimestamp(events, cutoffTimestamp) {
+  return events.filter((event) => timestampValue(event.timestamp) > cutoffTimestamp);
+}
+
+function eventsUpToTimestamp(events, cutoffTimestamp) {
+  return events.filter((event) => timestampValue(event.timestamp) <= cutoffTimestamp);
+}
+
+function buildSelectedContinuationRows(nodes) {
+  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
+  if (liveLeaves.length !== 1) {
+    return { rows: [], cutoffByNodeKey: new Map() };
+  }
+
+  const rows = [];
+  const cutoffByNodeKey = new Map();
+  let current = liveLeaves[0];
+  while (current.parentKey && nodes.has(current.parentKey)) {
+    const parent = nodes.get(current.parentKey);
+    const cutoffTimestamp = timestampValue(parent.projectRepo.meta.updated_at);
+    const continuationEvents = eventsAfterTimestamp(current.projectRepo.events || [], cutoffTimestamp);
+    if (continuationEvents.length) {
+      rows.push({ node: current, continuationEvents });
+      cutoffByNodeKey.set(current.key, cutoffTimestamp);
+    }
+    current = parent;
+  }
+
+  return { rows, cutoffByNodeKey };
+}
+
+function buildBranchTreeRows(nodes) {
   const leaves = [...nodes.values()].filter((node) => node.children.length === 0).sort(leafSort);
   if (!leaves.length) {
     return { leaves: [], rows: [] };
@@ -737,6 +795,60 @@ function buildBranchTreeRows() {
   return { leaves, rows };
 }
 
+function buildTimelineNodeCard(node, events, options = {}) {
+  const projectRepo = node.projectRepo;
+  const nodeCard = document.createElement("article");
+  nodeCard.className = `timeline-column branch-tree-node status-${node.status}${options.extraClass ? ` ${options.extraClass}` : ""}`;
+
+  const header = document.createElement("div");
+  header.className = "timeline-column-header";
+
+  const headingRow = document.createElement("div");
+  headingRow.className = "timeline-column-heading-row";
+  const title = document.createElement("h4");
+  title.className = "timeline-column-title";
+  title.textContent = options.title || node.name;
+  const badges = document.createElement("div");
+  badges.className = "timeline-column-badges";
+  badges.append(createBadge(projectRepo.meta.current_phase || "unknown"));
+  badges.append(createBadge(node.status, `status-${node.status}`));
+  headingRow.append(title, badges);
+
+  const path = document.createElement("p");
+  path.className = "timeline-column-path subtle";
+  path.textContent = options.pathText || node.pathNewToOld.join(" ← ");
+
+  const summary = document.createElement("p");
+  summary.className = "timeline-column-summary";
+  summary.textContent = options.summary || projectRepo.meta.last_summary || "No summary recorded yet.";
+
+  const docs = document.createElement("div");
+  docs.className = "timeline-column-docs";
+  appendTimelineDocLinks(docs, projectRepo);
+
+  header.append(headingRow, path, summary);
+  if (docs.childElementCount) {
+    header.append(docs);
+  }
+
+  const cycles = document.createElement("div");
+  cycles.className = "timeline-column-cycles";
+  const grouped = cycleGroups(events);
+  if (!grouped.length) {
+    const empty = document.createElement("p");
+    empty.className = "subtle timeline-empty";
+    empty.textContent = "No exported events yet for this timeline.";
+    cycles.append(empty);
+  } else {
+    grouped.forEach(({ cycle, events: cycleEvents }) => {
+      cycles.append(buildCycleCard(cycle, cycleEvents, "branch-cycle-card"));
+    });
+  }
+
+  nodeCard.append(header, cycles);
+  return nodeCard;
+}
+
 function appendTimelineDocLinks(container, projectRepo) {
   const files = Array.isArray(projectRepo.meta?.markdown_files) ? projectRepo.meta.markdown_files : [];
   container.replaceChildren();
@@ -759,18 +871,35 @@ function renderBranchBoard() {
     return;
   }
 
-  const tree = buildBranchTreeRows();
+  const nodes = projectTimelineNodes();
+  const tree = buildBranchTreeRows(nodes);
   if (!tree.leaves.length || !tree.rows.length) {
     elements.branchBoard.hidden = true;
     elements.branchBoardGrid.replaceChildren();
     return;
   }
+  const continuation = buildSelectedContinuationRows(nodes);
 
   elements.branchBoard.hidden = false;
   elements.branchBoardTitle.textContent = `${tree.leaves.length} leaf timeline${tree.leaves.length === 1 ? "" : "s"} above shared history`;
   elements.branchBoardMeta.textContent =
     "Leaf branches stay side by side until one is pruned and the surviving route continues as the main branch above.";
   elements.branchBoardGrid.replaceChildren();
+
+  continuation.rows.forEach(({ node, continuationEvents }) => {
+    const rowElement = document.createElement("section");
+    rowElement.className = "branch-tree-row";
+    rowElement.style.gridTemplateColumns = `repeat(${tree.leaves.length}, minmax(18rem, 1fr))`;
+
+    const nodeCard = buildTimelineNodeCard(node, continuationEvents, {
+      title: "main branch",
+      pathText: `current route: ${node.pathNewToOld.join(" ← ")}`,
+      extraClass: "main-branch-continuation",
+    });
+    nodeCard.style.gridColumn = `1 / span ${tree.leaves.length}`;
+    rowElement.append(nodeCard);
+    elements.branchBoardGrid.append(rowElement);
+  });
 
   tree.rows.forEach((row, rowIndex) => {
     const rowElement = document.createElement("section");
@@ -791,53 +920,13 @@ function renderBranchBoard() {
         return;
       }
 
-      const projectRepo = segment.node.projectRepo;
-      const header = document.createElement("div");
-      header.className = "timeline-column-header";
-
-      const headingRow = document.createElement("div");
-      headingRow.className = "timeline-column-heading-row";
-      const title = document.createElement("h4");
-      title.className = "timeline-column-title";
-      title.textContent = segment.node.name;
-      const badges = document.createElement("div");
-      badges.className = "timeline-column-badges";
-      badges.append(createBadge(projectRepo.meta.current_phase || "unknown"));
-      badges.append(createBadge(segment.node.status, `status-${segment.node.status}`));
-      headingRow.append(title, badges);
-
-      const path = document.createElement("p");
-      path.className = "timeline-column-path subtle";
-      path.textContent = segment.node.pathNewToOld.join(" ← ");
-
-      const summary = document.createElement("p");
-      summary.className = "timeline-column-summary";
-      summary.textContent = projectRepo.meta.last_summary || "No summary recorded yet.";
-
-      const docs = document.createElement("div");
-      docs.className = "timeline-column-docs";
-      appendTimelineDocLinks(docs, projectRepo);
-
-      header.append(headingRow, path, summary);
-      if (docs.childElementCount) {
-        header.append(docs);
-      }
-
-      const cycles = document.createElement("div");
-      cycles.className = "timeline-column-cycles";
-      const grouped = cycleGroups(projectRepo.events || []);
-      if (!grouped.length) {
-        const empty = document.createElement("p");
-        empty.className = "subtle timeline-empty";
-        empty.textContent = "No exported events yet for this timeline.";
-        cycles.append(empty);
-      } else {
-        grouped.forEach(({ cycle, events }) => {
-          cycles.append(buildCycleCard(cycle, events, "branch-cycle-card"));
-        });
-      }
-
-      nodeCard.append(header, cycles);
+      const cutoffTimestamp = continuation.cutoffByNodeKey.get(segment.node.key);
+      const events =
+        cutoffTimestamp === undefined
+          ? segment.node.projectRepo.events || []
+          : eventsUpToTimestamp(segment.node.projectRepo.events || [], cutoffTimestamp);
+      const content = buildTimelineNodeCard(segment.node, events);
+      nodeCard.replaceChildren(...content.childNodes);
       rowElement.append(nodeCard);
     });
 

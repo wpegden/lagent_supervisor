@@ -912,6 +912,23 @@ class CommandTests(SupervisorTestCase):
 
 
 class ArtifactFallbackTests(SupervisorTestCase):
+    def test_burst_captured_output_prefers_raw_log_over_wrapped_pane_capture(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lagent burst capture ") as tmpdir:
+            log_path = Path(tmpdir) / "worker.log"
+            log_path.write_text(
+                '{"phase":"proof_formalization","status":"NOT_STUCK","summary_of_changes":"ok","current_frontier":"x","likely_next_step":"y","input_request":""}\n',
+                encoding="utf-8",
+            )
+            pane_capture = '{"phase":"proof_formalization","status":"NOT_\nSTUCK"}'
+
+            captured = supervisor.burst_captured_output(log_path, pane_capture)
+
+            self.assertIn('"status":"NOT_STUCK"', captured)
+            self.assertEqual(
+                supervisor.extract_json_object(captured, required_key="status")["status"],
+                "NOT_STUCK",
+            )
+
     def test_malformed_artifact_falls_back_to_last_matching_json_in_output(self) -> None:
         with tempfile.TemporaryDirectory(prefix="lagent artifacts ") as tmpdir:
             artifact_path = Path(tmpdir) / "review_decision.json"
@@ -926,6 +943,23 @@ more noise
 """
             data = supervisor.load_json_artifact_with_fallback(artifact_path, captured, "decision")
             self.assertEqual(data["decision"], "CONTINUE")
+
+    def test_fallback_can_require_full_schema_to_avoid_nested_status_object(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lagent artifacts ") as tmpdir:
+            artifact_path = Path(tmpdir) / "worker_handoff.json"
+            captured = """
+noise
+{"phase": "proof_formalization", "status": "NOT_STUCK", "summary_of_changes": "ok", "current_frontier": "f", "likely_next_step": "n", "input_request": ""}
+later noise
+{"status": "clean"}
+"""
+            data = supervisor.load_json_artifact_with_fallback(
+                artifact_path,
+                captured,
+                ("phase", "status", "summary_of_changes", "current_frontier", "likely_next_step", "input_request"),
+            )
+            self.assertEqual(data["status"], "NOT_STUCK")
+            self.assertEqual(data["summary_of_changes"], "ok")
 
     def test_legacy_supervisor_artifact_path_is_used_as_fallback(self) -> None:
         repo_path = self.make_repo()
@@ -984,6 +1018,43 @@ more noise
         self.assertTrue(recovered)
         self.assertEqual(state["last_worker_handoff"]["status"], "STUCK")
         self.assertEqual(state["last_worker_output"], "worker output")
+        self.assertEqual(state["last_validation"]["cycle"], 12)
+        validation_mock.assert_called_once_with(config, "proof_formalization", 12)
+        self.assertEqual(record_mock.call_count, 2)
+
+    def test_recover_interrupted_worker_state_from_log_only(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "logs" / "worker-cycle-0012.ansi.log").write_text(
+            """
+worker output
+{
+  "phase": "proof_formalization",
+  "status": "NOT_STUCK",
+  "summary_of_changes": "made progress",
+  "current_frontier": "frontier",
+  "likely_next_step": "next",
+  "input_request": ""
+}
+""",
+            encoding="utf-8",
+        )
+        state = {
+            "cycle": 12,
+            "last_review": {"cycle": 11, "decision": "CONTINUE"},
+        }
+
+        with (
+            mock.patch.object(supervisor, "run_validation", return_value={"cycle": 12, "build": {"ok": True}}) as validation_mock,
+            mock.patch.object(supervisor, "record_chat_event") as record_mock,
+        ):
+            recovered = supervisor.recover_interrupted_worker_state(config, state, "proof_formalization")
+
+        self.assertTrue(recovered)
+        self.assertEqual(state["last_worker_handoff"]["status"], "NOT_STUCK")
+        self.assertIn("made progress", state["last_worker_output"])
         self.assertEqual(state["last_validation"]["cycle"], 12)
         validation_mock.assert_called_once_with(config, "proof_formalization", 12)
         self.assertEqual(record_mock.call_count, 2)
@@ -1130,6 +1201,42 @@ class WorkflowTests(SupervisorTestCase):
         config.workflow.human_input_path.write_text("fresh input\n", encoding="utf-8")
         self.assertTrue(supervisor.maybe_consume_human_input(config, state))
         self.assertEqual(state["last_human_input"], "fresh input")
+
+    def test_load_chat_meta_refreshes_identity_fields_from_config(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root)
+        meta_path = supervisor.chat_repo_meta_path(config)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "repo_name": "stale-repo",
+                    "project_name": "stale-project",
+                    "is_branch": False,
+                    "repo_display_name": "stale display",
+                    "repo_path": "/tmp/stale",
+                    "goal_file": "stale/GOAL.md",
+                    "chat_url": "https://example.com/stale",
+                    "direct_url": "https://example.com/stale/",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        meta = supervisor.load_chat_meta(config)
+
+        self.assertEqual(meta["repo_name"], config.chat.repo_name)
+        self.assertEqual(meta["project_name"], config.chat.project_name)
+        self.assertEqual(meta["is_branch"], config.chat.repo_name != config.chat.project_name)
+        self.assertEqual(meta["repo_display_name"], config.repo_path.name)
+        self.assertEqual(meta["repo_path"], str(config.repo_path))
+        self.assertEqual(meta["goal_file"], "repo/GOAL.md")
+        self.assertEqual(meta["chat_url"], supervisor.chat_repo_url(config))
+        self.assertEqual(meta["direct_url"], supervisor.chat_repo_direct_url(config))
+        self.assertEqual(meta["updated_at"], "2026-01-01T00:00:00Z")
 
     def test_chat_event_export_builds_manifest_and_repo_files(self) -> None:
         repo_path = self.make_repo()

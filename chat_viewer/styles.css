@@ -30,6 +30,7 @@ body {
     radial-gradient(circle at top left, rgba(255, 255, 255, 0.78), transparent 28rem),
     linear-gradient(135deg, #ebe3d1 0%, #f6f1e6 45%, #e6efe6 100%);
   font-family: var(--sans);
+  overflow-x: auto;
 }
 
 .markdown-page {
@@ -619,6 +620,7 @@ button:hover {
 @media (max-width: 900px) {
   .shell {
     grid-template-columns: 1fr;
+    min-width: 60rem;
   }
 
   .sidebar {
@@ -645,9 +647,5 @@ button:hover {
   .timeline-column {
     width: 100%;
     max-width: 100%;
-  }
-
-  .branch-tree-row {
-    grid-template-columns: 1fr !important;
   }
 }
