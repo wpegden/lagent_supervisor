@@ -2818,6 +2818,8 @@ def build_branch_selection_prompt(
     goal_text = read_text(config.goal_file).strip()
     selection_label = supervisor_prompt_label(config, config.reviewer.provider, branch_selection_artifact_path(config))
     preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
+    continue_count = branch_selection_continue_count(config, episode, policy)
+    initial_budget = branch_review_budget(config, policy)
     question = str(
         episode.get(
             "selection_question",
@@ -2828,6 +2830,19 @@ def build_branch_selection_prompt(
         "Supervisor policy note",
         effective_policy(config, state, policy).prompt_notes.branching,
     )
+    post_initial_guidance = ""
+    if continue_count > 0:
+        post_initial_guidance = textwrap.dedent(
+            f"""\
+            Additional guidance for this later checkpoint:
+            - This branch episode is already past the initial {initial_budget}-review checkpoint.
+            - Resource cost now matters more than before.
+            - Do not keep a clearly less promising branch alive merely because it is still making local progress.
+            - Prefer `SELECT_BRANCH` whenever one branch now looks meaningfully more likely to eventually formalize the whole paper.
+            - Return `CONTINUE_BRANCHING` only when the branches still look genuinely close and it remains honestly hard to name a preferred branch.
+
+            """
+        )
     return textwrap.dedent(
         f"""\
         You are temporarily acting as the supervisor's branch selector.
@@ -2849,6 +2864,7 @@ def build_branch_selection_prompt(
         {question}
 
         {policy_notes}
+        {post_initial_guidance}
 
         Requirements:
         - Judge branches by their likelihood of eventually succeeding at formalizing the whole paper.

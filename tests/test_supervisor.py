@@ -832,6 +832,32 @@ class PolicyTests(SupervisorTestCase):
         self.assertIn("Which branch seems more likely to eventually succeed at formalizing the whole paper?", prompt)
         self.assertIn("Do not default to the branch that is merely furthest along today.", prompt)
 
+    def test_branch_selection_prompt_tightens_after_initial_checkpoint(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        prompt = supervisor.build_branch_selection_prompt(
+            config,
+            {"review_log": []},
+            "proof_formalization",
+            {
+                "id": "episode-001",
+                "base_review_count": 0,
+                "next_selection_review_target": 30,
+                "selection_continue_count": 1,
+                "selection_question": "Which branch seems more likely to eventually succeed at formalizing the whole paper?",
+            },
+            [
+                {"name": "continue-current-route", "progress_reviews": 15, "latest_review_decision": "CONTINUE"},
+                {"name": "major-rewrite", "progress_reviews": 15, "latest_review_decision": "CONTINUE"},
+            ],
+            False,
+        )
+
+        self.assertIn("already past the initial 20-review checkpoint", prompt)
+        self.assertIn("Do not keep a clearly less promising branch alive merely because it is still making local progress.", prompt)
+        self.assertIn("genuinely close", prompt)
+
     def test_validate_branch_strategy_decision_accepts_configured_branch_limit(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path)
