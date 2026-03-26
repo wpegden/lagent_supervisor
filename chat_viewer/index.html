@@ -4,7 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LAgent Chats</title>
-  <link rel="stylesheet" href="_assets/styles.css">
+  <script>
+    (function () {
+      const stamp = String(Date.now());
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = `_assets/styles.css?t=${encodeURIComponent(stamp)}`;
+      document.head.append(link);
+    })();
+  </script>
 </head>
 <body>
   <div class="shell">
@@ -90,6 +98,14 @@
     </main>
   </div>
 
-  <script src="_assets/app.js" defer></script>
+  <script>
+    (function () {
+      const stamp = String(Date.now());
+      const script = document.createElement("script");
+      script.src = `_assets/app.js?t=${encodeURIComponent(stamp)}`;
+      script.defer = true;
+      document.body.append(script);
+    })();
+  </script>
 </body>
 </html>

@@ -601,6 +601,50 @@ button:hover {
   align-items: start;
 }
 
+.branch-boundary-row {
+  gap: 0.7rem;
+}
+
+.branch-boundary-note {
+  border-radius: 1rem;
+  padding: 0.85rem 1rem;
+  background: rgba(248, 243, 232, 0.9);
+  border: 1px solid rgba(31, 106, 82, 0.14);
+  display: grid;
+  gap: 0.35rem;
+}
+
+.branch-boundary-note.tone-selection {
+  background: rgba(244, 248, 246, 0.94);
+  border-color: rgba(31, 106, 82, 0.24);
+}
+
+.branch-boundary-note.tone-branch {
+  background: rgba(255, 248, 238, 0.94);
+  border-color: rgba(124, 56, 34, 0.16);
+}
+
+.branch-boundary-label,
+.branch-boundary-summary {
+  margin: 0;
+}
+
+.branch-boundary-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+}
+
+.branch-boundary-note.tone-branch .branch-boundary-label {
+  color: #7c3822;
+}
+
+.branch-boundary-summary {
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
 .branch-tree-node {
   max-width: 100%;
 }

@@ -124,15 +124,34 @@ function branchRepoName(projectRepoName, episode, branch) {
   return sanitizeRepoName(`${projectRepoName}-${episode?.id || ""}-${branch?.name || ""}`);
 }
 
-function inferredProjectName(repo, repos) {
+function inferredProjectName(repo, repos, seen = new Set()) {
+  const repoName = String(repo?.repo_name || "").trim();
+  if (!repoName) {
+    return "";
+  }
+  if (seen.has(repoName)) {
+    return String(repo?.project_name || repoName).trim() || repoName;
+  }
+
+  const nextSeen = new Set(seen);
+  nextSeen.add(repoName);
+
   const explicit = String(repo?.project_name || "").trim();
   const branchPath = repo?.branch_overview?.current_path_newest_to_oldest;
   const looksLikeBranchRepo = Array.isArray(branchPath) && branchPath.length > 1;
-  if (explicit && (!looksLikeBranchRepo || explicit !== repo.repo_name)) {
+  if (explicit && looksLikeBranchRepo && explicit !== repoName) {
+    const explicitParentRepo = repos.find((candidate) => String(candidate?.repo_name || "").trim() === explicit);
+    if (explicitParentRepo) {
+      return inferredProjectName(explicitParentRepo, repos, nextSeen);
+    }
+  }
+  if (explicit && (!looksLikeBranchRepo || explicit !== repoName)) {
     return explicit;
   }
+
   for (const candidate of repos) {
-    if (!candidate || candidate.repo_name === repo.repo_name) {
+    const candidateName = String(candidate?.repo_name || "").trim();
+    if (!candidate || candidateName === repoName) {
       continue;
     }
     const overview = candidate.branch_overview;
@@ -141,13 +160,14 @@ function inferredProjectName(repo, repos) {
     }
     for (const episode of overview.episodes || []) {
       for (const branch of episode.branches || []) {
-        if (branchRepoName(candidate.repo_name, episode, branch) === repo.repo_name) {
-          return String(candidate.project_name || candidate.repo_name || repo.repo_name);
+        if (branchRepoName(candidateName, episode, branch) === repoName) {
+          return inferredProjectName(candidate, repos, nextSeen);
         }
       }
     }
   }
-  return explicit || repo.repo_name;
+
+  return explicit || repoName;
 }
 
 function timelinePath(meta) {
@@ -621,11 +641,13 @@ function renderBranchOverview() {
 
 function branchStatusMap() {
   const map = new Map();
-  const overview = state.currentMeta?.branch_overview;
-  const rootRepoName = state.currentMeta?.repo_name || state.currentProjectName || "";
-  for (const episode of overview?.episodes || []) {
-    for (const branch of episode.branches || []) {
-      map.set(branchRepoName(rootRepoName, episode, branch), branch.status || "active");
+  for (const projectRepo of state.currentProjectRepos) {
+    const overview = projectRepo.meta?.branch_overview;
+    const rootRepoName = projectRepo.meta?.repo_name || "";
+    for (const episode of overview?.episodes || []) {
+      for (const branch of episode.branches || []) {
+        map.set(branchRepoName(rootRepoName, episode, branch), branch.status || "active");
+      }
     }
   }
   return map;
@@ -725,74 +747,299 @@ function paddedLeafChain(chain, targetLength) {
   return padded;
 }
 
-function eventsAfterTimestamp(events, cutoffTimestamp) {
-  return events.filter((event) => timestampValue(event.timestamp) > cutoffTimestamp);
-}
-
-function eventsUpToTimestamp(events, cutoffTimestamp) {
-  return events.filter((event) => timestampValue(event.timestamp) <= cutoffTimestamp);
-}
-
-function buildSelectedContinuationRows(nodes) {
-  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
-  if (liveLeaves.length !== 1) {
-    return { rows: [], cutoffByNodeKey: new Map() };
+function timelineKeyFromPath(pathNewToOld) {
+  if (!Array.isArray(pathNewToOld) || !pathNewToOld.length) {
+    return "mainline";
   }
+  return [...pathNewToOld].reverse().join("::");
+}
 
-  const rows = [];
-  const cutoffByNodeKey = new Map();
-  let current = liveLeaves[0];
-  while (current.parentKey && nodes.has(current.parentKey)) {
-    const parent = nodes.get(current.parentKey);
-    const cutoffTimestamp = timestampValue(parent.projectRepo.meta.updated_at);
-    const continuationEvents = eventsAfterTimestamp(current.projectRepo.events || [], cutoffTimestamp);
-    if (continuationEvents.length) {
-      rows.push({ node: current, continuationEvents });
-      cutoffByNodeKey.set(current.key, cutoffTimestamp);
+function timelineKeyFromMeta(meta) {
+  return timelineKeyFromPath(timelinePath(meta));
+}
+
+function findEpisodeEvent(projectRepo, cycle, kind) {
+  const matches = (projectRepo?.events || []).filter(
+    (event) => String(event.kind || "") === kind && Number(event.cycle) === Number(cycle),
+  );
+  return matches[matches.length - 1] || null;
+}
+
+function projectEpisodesByContext(nodes) {
+  const episodes = new Map();
+
+  for (const projectRepo of state.currentProjectRepos) {
+    if (!projectRepo?.meta) {
+      continue;
     }
-    current = parent;
-  }
-
-  return { rows, cutoffByNodeKey };
-}
-
-function buildBranchTreeRows(nodes) {
-  const leaves = [...nodes.values()].filter((node) => node.children.length === 0).sort(leafSort);
-  if (!leaves.length) {
-    return { leaves: [], rows: [] };
-  }
-
-  const chains = leaves.map((leaf) => ancestorChainFromLeaf(leaf, nodes));
-  const maxLength = Math.max(...chains.map((chain) => chain.length));
-  const paddedChains = chains.map((chain) => paddedLeafChain(chain, maxLength));
-
-  const rows = [];
-  for (let rowIndex = 0; rowIndex < maxLength; rowIndex += 1) {
-    const segments = [];
-    let column = 0;
-    while (column < leaves.length) {
-      const node = paddedChains[column][rowIndex];
-      const key = node.key;
-      let span = 1;
-      const continuedFlags = [
-        rowIndex > 0 && paddedChains[column][rowIndex - 1].key === key,
-      ];
-      while (column + span < leaves.length && paddedChains[column + span][rowIndex].key === key) {
-        continuedFlags.push(rowIndex > 0 && paddedChains[column + span][rowIndex - 1].key === key);
-        span += 1;
+    const repoKey = timelineKeyFromMeta(projectRepo.meta);
+    for (const episode of projectRepo.meta?.branch_overview?.episodes || []) {
+      const contextPath = Array.isArray(episode.lineage_newest_to_oldest) && episode.lineage_newest_to_oldest.length
+        ? episode.lineage_newest_to_oldest
+        : ["mainline"];
+      const contextKey = timelineKeyFromPath(contextPath);
+      const dedupeKey = `${contextKey}|${episode.id}`;
+      const score = repoKey === contextKey ? 0 : 1 + Math.abs(timelineDepth(projectRepo.meta) - contextPath.length);
+      const existing = episodes.get(dedupeKey);
+      if (!existing || score < existing.sourceScore) {
+        episodes.set(dedupeKey, {
+          ...episode,
+          contextKey,
+          sourceRepo: projectRepo,
+          sourceScore: score,
+        });
       }
-      segments.push({
-        node,
-        start: column + 1,
-        span,
-        continuationOnly: continuedFlags.every(Boolean),
-      });
-      column += span;
     }
-    rows.push({ index: rowIndex, segments });
   }
 
-  return { leaves, rows };
+  const byContext = new Map();
+  for (const episode of episodes.values()) {
+    const branchEvent = findEpisodeEvent(episode.sourceRepo, episode.trigger_cycle, "branch_strategy_decision");
+    const selectionEvent = findEpisodeEvent(episode.sourceRepo, episode.trigger_cycle, "branch_selection_decision");
+    const enriched = {
+      ...episode,
+      branchEvent,
+      selectionEvent,
+      branchTimestamp: branchEvent ? timestampValue(branchEvent.timestamp) : null,
+      selectionTimestamp: selectionEvent ? timestampValue(selectionEvent.timestamp) : null,
+      branchSummary: branchEvent?.summary || "",
+      selectionSummary: selectionEvent?.summary || "",
+      contextNode: nodes.get(episode.contextKey) || null,
+    };
+    if (!byContext.has(episode.contextKey)) {
+      byContext.set(episode.contextKey, []);
+    }
+    byContext.get(episode.contextKey).push(enriched);
+  }
+
+  byContext.forEach((items) => {
+    items.sort((left, right) => Number(right.trigger_cycle || 0) - Number(left.trigger_cycle || 0));
+  });
+
+  return byContext;
+}
+
+function contextEpisode(episodesByContext, nodeKey) {
+  const items = episodesByContext.get(nodeKey) || [];
+  return items[0] || null;
+}
+
+function childNodeForBranch(node, branchName, nodes) {
+  if (!node || !branchName) {
+    return null;
+  }
+  const directKey = `${node.key}::${branchName}`;
+  if (nodes.has(directKey)) {
+    return nodes.get(directKey);
+  }
+  return [...node.children]
+    .map((key) => nodes.get(key))
+    .find((child) => child && String(child.pathNewToOld[0] || "") === String(branchName)) || null;
+}
+
+function orderedEpisodeChildren(node, episode, nodes) {
+  const children = (episode?.branches || [])
+    .map((branch) => {
+      const child = childNodeForBranch(node, branch.name, nodes);
+      if (!child) {
+        return null;
+      }
+      return { child, branch };
+    })
+    .filter(Boolean);
+
+  children.sort((left, right) => {
+    const leftIsSelected = String(left.branch.name || "") === String(episode?.selected_branch || "");
+    const rightIsSelected = String(right.branch.name || "") === String(episode?.selected_branch || "");
+    if (leftIsSelected !== rightIsSelected) {
+      return Number(rightIsSelected) - Number(leftIsSelected);
+    }
+    if (left.branch.status !== right.branch.status) {
+      const rank = { selected: 4, active: 3, dead: 1 };
+      return (rank[right.branch.status] || 0) - (rank[left.branch.status] || 0);
+    }
+    return leafSort(left.child, right.child);
+  });
+
+  return children;
+}
+
+function segmentEvents(events, startExclusive = null, endExclusive = null) {
+  const excludedKinds = new Set([
+    "branch_strategy_prompt",
+    "branch_strategy_decision",
+    "branch_selection_prompt",
+    "branch_selection_decision",
+  ]);
+  return events.filter((event) => {
+    if (excludedKinds.has(String(event.kind || ""))) {
+      return false;
+    }
+    const stamp = timestampValue(event.timestamp);
+    if (startExclusive !== null && stamp <= startExclusive) {
+      return false;
+    }
+    if (endExclusive !== null && stamp >= endExclusive) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function segmentSummary(events, fallback) {
+  const grouped = cycleGroups(events);
+  if (!grouped.length) {
+    return fallback;
+  }
+  return cycleSummaryData(grouped[0].events).headline;
+}
+
+function strippedBoundarySummary(label, summary) {
+  const text = String(summary || "").trim();
+  const prefix = `${label}:`;
+  if (text.startsWith(prefix)) {
+    return text.slice(prefix.length).trim();
+  }
+  return text;
+}
+
+function buildCardsRow(cards) {
+  return { type: "cards", cards };
+}
+
+function buildBoundaryRow(label, summary, tone) {
+  const text = strippedBoundarySummary(label, summary);
+  if (!text) {
+    return null;
+  }
+  return {
+    type: "boundary",
+    label,
+    tone,
+    summary: text,
+  };
+}
+
+function buildProjectRowsForNode(node, nodes, episodesByContext, startExclusive = null) {
+  if (!node) {
+    return [];
+  }
+
+  const rows = [];
+  const episode = contextEpisode(episodesByContext, node.key);
+  if (episode?.status === "selected") {
+    const selectedChild = childNodeForBranch(node, episode.selected_branch, nodes);
+    rows.push(...buildProjectRowsForNode(selectedChild, nodes, episodesByContext, episode.selectionTimestamp));
+
+    const selectionRow = buildBoundaryRow("SELECT_BRANCH", episode.selectionSummary, "selection");
+    if (selectionRow) {
+      rows.push(selectionRow);
+    }
+
+    const splitCards = orderedEpisodeChildren(node, episode, nodes).map(({ child, branch }) => ({
+      node: child,
+      branch,
+      events: segmentEvents(child.projectRepo.events || [], episode.branchTimestamp, episode.selectionTimestamp),
+    }));
+    if (splitCards.length) {
+      rows.push(buildCardsRow(splitCards));
+    }
+
+    const branchRow = buildBoundaryRow("BRANCH", episode.branchSummary, "branch");
+    if (branchRow) {
+      rows.push(branchRow);
+    }
+
+    const nodeEvents = segmentEvents(node.projectRepo.events || [], startExclusive, episode.branchTimestamp);
+    if (nodeEvents.length || !node.parentKey) {
+      rows.push(buildCardsRow([{ node, events: nodeEvents }]));
+    }
+    return rows;
+  }
+
+  if (episode?.status === "active") {
+    const activeCards = orderedEpisodeChildren(node, episode, nodes)
+      .filter(({ branch }) => String(branch.status || "") !== "dead")
+      .map(({ child, branch }) => ({
+        node: child,
+        branch,
+        events: segmentEvents(child.projectRepo.events || [], episode.branchTimestamp, null),
+      }));
+    if (activeCards.length) {
+      rows.push(buildCardsRow(activeCards));
+    }
+
+    const branchRow = buildBoundaryRow("BRANCH", episode.branchSummary, "branch");
+    if (branchRow) {
+      rows.push(branchRow);
+    }
+
+    const nodeEvents = segmentEvents(node.projectRepo.events || [], startExclusive, episode.branchTimestamp);
+    if (nodeEvents.length || !node.parentKey) {
+      rows.push(buildCardsRow([{ node, events: nodeEvents }]));
+    }
+    return rows;
+  }
+
+  const nodeEvents = segmentEvents(node.projectRepo.events || [], startExclusive, null);
+  if (nodeEvents.length || !node.parentKey) {
+    rows.push(buildCardsRow([{ node, events: nodeEvents }]));
+  }
+  return rows;
+}
+
+function distributedGridSlots(columnCount, itemCount) {
+  const slots = [];
+  let start = 1;
+  let remainingColumns = Math.max(1, columnCount);
+  let remainingItems = Math.max(1, itemCount);
+  for (let index = 0; index < itemCount; index += 1) {
+    const span = Math.max(1, Math.floor(remainingColumns / remainingItems) + (remainingColumns % remainingItems > 0 ? 1 : 0));
+    slots.push({ start, span });
+    start += span;
+    remainingColumns -= span;
+    remainingItems -= 1;
+  }
+  return slots;
+}
+
+function buildCardsRowElement(cards, columnCount) {
+  const rowElement = document.createElement("section");
+  rowElement.className = "branch-tree-row";
+  rowElement.style.gridTemplateColumns = `repeat(${columnCount}, minmax(18rem, 1fr))`;
+
+  const slots = distributedGridSlots(columnCount, cards.length);
+  cards.forEach((card, index) => {
+    const slot = slots[index];
+    const content = buildTimelineNodeCard(card.node, card.events, {
+      summary: segmentSummary(card.events, card.node.projectRepo.meta.last_summary || "No summary recorded yet."),
+    });
+    content.style.gridColumn = `${slot.start} / span ${slot.span}`;
+    rowElement.append(content);
+  });
+  return rowElement;
+}
+
+function buildBoundaryRowElement(row, columnCount) {
+  const rowElement = document.createElement("section");
+  rowElement.className = "branch-tree-row branch-boundary-row";
+  rowElement.style.gridTemplateColumns = `repeat(${columnCount}, minmax(18rem, 1fr))`;
+
+  const note = document.createElement("article");
+  note.className = `branch-boundary-note tone-${row.tone || "branch"}`;
+  note.style.gridColumn = `1 / span ${columnCount}`;
+
+  const label = document.createElement("p");
+  label.className = "branch-boundary-label";
+  label.textContent = row.label.replaceAll("_", " ");
+
+  const summary = document.createElement("p");
+  summary.className = "branch-boundary-summary";
+  summary.textContent = row.summary;
+
+  note.append(label, summary);
+  rowElement.append(note);
+  return rowElement;
 }
 
 function buildTimelineNodeCard(node, events, options = {}) {
@@ -820,7 +1067,7 @@ function buildTimelineNodeCard(node, events, options = {}) {
 
   const summary = document.createElement("p");
   summary.className = "timeline-column-summary";
-  summary.textContent = options.summary || projectRepo.meta.last_summary || "No summary recorded yet.";
+  summary.textContent = options.summary || segmentSummary(events, projectRepo.meta.last_summary || "No summary recorded yet.");
 
   const docs = document.createElement("div");
   docs.className = "timeline-column-docs";
@@ -872,65 +1119,30 @@ function renderBranchBoard() {
   }
 
   const nodes = projectTimelineNodes();
-  const tree = buildBranchTreeRows(nodes);
-  if (!tree.leaves.length || !tree.rows.length) {
+  const rootNode = [...nodes.values()].find((node) => !node.parentKey) || null;
+  const episodesByContext = projectEpisodesByContext(nodes);
+  const rows = buildProjectRowsForNode(rootNode, nodes, episodesByContext, null);
+  const cardsOnly = rows.filter((row) => row.type === "cards");
+  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
+  if (!rootNode || !rows.length || !cardsOnly.length) {
     elements.branchBoard.hidden = true;
     elements.branchBoardGrid.replaceChildren();
     return;
   }
-  const continuation = buildSelectedContinuationRows(nodes);
+  const columnCount = Math.max(1, ...cardsOnly.map((row) => row.cards.length));
 
   elements.branchBoard.hidden = false;
-  elements.branchBoardTitle.textContent = `${tree.leaves.length} leaf timeline${tree.leaves.length === 1 ? "" : "s"} above shared history`;
+  elements.branchBoardTitle.textContent = `${liveLeaves.length} current leaf timeline${liveLeaves.length === 1 ? "" : "s"} above shared history`;
   elements.branchBoardMeta.textContent =
     "Leaf branches stay side by side until one is pruned and the surviving route continues as the main branch above.";
   elements.branchBoardGrid.replaceChildren();
 
-  continuation.rows.forEach(({ node, continuationEvents }) => {
-    const rowElement = document.createElement("section");
-    rowElement.className = "branch-tree-row";
-    rowElement.style.gridTemplateColumns = `repeat(${tree.leaves.length}, minmax(18rem, 1fr))`;
-
-    const nodeCard = buildTimelineNodeCard(node, continuationEvents, {
-      title: "main branch",
-      pathText: `current route: ${node.pathNewToOld.join(" ← ")}`,
-      extraClass: "main-branch-continuation",
-    });
-    nodeCard.style.gridColumn = `1 / span ${tree.leaves.length}`;
-    rowElement.append(nodeCard);
-    elements.branchBoardGrid.append(rowElement);
-  });
-
-  tree.rows.forEach((row, rowIndex) => {
-    const rowElement = document.createElement("section");
-    rowElement.className = "branch-tree-row";
-    rowElement.style.gridTemplateColumns = `repeat(${tree.leaves.length}, minmax(18rem, 1fr))`;
-
-    row.segments.forEach((segment) => {
-      const nodeCard = document.createElement("article");
-      nodeCard.className = `timeline-column branch-tree-node status-${segment.node.status}${segment.continuationOnly ? " continuation-only" : ""}`;
-      nodeCard.style.gridColumn = `${segment.start} / span ${segment.span}`;
-
-      if (segment.continuationOnly) {
-        const continuation = document.createElement("p");
-        continuation.className = "branch-tree-continuation";
-        continuation.textContent = `${segment.node.name} continues`;
-        nodeCard.append(continuation);
-        rowElement.append(nodeCard);
-        return;
-      }
-
-      const cutoffTimestamp = continuation.cutoffByNodeKey.get(segment.node.key);
-      const events =
-        cutoffTimestamp === undefined
-          ? segment.node.projectRepo.events || []
-          : eventsUpToTimestamp(segment.node.projectRepo.events || [], cutoffTimestamp);
-      const content = buildTimelineNodeCard(segment.node, events);
-      nodeCard.replaceChildren(...content.childNodes);
-      rowElement.append(nodeCard);
-    });
-
-    elements.branchBoardGrid.append(rowElement);
+  rows.forEach((row) => {
+    if (row.type === "boundary") {
+      elements.branchBoardGrid.append(buildBoundaryRowElement(row, columnCount));
+      return;
+    }
+    elements.branchBoardGrid.append(buildCardsRowElement(row.cards, columnCount));
   });
 }
 
