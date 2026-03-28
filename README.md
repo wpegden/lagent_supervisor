@@ -10,10 +10,11 @@ It now supports either:
   - `planning`
   - `theorem_stating`
   - `proof_formalization`
+  - `proof_complete_style_cleanup`
 
 The worker edits the repo and maintains shared workflow files such as `TASKS.md`, `PAPERNOTES.md`, `PLAN.md`, `PaperDefinitions.lean`, and `PaperTheorems.lean` as the current phase requires.
 
-The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to ten distinct stuck-recovery suggestions before finally stopping the run as stuck. Inside a branch run, that branch-local stuck-recovery budget is shorter: four failed recovery attempts cause the branch to be pruned. In proof formalization, the supervisor can also open a branch episode when the reviewer has identified a genuine route split, such as continuing the current path versus a major rewrite.
+The reviewer reads the worker handoff JSON, the latest terminal output, and the supervisor's validation summary, then returns a decision such as `CONTINUE`, `ADVANCE_PHASE`, `NEED_INPUT`, `STUCK`, or `DONE`. When the reviewer returns `STUCK`, the supervisor now asks for up to ten distinct stuck-recovery suggestions before finally stopping the run as stuck. Inside a branch run, that branch-local stuck-recovery budget is shorter: four failed recovery attempts cause the branch to be pruned. In proof formalization, the supervisor can also open a branch episode when the reviewer has identified a genuine route split, such as continuing the current path versus a major rewrite. After proof formalization reaches a complete clean proof state, the workflow advances into `proof_complete_style_cleanup`, where the goal is optional warning cleanup and moderate refactors while preserving a fully buildable proof state after every cycle.
 
 It supports:
 

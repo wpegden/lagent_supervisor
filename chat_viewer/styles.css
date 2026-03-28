@@ -325,9 +325,50 @@ button:hover {
 }
 
 .topbar-actions {
+  display: grid;
+  gap: 0.7rem;
+  justify-items: end;
+}
+
+.topbar-action-row {
   display: flex;
   gap: 0.8rem;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.topbar-status {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 12rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: rgba(255, 250, 240, 0.9);
+  text-align: right;
+}
+
+.topbar-status-label,
+.topbar-status-value,
+.topbar-status-meta {
+  margin: 0;
+}
+
+.topbar-status-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.topbar-status-value {
+  font-family: var(--serif);
+  font-size: 1.1rem;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.topbar-status-meta {
+  font-size: 0.82rem;
 }
 
 .filters {
@@ -692,7 +733,16 @@ button:hover {
 
   .topbar-actions {
     width: 100%;
+    justify-items: stretch;
+  }
+
+  .topbar-action-row {
     justify-content: space-between;
+  }
+
+  .topbar-status {
+    min-width: 0;
+    text-align: left;
   }
 
   .branch-board-grid {

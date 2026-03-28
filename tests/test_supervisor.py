@@ -99,6 +99,43 @@ class SupervisorTestCase(unittest.TestCase):
 
 
 class CommandTests(SupervisorTestCase):
+    def test_phase_sequence_keeps_legacy_order_and_appends_cleanup(self) -> None:
+        self.assertEqual(
+            supervisor.PHASES,
+            (
+                "paper_check",
+                "planning",
+                "theorem_stating",
+                "proof_formalization",
+                supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            ),
+        )
+        self.assertEqual(supervisor.next_phase("paper_check"), "planning")
+        self.assertEqual(supervisor.next_phase("planning"), "theorem_stating")
+        self.assertEqual(supervisor.next_phase("theorem_stating"), "proof_formalization")
+        self.assertEqual(
+            supervisor.next_phase("proof_formalization"),
+            supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+        )
+
+    def test_legacy_phase_reviewer_decisions_are_unchanged_before_cleanup(self) -> None:
+        self.assertEqual(
+            supervisor.phase_specific_reviewer_decisions("paper_check"),
+            ("CONTINUE", "ADVANCE_PHASE", "STUCK"),
+        )
+        self.assertEqual(
+            supervisor.phase_specific_reviewer_decisions("planning"),
+            supervisor.REVIEWER_DECISIONS,
+        )
+        self.assertEqual(
+            supervisor.phase_specific_reviewer_decisions("theorem_stating"),
+            ("CONTINUE", "ADVANCE_PHASE", "STUCK"),
+        )
+        self.assertEqual(
+            supervisor.phase_specific_reviewer_decisions("proof_formalization"),
+            ("CONTINUE", "ADVANCE_PHASE", "STUCK"),
+        )
+
     def test_sanitize_tmux_session_name_replaces_dots(self) -> None:
         self.assertEqual(
             supervisor.sanitize_tmux_session_name("arxiv-1702.07325-agents"),
@@ -806,6 +843,46 @@ class PolicyTests(SupervisorTestCase):
 
         self.assertIn("paper-facing", prompt)
         self.assertIn("separate support files would be cleaner", prompt)
+
+    def test_proof_phase_worker_prompt_keeps_legacy_done_wording(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        prompt = supervisor.build_worker_prompt(config, {}, "proof_formalization", False)
+
+        self.assertIn("`DONE` means the full workflow is complete.", prompt)
+
+    def test_cleanup_phase_prompts_focus_on_safe_polish(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        worker_prompt = supervisor.build_worker_prompt(
+            config,
+            {},
+            supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            False,
+        )
+        reviewer_prompt = supervisor.build_reviewer_prompt(
+            config,
+            {"review_log": []},
+            supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            "worker terminal output",
+            '{"status":"NOT_STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}, "axioms": {"unapproved": []}},
+            False,
+        )
+
+        self.assertIn("PROOF COMPLETE - style cleanup", worker_prompt)
+        self.assertIn("every burst must end with a fully buildable proof state", worker_prompt)
+        self.assertIn("warning cleanup", worker_prompt)
+        self.assertIn("optional polish, not mission-critical", reviewer_prompt)
+        self.assertIn("preserve the last good proof-complete commit", reviewer_prompt)
+
+    def test_cleanup_phase_reviewer_decisions(self) -> None:
+        self.assertEqual(
+            supervisor.phase_specific_reviewer_decisions(supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP),
+            ("CONTINUE", "STUCK", "DONE"),
+        )
 
     def test_prompts_include_policy_notes_when_configured(self) -> None:
         repo_path = self.make_repo()
@@ -2130,6 +2207,443 @@ class BurstRetryTests(SupervisorTestCase):
 
 
 class WorkflowTests(SupervisorTestCase):
+    def _run_main_with_mocked_bursts(
+        self,
+        config: supervisor.Config,
+        state: dict,
+        *,
+        artifacts: list[dict],
+        validations: list[dict],
+        restore_cleanup_last_good_commit: mock.Mock | None = None,
+    ) -> tuple[int, list[dict], mock.Mock, mock.Mock]:
+        launches: list[dict] = []
+
+        def fake_make_adapter(role: str, cfg: supervisor.Config, current_state: dict) -> DummyAdapter:
+            provider_cfg = cfg.worker if role == "worker" else cfg.reviewer
+            return DummyAdapter(provider_cfg, role, cfg, current_state, ["bash", "-lc", "exit 0"])
+
+        def fake_launch(*args, **kwargs):
+            launches.append(
+                {
+                    "cycle": args[1],
+                    "prompt": args[2],
+                    "phase": kwargs.get("phase"),
+                    "stage_label": kwargs.get("stage_label"),
+                    "reuse_existing_window": kwargs.get("reuse_existing_window"),
+                }
+            )
+            return {
+                "captured_output": "",
+                "artifact_path": f"/tmp/fake-artifact-{len(launches)}.json",
+            }
+
+        record_chat_event_mock = mock.Mock()
+        save_state_mock = mock.Mock()
+        restore_mock = restore_cleanup_last_good_commit or mock.Mock()
+
+        with (
+            mock.patch.object(sys, "argv", ["supervisor.py", "--config", str(config.repo_path.parent / "config.json")]),
+            mock.patch.object(supervisor, "load_config", return_value=config),
+            mock.patch.object(supervisor, "load_state", return_value=state),
+            mock.patch.object(supervisor, "check_dependencies"),
+            mock.patch.object(supervisor, "ensure_git_repository"),
+            mock.patch.object(supervisor, "install_personal_provider_context_files", return_value=[]),
+            mock.patch.object(supervisor, "ensure_repo_files"),
+            mock.patch.object(supervisor, "ensure_chat_site"),
+            mock.patch.object(supervisor, "ensure_tmux_session"),
+            mock.patch.object(supervisor, "maybe_consume_human_input", return_value=True),
+            mock.patch.object(supervisor, "recover_interrupted_worker_state", return_value=False),
+            mock.patch.object(supervisor, "make_adapter", side_effect=fake_make_adapter),
+            mock.patch.object(supervisor, "launch_tmux_burst_with_retries", side_effect=fake_launch),
+            mock.patch.object(supervisor, "load_json_artifact_with_fallback", side_effect=artifacts),
+            mock.patch.object(supervisor, "run_validation", side_effect=validations),
+            mock.patch.object(supervisor, "restore_cleanup_last_good_commit", restore_mock),
+            mock.patch.object(supervisor, "record_chat_event", record_chat_event_mock),
+            mock.patch.object(supervisor, "append_jsonl"),
+            mock.patch.object(supervisor, "save_state", save_state_mock),
+            mock.patch.object(supervisor.time, "sleep"),
+        ):
+            result = supervisor.main()
+
+        return result, launches, record_chat_event_mock, save_state_mock
+
+    def test_main_advances_from_proof_formalization_into_cleanup_phase(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase="proof_formalization")
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+        }
+        result, launches, record_chat_event_mock, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": "proof_formalization",
+                    "status": "DONE",
+                    "summary_of_changes": "proof complete",
+                    "current_frontier": "none",
+                    "likely_next_step": "cleanup",
+                    "input_request": "",
+                },
+                {
+                    "phase": "proof_formalization",
+                    "decision": "ADVANCE_PHASE",
+                    "confidence": 0.95,
+                    "reason": "Proof complete; move to cleanup.",
+                    "next_prompt": "",
+                },
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "STUCK",
+                    "summary_of_changes": "No worthwhile cleanup found.",
+                    "current_frontier": "cleanup done",
+                    "likely_next_step": "stop",
+                    "input_request": "",
+                },
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": "proof_formalization",
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head"},
+                },
+                {
+                    "cycle": 2,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head"},
+                },
+            ],
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [entry["stage_label"] for entry in launches],
+            ["worker burst", "reviewer burst", "worker burst"],
+        )
+        self.assertEqual(launches[0]["phase"], "proof_formalization")
+        self.assertEqual(launches[1]["phase"], "proof_formalization")
+        self.assertEqual(launches[2]["phase"], supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        self.assertIn("PROOF COMPLETE - style cleanup", launches[2]["prompt"])
+        self.assertEqual(state["phase"], supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        self.assertEqual(state["cleanup_last_good_commit"], "proof-head")
+        transition_events = [
+            call.kwargs for call in record_chat_event_mock.mock_calls if call.kwargs.get("kind") == "phase_transition"
+        ]
+        self.assertEqual(len(transition_events), 1)
+        self.assertEqual(transition_events[0]["phase"], supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+
+    def test_main_cleanup_invalid_worker_cycle_restores_and_stops_before_reviewer(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase=supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        state = {
+            "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "cleanup_last_good_commit": "good-head",
+        }
+        restore_mock = mock.Mock()
+
+        result, launches, _, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "NOT_STUCK",
+                    "summary_of_changes": "cleanup edit",
+                    "current_frontier": "warnings",
+                    "likely_next_step": "finish cleanup",
+                    "input_request": "",
+                }
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": False},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "bad-head"},
+                }
+            ],
+            restore_cleanup_last_good_commit=restore_mock,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual([entry["stage_label"] for entry in launches], ["worker burst"])
+        restore_mock.assert_called_once()
+        self.assertEqual(restore_mock.call_args.kwargs["cycle"], 1)
+        self.assertIn("cleanup cycle ended without a fully valid proof state", restore_mock.call_args.kwargs["reason"])
+
+    def test_main_cleanup_no_progress_stops_before_reviewer(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase=supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        state = {
+            "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "cleanup_last_good_commit": "good-head",
+        }
+        restore_mock = mock.Mock()
+
+        result, launches, _, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "NOT_STUCK",
+                    "summary_of_changes": "looked for cleanup",
+                    "current_frontier": "no-op",
+                    "likely_next_step": "stop",
+                    "input_request": "",
+                }
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "good-head"},
+                }
+            ],
+            restore_cleanup_last_good_commit=restore_mock,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual([entry["stage_label"] for entry in launches], ["worker burst"])
+        restore_mock.assert_not_called()
+        self.assertEqual(state["cleanup_last_good_commit"], "good-head")
+
+    def test_main_cleanup_reviewer_stuck_restores_and_stops(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase=supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        state = {
+            "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "cleanup_last_good_commit": "good-head",
+        }
+        restore_mock = mock.Mock()
+
+        result, launches, _, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "DONE",
+                    "summary_of_changes": "warning cleanup commit",
+                    "current_frontier": "review for more cleanup",
+                    "likely_next_step": "review",
+                    "input_request": "",
+                },
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "decision": "STUCK",
+                    "confidence": 0.71,
+                    "reason": "No worthwhile cleanup remains.",
+                    "next_prompt": "",
+                },
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "cleaner-head"},
+                }
+            ],
+            restore_cleanup_last_good_commit=restore_mock,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual([entry["stage_label"] for entry in launches], ["worker burst", "reviewer burst"])
+        restore_mock.assert_called_once()
+        self.assertIn("cleanup reviewer decided the optional cleanup phase had stalled", restore_mock.call_args.kwargs["reason"])
+
+    def test_main_cleanup_reviewer_done_keeps_polished_commit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase=supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        state = {
+            "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "cleanup_last_good_commit": "good-head",
+        }
+        restore_mock = mock.Mock()
+
+        result, launches, _, save_state_mock = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "DONE",
+                    "summary_of_changes": "final warning cleanup",
+                    "current_frontier": "none",
+                    "likely_next_step": "stop",
+                    "input_request": "",
+                },
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "decision": "DONE",
+                    "confidence": 0.94,
+                    "reason": "Cleanup complete.",
+                    "next_prompt": "",
+                },
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "polished-head"},
+                }
+            ],
+            restore_cleanup_last_good_commit=restore_mock,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual([entry["stage_label"] for entry in launches], ["worker burst", "reviewer burst"])
+        restore_mock.assert_not_called()
+        self.assertEqual(state["cleanup_last_good_commit"], "polished-head")
+        self.assertGreaterEqual(save_state_mock.call_count, 1)
+
+    def test_main_cleanup_invalid_worker_cycle_real_git_restore(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase=supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_path, check=True, capture_output=True, text=True)
+        (repo_path / "tracked.txt").write_text("good\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "good"], cwd=repo_path, check=True, capture_output=True, text=True)
+        good_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repo_path / "tracked.txt").write_text("bad\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "bad"], cwd=repo_path, check=True, capture_output=True, text=True)
+        bad_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        state = {
+            "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "cleanup_last_good_commit": good_head,
+        }
+        launches: list[dict] = []
+
+        def fake_make_adapter(role: str, cfg: supervisor.Config, current_state: dict) -> DummyAdapter:
+            provider_cfg = cfg.worker if role == "worker" else cfg.reviewer
+            return DummyAdapter(provider_cfg, role, cfg, current_state, ["bash", "-lc", "exit 0"])
+
+        def fake_launch(*args, **kwargs):
+            launches.append({"stage_label": kwargs.get("stage_label"), "phase": kwargs.get("phase")})
+            return {"captured_output": "", "artifact_path": "/tmp/fake-worker.json"}
+
+        with (
+            mock.patch.object(sys, "argv", ["supervisor.py", "--config", str(config.repo_path.parent / "config.json")]),
+            mock.patch.object(supervisor, "load_config", return_value=config),
+            mock.patch.object(supervisor, "load_state", return_value=state),
+            mock.patch.object(supervisor, "check_dependencies"),
+            mock.patch.object(supervisor, "ensure_git_repository"),
+            mock.patch.object(supervisor, "install_personal_provider_context_files", return_value=[]),
+            mock.patch.object(supervisor, "ensure_repo_files"),
+            mock.patch.object(supervisor, "ensure_chat_site"),
+            mock.patch.object(supervisor, "ensure_tmux_session"),
+            mock.patch.object(supervisor, "maybe_consume_human_input", return_value=True),
+            mock.patch.object(supervisor, "recover_interrupted_worker_state", return_value=False),
+            mock.patch.object(supervisor, "make_adapter", side_effect=fake_make_adapter),
+            mock.patch.object(supervisor, "launch_tmux_burst_with_retries", side_effect=fake_launch),
+            mock.patch.object(
+                supervisor,
+                "load_json_artifact_with_fallback",
+                return_value={
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "NOT_STUCK",
+                    "summary_of_changes": "cleanup edit",
+                    "current_frontier": "warning cleanup",
+                    "likely_next_step": "finish cleanup",
+                    "input_request": "",
+                },
+            ),
+            mock.patch.object(
+                supervisor,
+                "run_validation",
+                side_effect=[
+                    {
+                        "cycle": 1,
+                        "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                        "build": {"ok": False},
+                        "sorries": {"count": 0},
+                        "axioms": {"unapproved": []},
+                        "git": {"head": bad_head},
+                    },
+                    {
+                        "cycle": 1,
+                        "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                        "build": {"ok": True},
+                        "sorries": {"count": 0},
+                        "axioms": {"unapproved": []},
+                        "git": {"head": good_head},
+                    },
+                ],
+            ),
+            mock.patch.object(supervisor, "record_chat_event"),
+            mock.patch.object(supervisor, "append_jsonl"),
+            mock.patch.object(supervisor, "save_state"),
+            mock.patch.object(supervisor.time, "sleep"),
+        ):
+            result = supervisor.main()
+
+        restored_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(result, 0)
+        self.assertEqual(restored_head, good_head)
+        self.assertEqual(launches, [{"stage_label": "worker burst", "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP}])
+
     def test_ensure_repo_files_respects_phase_artifacts(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path, start_phase="paper_check")
@@ -2167,6 +2681,90 @@ class WorkflowTests(SupervisorTestCase):
         self.assertFalse(summary["policy_ok"])
         self.assertTrue(summary["axioms"]["unapproved"])
         self.assertTrue(summary["sorry_policy"]["disallowed_entries"])
+
+    def test_cleanup_phase_shares_proof_sorry_policy(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase=supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        (repo_path / "lakefile.toml").write_text(
+            'name = "T"\nversion = "0.1.0"\ndefaultTargets = ["t"]\n\n[[lean_lib]]\nname = "T"\n',
+            encoding="utf-8",
+        )
+        (repo_path / "lean-toolchain").write_text("leanprover/lean4:v4.28.0\n", encoding="utf-8")
+        (repo_path / "T.lean").write_text("def t : Nat := 0\n", encoding="utf-8")
+        (repo_path / "PaperDefinitions.lean").write_text("def foo : Nat := 0\n", encoding="utf-8")
+        (repo_path / "PaperTheorems.lean").write_text("theorem stated : True := by\n  sorry\n", encoding="utf-8")
+
+        supervisor.ensure_repo_files(config, supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+        summary = supervisor.run_validation(config, supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP, 1)
+
+        self.assertFalse(summary["policy_ok"])
+        self.assertEqual(summary["sorry_policy"]["allowed_files"], ["repo/PaperTheorems.lean"])
+
+    def test_cleanup_phase_stuck_review_does_not_trigger_stuck_recovery(self) -> None:
+        state = {
+            "last_review": {
+                "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                "decision": "STUCK",
+                "cycle": 12,
+            },
+            "stuck_recovery_attempts": [],
+            "stuck_recovery_last_trigger_cycle": None,
+        }
+
+        self.assertFalse(supervisor.has_unhandled_stuck_review(state))
+        self.assertFalse(supervisor.can_attempt_stuck_recovery(state))
+
+    def test_restore_cleanup_last_good_commit_resets_repo(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_path, check=True, capture_output=True, text=True)
+        (repo_path / "tracked.txt").write_text("good\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "good"], cwd=repo_path, check=True, capture_output=True, text=True)
+        good_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repo_path / "tracked.txt").write_text("bad\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "bad"], cwd=repo_path, check=True, capture_output=True, text=True)
+
+        state = {"cleanup_last_good_commit": good_head}
+        with (
+            mock.patch.object(
+                supervisor,
+                "run_validation",
+                return_value={
+                    "cycle": 2,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": good_head},
+                },
+            ),
+            mock.patch.object(supervisor, "record_chat_event"),
+            mock.patch.object(supervisor, "save_state"),
+        ):
+            supervisor.restore_cleanup_last_good_commit(
+                config,
+                state,
+                cycle=2,
+                reason="cleanup stalled",
+            )
+
+        restored_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(restored_head, good_head)
 
     def test_human_input_is_only_consumed_after_new_request(self) -> None:
         repo_path = self.make_repo()
@@ -2284,6 +2882,41 @@ class WorkflowTests(SupervisorTestCase):
         self.assertTrue(all(entry.get("label") for entry in meta["markdown_files"]))
         self.assertIsNone(meta["branch_overview"])
 
+    def test_chat_event_export_writes_codex_budget_status_file(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="planning")
+        state = {"phase": "planning", "cycle": 2, "awaiting_human_input": False}
+        fake_status = {
+            "timestamp": "2026-03-26T18:01:00Z",
+            "source_path": "/tmp/session.jsonl",
+            "plan_type": "pro",
+            "used_percent": 44.0,
+            "percent_left": 56.0,
+            "window_minutes": 10080,
+            "resets_at": 1775081890,
+        }
+
+        with mock.patch.object(supervisor, "latest_codex_weekly_budget_status", return_value=fake_status):
+            supervisor.record_chat_event(
+                config,
+                state,
+                cycle=2,
+                phase="planning",
+                kind="worker_prompt",
+                actor="supervisor",
+                target="worker",
+                content="Read the paper carefully.",
+                content_type="text",
+            )
+
+        payload = json.loads((chat_root / "codex-budget.json").read_text(encoding="utf-8"))
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["percent_left"], 56.0)
+        self.assertEqual(payload["used_percent"], 44.0)
+        self.assertEqual(payload["window_minutes"], 10080)
+        self.assertEqual(payload["resets_at"], 1775081890)
+
     def test_chat_event_export_includes_branch_overview(self) -> None:
         repo_path = self.make_repo()
         chat_root = repo_path.parent / "chat site"
@@ -2366,6 +2999,42 @@ class WorkflowTests(SupervisorTestCase):
         plan_entry = next(entry for entry in meta["markdown_files"] if entry["label"] == "PLAN.md")
         self.assertIn("Expanded plan", exported_plan.read_text(encoding="utf-8"))
         self.assertTrue(plan_entry["updated_at"])
+
+    def test_chat_markdown_refresher_also_refreshes_codex_budget_status(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="planning")
+        supervisor.ensure_repo_files(config, "planning")
+        state = {"phase": "planning", "cycle": 1, "awaiting_human_input": False}
+        supervisor.record_chat_event(
+            config,
+            state,
+            cycle=1,
+            phase="planning",
+            kind="worker_prompt",
+            actor="supervisor",
+            target="worker",
+            content="Plan the project.",
+            content_type="text",
+        )
+        fake_status = {
+            "timestamp": "2026-03-27T16:53:22.283Z",
+            "source_path": "/tmp/session.jsonl",
+            "plan_type": "pro",
+            "used_percent": 27.0,
+            "percent_left": 73.0,
+            "window_minutes": 10080,
+            "resets_at": 1775181392,
+        }
+
+        with mock.patch.object(supervisor, "latest_codex_weekly_budget_status", return_value=fake_status):
+            refresher = supervisor.ChatMarkdownRefresher(config, interval_seconds=0.0)
+            refresher.maybe_refresh(force=True)
+
+        payload = json.loads((chat_root / "codex-budget.json").read_text(encoding="utf-8"))
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["percent_left"], 73.0)
+        self.assertEqual(payload["used_percent"], 27.0)
 
 
 class ProviderContextTests(SupervisorTestCase):

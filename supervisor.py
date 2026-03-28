@@ -38,11 +38,13 @@ MAX_BRANCH_STUCK_RECOVERY_ATTEMPTS = DEFAULT_BRANCH_STUCK_RECOVERY_ATTEMPTS
 BRANCH_FRONTIER_REPLACEMENT_MIN_CONFIDENCE = DEFAULT_BRANCH_FRONTIER_REPLACEMENT_MIN_CONFIDENCE
 BRANCH_PROPOSAL_COOLDOWN_REVIEWS = DEFAULT_BRANCH_PROPOSAL_COOLDOWN_REVIEWS
 AGENT_CLI_RETRY_DELAYS_SECONDS = DEFAULT_AGENT_CLI_RETRY_DELAYS_SECONDS
+PHASE_PROOF_COMPLETE_STYLE_CLEANUP = "proof_complete_style_cleanup"
 PHASES: Tuple[str, ...] = (
     "paper_check",
     "planning",
     "theorem_stating",
     "proof_formalization",
+    PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
 )
 WORKER_STATUSES: Tuple[str, ...] = ("NOT_STUCK", "STUCK", "DONE", "NEED_INPUT")
 REVIEWER_DECISIONS: Tuple[str, ...] = ("CONTINUE", "ADVANCE_PHASE", "STUCK", "NEED_INPUT", "DONE")
@@ -700,7 +702,7 @@ def load_config(path: Path) -> Config:
     )
 
     workflow_block = raw.get("workflow", {})
-    start_phase = str(workflow_block.get("start_phase", "proof_formalization")).strip().lower()
+    start_phase = normalize_phase_name(str(workflow_block.get("start_phase", "proof_formalization")))
     if start_phase not in PHASES:
         raise SupervisorError(f"Unsupported workflow.start_phase: {start_phase}")
     sorry_mode = str(workflow_block.get("sorry_mode", "default")).strip().lower()
@@ -972,6 +974,17 @@ def phase_index(phase: str) -> int:
     return PHASES.index(phase)
 
 
+def is_style_cleanup_phase(phase: str) -> bool:
+    return phase == PHASE_PROOF_COMPLETE_STYLE_CLEANUP
+
+
+def normalize_phase_name(value: str) -> str:
+    phase = value.strip().lower()
+    if phase in {"proof complete - style cleanup", "proof complete style cleanup"}:
+        return PHASE_PROOF_COMPLETE_STYLE_CLEANUP
+    return phase
+
+
 def next_phase(phase: str) -> Optional[str]:
     idx = phase_index(phase)
     if idx + 1 >= len(PHASES):
@@ -980,19 +993,19 @@ def next_phase(phase: str) -> Optional[str]:
 
 
 def phase_uses_paper_notes(phase: str) -> bool:
-    return phase in {"paper_check", "planning", "theorem_stating", "proof_formalization"}
+    return phase in {"paper_check", "planning", "theorem_stating", "proof_formalization", PHASE_PROOF_COMPLETE_STYLE_CLEANUP}
 
 
 def phase_uses_plan(phase: str) -> bool:
-    return phase in {"planning", "theorem_stating", "proof_formalization"}
+    return phase in {"planning", "theorem_stating", "proof_formalization", PHASE_PROOF_COMPLETE_STYLE_CLEANUP}
 
 
 def phase_uses_statement_files(phase: str) -> bool:
-    return phase in {"theorem_stating", "proof_formalization"}
+    return phase in {"theorem_stating", "proof_formalization", PHASE_PROOF_COMPLETE_STYLE_CLEANUP}
 
 
 def current_phase(config: Config, state: Dict[str, Any]) -> str:
-    phase = str(state.get("phase") or config.workflow.start_phase).strip().lower()
+    phase = normalize_phase_name(str(state.get("phase") or config.workflow.start_phase))
     if phase not in PHASES:
         raise SupervisorError(f"Invalid workflow phase in state: {phase}")
     state["phase"] = phase
@@ -1168,6 +1181,13 @@ def supervisor_phase_tasks(config: Config, phase: str) -> List[str]:
             "- [ ] Create `PaperTheorems.lean` with theorem statements as close to the paper as Lean allows.",
             "- [ ] Keep the files easy for a human to compare against the paper.",
             "- [ ] Make both files syntactically valid Lean.",
+        ]
+    if is_style_cleanup_phase(phase):
+        return [
+            "- [ ] Keep the proofs complete and the repo end-to-end buildable after every burst.",
+            "- [ ] Eliminate warnings when that can be done safely.",
+            "- [ ] Consider moderate refactors that improve reusability without changing the paper-facing results.",
+            "- [ ] Stop rather than forcing cleanup work that is not clearly worthwhile.",
         ]
     return [
         "- [ ] Prove the target statements presented in `PaperTheorems.lean`.",
@@ -1526,6 +1546,10 @@ def chat_manifest_path(config: Config) -> Path:
     return chat_root_dir(config) / "repos.json"
 
 
+def chat_codex_budget_path(config: Config) -> Path:
+    return chat_root_dir(config) / "codex-budget.json"
+
+
 def chat_repo_dir(config: Config) -> Path:
     return chat_root_dir(config) / config.chat.repo_name
 
@@ -1570,6 +1594,35 @@ def install_chat_viewer_assets(root_dir: Path) -> None:
         shutil.copyfile(source, target)
     if not (root_dir / "repos.json").exists():
         JsonFile.dump(root_dir / "repos.json", {"repos": []})
+
+
+def chat_codex_budget_payload() -> Dict[str, Any]:
+    status = latest_codex_weekly_budget_status()
+    payload: Dict[str, Any] = {
+        "available": status is not None,
+        "checked_at": timestamp_now(),
+    }
+    if status is None:
+        payload.update(
+            {
+                "timestamp": None,
+                "source_path": None,
+                "plan_type": None,
+                "used_percent": None,
+                "percent_left": None,
+                "window_minutes": None,
+                "resets_at": None,
+            }
+        )
+        return payload
+    payload.update(status)
+    return payload
+
+
+def refresh_chat_codex_budget_status(config: Config) -> Dict[str, Any]:
+    payload = chat_codex_budget_payload()
+    JsonFile.dump(chat_codex_budget_path(config), payload)
+    return payload
 
 
 def default_chat_meta(config: Config) -> Dict[str, Any]:
@@ -1839,6 +1892,7 @@ def refresh_chat_markdown_metadata(config: Config, *, update_manifest: bool) -> 
 
 def ensure_chat_site(config: Config) -> None:
     install_chat_viewer_assets(chat_root_dir(config))
+    refresh_chat_codex_budget_status(config)
     repo_dir = chat_repo_dir(config)
     repo_dir.mkdir(parents=True, exist_ok=True)
     redirect = textwrap.dedent(
@@ -2050,6 +2104,7 @@ def load_state(config: Config) -> Dict[str, Any]:
     state.setdefault("last_branch_consideration_cycle", 0)
     state.setdefault("codex_budget_pause", None)
     state.setdefault("policy", None)
+    state.setdefault("cleanup_last_good_commit", None)
     current_phase(config, state)
     return state
 
@@ -2069,6 +2124,8 @@ def phase_specific_reviewer_decisions(phase: str) -> Sequence[str]:
     if phase == "planning":
         return REVIEWER_DECISIONS
     if phase == "proof_formalization":
+        return ("CONTINUE", "ADVANCE_PHASE", "STUCK")
+    if is_style_cleanup_phase(phase):
         return ("CONTINUE", "STUCK", "DONE")
     return ("CONTINUE", "ADVANCE_PHASE", "STUCK")
 
@@ -2335,6 +2392,10 @@ def determine_resume_cycle_and_stage(state: Dict[str, Any]) -> Tuple[int, str]:
 
 def has_unhandled_stuck_review(state: Dict[str, Any]) -> bool:
     last_review = state.get("last_review") or {}
+    review_phase_raw = str(last_review.get("phase", "")).strip()
+    review_phase = normalize_phase_name(review_phase_raw) if review_phase_raw else "proof_formalization"
+    if review_phase != "proof_formalization":
+        return False
     if str(last_review.get("decision", "")).strip().upper() != "STUCK":
         return False
     trigger_cycle = last_review_cycle(state)
@@ -2385,6 +2446,86 @@ def approved_axioms(config: Config) -> List[str]:
 
 def git_push_command(config: Config) -> str:
     return f"git push {shlex.quote(config.git.remote_name)} HEAD:{shlex.quote(current_git_branch(config))}"
+
+
+def current_git_head(config: Config) -> Optional[str]:
+    if not repo_has_git_commits(config):
+        return None
+    head = git_output(config, ["rev-parse", "HEAD"]).strip()
+    return head or None
+
+
+def cleanup_last_good_commit(state: Dict[str, Any]) -> Optional[str]:
+    value = state.get("cleanup_last_good_commit")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def update_cleanup_last_good_commit(
+    config: Config,
+    state: Dict[str, Any],
+    validation_summary: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    head: Optional[str] = None
+    if isinstance(validation_summary, dict):
+        git_summary = validation_summary.get("git")
+        if isinstance(git_summary, dict):
+            raw_head = git_summary.get("head")
+            if isinstance(raw_head, str) and raw_head.strip():
+                head = raw_head.strip()
+    if head is None:
+        head = current_git_head(config)
+    if head:
+        state["cleanup_last_good_commit"] = head
+    return head
+
+
+def restore_cleanup_last_good_commit(
+    config: Config,
+    state: Dict[str, Any],
+    *,
+    cycle: int,
+    reason: str,
+) -> Dict[str, Any]:
+    commit = cleanup_last_good_commit(state)
+    if not commit:
+        raise SupervisorError("Cleanup rollback requested but no last good commit is recorded.")
+    ensure_git_command_ok(config, ["reset", "--hard", commit])
+    if git_is_enabled(config):
+        current_branch = current_git_branch(config)
+        ensure_git_command_ok(
+            config,
+            ["push", "--force-with-lease", config.git.remote_name, f"HEAD:{current_branch}"],
+        )
+    restored_validation = run_validation(config, PHASE_PROOF_COMPLETE_STYLE_CLEANUP, cycle)
+    state["last_validation"] = restored_validation
+    update_cleanup_last_good_commit(config, state, restored_validation)
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+        kind="cleanup_revert",
+        actor="supervisor",
+        target="workflow",
+        content={"reason": reason, "restored_commit": commit},
+        content_type="json",
+        summary=f"Reverted cleanup worktree to last good commit {commit[:12]}",
+    )
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+        kind="validation_summary",
+        actor="supervisor",
+        target="workflow",
+        content=restored_validation,
+        content_type="json",
+    )
+    save_state(config, state)
+    return restored_validation
 
 
 def git_validation_summary(config: Config) -> Dict[str, Any]:
@@ -2580,6 +2721,20 @@ def phase_worker_instructions(config: Config, phase: str, provider: str) -> str:
             - `DONE` means the statement files are in place and ready for reviewer comparison against the paper.
             """
         ).strip()
+    if is_style_cleanup_phase(phase):
+        return textwrap.dedent(
+            f"""\
+            Phase objective: PROOF COMPLETE - style cleanup.
+
+            Requirements:
+            - Treat the proofs as complete already; every burst must end with a fully buildable proof state.
+            - Maintain `{tasks_label}` and `{plan_label}`.
+            - Focus on warning cleanup, proof/style cleanup, and moderate refactors that improve reuse or readability.
+            - Keep `{definitions_label}` and `{theorems_label}` paper-facing and stable.
+            - Do not take speculative risks. If a cleanup attempt stops being clearly worthwhile, report `STUCK`.
+            - `DONE` means there is no clearly worthwhile remaining cleanup and the polished proof state should be kept as the final result.
+            """
+        ).strip()
     sorry_policy = (
         f"Default sorry policy: do not move on with extra sorrys anywhere outside `{theorems_label}`."
         if config.workflow.sorry_mode == "default"
@@ -2768,9 +2923,21 @@ def phase_reviewer_instructions(config: Config, phase: str) -> str:
         ).strip()
         git_note = git_reviewer_instructions(config)
         return text + ("\n" + git_note if git_note else "")
+    if is_style_cleanup_phase(phase):
+        text = textwrap.dedent(
+            """\
+            Decide whether cleanup should continue, stop as done, or stop because cleanup has stalled.
+            This phase is optional polish, not mission-critical proof development.
+            Require that every cycle remain fully buildable with no sorrys and no unapproved axioms.
+            Prefer `DONE` once the remaining cleanup is marginal.
+            Use `STUCK` when cleanup no longer seems worth the risk or effort; the supervisor will preserve the last good proof-complete commit and finish successfully.
+            """
+        ).strip()
+        git_note = git_reviewer_instructions(config)
+        return text + ("\n" + git_note if git_note else "")
     text = textwrap.dedent(
         """\
-        Decide whether the worker should continue the proof phase, stop as stuck, or declare the whole workflow done.
+        Decide whether the worker should continue the proof phase, advance to proof-complete style cleanup, or stop as stuck.
         Use the supervisor validation summary for build status, sorry counts, and axiom enforcement.
         Keep `PaperDefinitions.lean` and `PaperTheorems.lean` paper-facing and easy to compare against the paper.
         If the worker is stuffing reusable infrastructure into those files when separate support files would be cleaner, require refactoring.
@@ -3394,7 +3561,7 @@ def validation_sorry_policy(config: Config, phase: str, sorrys: Dict[str, Any]) 
             "allowed_files": ["any"],
             "disallowed_entries": [],
         }
-    if phase in {"theorem_stating", "proof_formalization"}:
+    if phase in {"theorem_stating", "proof_formalization", PHASE_PROOF_COMPLETE_STYLE_CLEANUP}:
         allowed_file = "repo/PaperTheorems.lean"
     else:
         allowed_file = None
@@ -3684,10 +3851,11 @@ class ChatMarkdownRefresher:
             return
         try:
             refresh_chat_markdown_metadata(self.config, update_manifest=False)
+            refresh_chat_codex_budget_status(self.config)
         except Exception as exc:
             message = str(exc)
             if message != self.last_warning:
-                print(f"[chat-export] warning: could not refresh markdown files: {message}", file=sys.stderr)
+                print(f"[chat-export] warning: could not refresh chat exports: {message}", file=sys.stderr)
                 self.last_warning = message
             self.next_refresh_at = now + self.interval_seconds
             return
@@ -5347,13 +5515,20 @@ def enforce_terminal_decision(
             raise SupervisorError("Cannot advance from theorem_stating with unapproved axioms present.")
         if validation_summary["sorry_policy"]["disallowed_entries"]:
             raise SupervisorError("Cannot advance from theorem_stating with disallowed sorrys present.")
-    if phase == "proof_formalization" and decision_value == "DONE":
+    if phase == "proof_formalization" and decision_value in {"ADVANCE_PHASE", "DONE"}:
         if not validation_summary["build"]["ok"]:
-            raise SupervisorError("Cannot finish proof_formalization while `lake build` is failing.")
+            raise SupervisorError("Cannot complete proof_formalization while `lake build` is failing.")
         if validation_summary["sorries"]["count"] != 0:
-            raise SupervisorError("Cannot finish proof_formalization while any `sorry` remains.")
+            raise SupervisorError("Cannot complete proof_formalization while any `sorry` remains.")
         if validation_summary["axioms"]["unapproved"]:
-            raise SupervisorError("Cannot finish proof_formalization with unapproved axioms present.")
+            raise SupervisorError("Cannot complete proof_formalization with unapproved axioms present.")
+    if is_style_cleanup_phase(phase) and decision_value == "DONE":
+        if not validation_summary["build"]["ok"]:
+            raise SupervisorError("Cannot finish cleanup while `lake build` is failing.")
+        if validation_summary["sorries"]["count"] != 0:
+            raise SupervisorError("Cannot finish cleanup while any `sorry` remains.")
+        if validation_summary["axioms"]["unapproved"]:
+            raise SupervisorError("Cannot finish cleanup with unapproved axioms present.")
 
 
 def main() -> int:
@@ -5372,6 +5547,9 @@ def main() -> int:
     policy_manager = PolicyManager(config)
     policy = policy_manager.reload(state=state, force=True, persist=True)
     phase = current_phase(config, state)
+    if is_style_cleanup_phase(phase) and cleanup_last_good_commit(state) is None:
+        update_cleanup_last_good_commit(config, state, state.get("last_validation"))
+        save_state(config, state)
     ensure_repo_files(config, phase)
     ensure_chat_site(config)
     ensure_tmux_session(config)
@@ -5403,14 +5581,14 @@ def main() -> int:
     worker = make_adapter("worker", config, state)
     reviewer = make_adapter("reviewer", config, state)
 
-    if not has_active_branch_episode and can_attempt_stuck_recovery(state, policy):
+    if phase == "proof_formalization" and not has_active_branch_episode and can_attempt_stuck_recovery(state, policy):
         suggestion = run_stuck_recovery_review(config, state, reviewer, phase, policy=policy)
         attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
         print(
             f"Prepared stuck-recovery attempt {suggestion['attempt']}/{attempt_limit} "
             f"from prior STUCK review."
         )
-    elif not has_active_branch_episode and has_unhandled_stuck_review(state):
+    elif phase == "proof_formalization" and not has_active_branch_episode and has_unhandled_stuck_review(state):
         attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
         print(
             "Stopping because the current stuck episode already exhausted all "
@@ -5450,6 +5628,9 @@ def main() -> int:
     while True:
         policy = policy_manager.reload(state=state, persist=True)
         phase = current_phase(config, state)
+        if is_style_cleanup_phase(phase) and cleanup_last_good_commit(state) is None:
+            update_cleanup_last_good_commit(config, state, state.get("last_validation"))
+            save_state(config, state)
         if active_branch_episode(state):
             return monitor_active_branch_episode(config, state, reviewer, phase, policy_manager)
         ensure_repo_files(config, phase)
@@ -5471,6 +5652,7 @@ def main() -> int:
         if stage == "worker":
             policy = policy_manager.reload(state=state, persist=True)
             print(f"\n===== cycle {cycle}: worker | phase={phase} =====")
+            cleanup_start_commit = cleanup_last_good_commit(state) if is_style_cleanup_phase(phase) else None
             worker_prompt = build_worker_prompt(
                 config,
                 state,
@@ -5536,6 +5718,26 @@ def main() -> int:
                 content=validation_summary,
                 content_type="json",
             )
+            if is_style_cleanup_phase(phase):
+                if not validation_summary["build"]["ok"] or validation_summary["sorries"]["count"] != 0 or validation_summary["axioms"]["unapproved"]:
+                    restore_cleanup_last_good_commit(
+                        config,
+                        state,
+                        cycle=cycle,
+                        reason="cleanup cycle ended without a fully valid proof state",
+                    )
+                    print("Cleanup cycle broke proof completeness; restored last good commit and stopping as DONE.")
+                    break
+                current_head = update_cleanup_last_good_commit(config, state, validation_summary)
+                worker_status = str(worker_handoff.get("status", "")).strip().upper()
+                if worker_status == "STUCK":
+                    print("Cleanup worker reported STUCK; keeping the last good proof-complete commit and stopping as DONE.")
+                    save_state(config, state)
+                    break
+                if cleanup_start_commit and current_head == cleanup_start_commit:
+                    print("Cleanup cycle made no committed progress; keeping the last good proof-complete commit and stopping as DONE.")
+                    save_state(config, state)
+                    break
             save_state(config, state)
         else:
             worker_terminal_output = str(state.get("last_worker_output") or "").strip()
@@ -5669,7 +5871,7 @@ def main() -> int:
                             "stopping this branch supervisor so the parent frontier monitor can evaluate it."
                         )
                         break
-        if decision_value != "STUCK" and stuck_recovery_attempts(state):
+        if phase == "proof_formalization" and decision_value != "STUCK" and stuck_recovery_attempts(state):
             clear_stuck_recovery(state)
             save_state(config, state)
         if decision_value == "ADVANCE_PHASE":
@@ -5686,6 +5888,8 @@ def main() -> int:
                 print("Reviewer advanced past the final phase; stopping as DONE.")
                 break
             state["phase"] = next_value
+            if is_style_cleanup_phase(next_value):
+                update_cleanup_last_good_commit(config, state, validation_summary)
             record_chat_event(
                 config,
                 state,
@@ -5723,6 +5927,15 @@ def main() -> int:
             print(f"Stopping because reviewer requested human input. See {config.workflow.input_request_path}")
             break
         if decision_value == "STUCK":
+            if is_style_cleanup_phase(phase):
+                restore_cleanup_last_good_commit(
+                    config,
+                    state,
+                    cycle=cycle,
+                    reason="cleanup reviewer decided the optional cleanup phase had stalled",
+                )
+                print("Cleanup reviewer returned STUCK; restored last good commit and stopping as DONE.")
+                break
             if can_attempt_stuck_recovery(state, policy):
                 suggestion = run_stuck_recovery_review(config, state, reviewer, phase, policy=policy)
                 attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
@@ -5739,6 +5952,9 @@ def main() -> int:
             )
             break
         if decision_value == "DONE":
+            if is_style_cleanup_phase(phase):
+                update_cleanup_last_good_commit(config, state, validation_summary)
+                save_state(config, state)
             print("Stopping because reviewer returned DONE.")
             break
 

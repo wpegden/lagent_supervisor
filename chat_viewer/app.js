@@ -4,6 +4,7 @@ const state = {
   currentMeta: null,
   currentEvents: [],
   currentProjectRepos: [],
+  codexBudgetStatus: null,
   refreshHandle: null,
 };
 
@@ -31,6 +32,10 @@ const elements = {
   transcript: document.querySelector("#transcript"),
   refreshButton: document.querySelector("#refresh-button"),
   autoRefresh: document.querySelector("#auto-refresh"),
+  codexBudgetIndicator: document.querySelector("#codex-budget-indicator"),
+  codexBudgetLabel: document.querySelector("#codex-budget-label"),
+  codexBudgetValue: document.querySelector("#codex-budget-value"),
+  codexBudgetReset: document.querySelector("#codex-budget-reset"),
 };
 
 function cacheBusted(path) {
@@ -83,8 +88,20 @@ function eventTitle(event) {
     branch_selection_decision: "Branch selection decision",
     branch_replacement_prompt: "Supervisor -> branch frontier selector",
     branch_replacement_decision: "Branch frontier decision",
+    cleanup_revert: "Cleanup rollback",
   };
   return titles[event.kind] || event.kind.replaceAll("_", " ");
+}
+
+function formatPhaseLabel(phase) {
+  const value = String(phase || "").trim();
+  if (!value) {
+    return "unknown phase";
+  }
+  if (value === "proof_complete_style_cleanup") {
+    return "PROOF COMPLETE - style cleanup";
+  }
+  return value.replaceAll("_", " ");
 }
 
 function timestampValue(value) {
@@ -101,6 +118,29 @@ function formatTimestamp(value) {
   }
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "unknown";
+  }
+  return `${numeric % 1 === 0 ? numeric.toFixed(0) : numeric.toFixed(1)}%`;
+}
+
+function formatBudgetReset(value) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return new Date(numeric * 1000).toLocaleString();
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return String(value);
+  }
+  return parsed.toLocaleString();
 }
 
 function sanitizeRepoName(value) {
@@ -542,12 +582,12 @@ function buildCycleCard(cycle, events, extraClass = "") {
   title.textContent = `Cycle ${cycle}`;
   const meta = document.createElement("p");
   meta.className = "subtle cycle-meta";
-  meta.textContent = `${firstEvent?.phase || "unknown phase"} · ${events.length} event${events.length === 1 ? "" : "s"} · ${formatTimestamp(lastEvent?.timestamp)}`;
+  meta.textContent = `${formatPhaseLabel(firstEvent?.phase)} · ${events.length} event${events.length === 1 ? "" : "s"} · ${formatTimestamp(lastEvent?.timestamp)}`;
   heading.append(title, meta);
 
   const badges = document.createElement("div");
   badges.className = "cycle-status-badges";
-  badges.append(createBadge(firstEvent?.phase || "unknown"));
+  badges.append(createBadge(formatPhaseLabel(firstEvent?.phase), String(firstEvent?.phase || "unknown")));
   if (summary.reviewerDecision?.content?.decision) {
     badges.append(
       createBadge(
@@ -677,7 +717,7 @@ function renderBranchOverview() {
     const meta = document.createElement("p");
     meta.className = "subtle branch-episode-meta";
     const contextPath = episode.lineage_newest_to_oldest?.length ? episode.lineage_newest_to_oldest.join(" ← ") : "mainline";
-    meta.textContent = `${episode.phase || "unknown phase"} · ${episode.status} · context ${contextPath}`;
+    meta.textContent = `${formatPhaseLabel(episode.phase)} · ${episode.status} · context ${contextPath}`;
     header.append(title, meta);
 
     const branchList = document.createElement("div");
@@ -1233,6 +1273,7 @@ function renderFilters() {
 }
 
 function renderHeader() {
+  renderCodexBudgetStatus();
   const project = currentProjectGroup();
   if (!state.currentMeta || !project) {
     elements.repoKicker.textContent = "Transcript";
@@ -1264,6 +1305,24 @@ function renderHeader() {
     link.title = file.path || file.label || "Markdown file";
     elements.repoDocLinks.append(link);
   });
+}
+
+function renderCodexBudgetStatus() {
+  if (!elements.codexBudgetIndicator) {
+    return;
+  }
+
+  elements.codexBudgetLabel.textContent = "weekly budget left";
+  const status = state.codexBudgetStatus;
+  const percentLeft = Number(status?.percent_left);
+  const isAvailable = Boolean(status) && status.available !== false && Number.isFinite(percentLeft);
+  elements.codexBudgetValue.textContent = isAvailable ? formatPercent(percentLeft) : "unknown";
+
+  const resetText = isAvailable ? formatBudgetReset(status?.resets_at) : "";
+  elements.codexBudgetReset.textContent = resetText ? `resets ${resetText}` : "";
+
+  const checkedAt = status?.checked_at ? formatTimestamp(status.checked_at) : "";
+  elements.codexBudgetIndicator.title = checkedAt ? `last checked ${checkedAt}` : "";
 }
 
 function renderEvents() {
@@ -1336,8 +1395,12 @@ async function selectProject(projectName, updateHash = false) {
 }
 
 async function refreshRepos() {
-  const payload = await fetchJson("repos.json", { repos: [] });
+  const [payload, budgetStatus] = await Promise.all([
+    fetchJson("repos.json", { repos: [] }),
+    fetchJson("codex-budget.json", null),
+  ]);
   state.repos = Array.isArray(payload.repos) ? payload.repos : [];
+  state.codexBudgetStatus = budgetStatus;
   renderRepoList();
 
   const hashValue = window.location.hash.replace(/^#/, "");

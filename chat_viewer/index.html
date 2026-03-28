@@ -43,11 +43,18 @@
           </div>
         </div>
         <div class="topbar-actions">
-          <label class="toggle">
-            <input id="auto-refresh" type="checkbox" checked>
-            <span>Auto-refresh</span>
-          </label>
-          <button id="refresh-button" type="button">Refresh now</button>
+          <div class="topbar-action-row">
+            <label class="toggle">
+              <input id="auto-refresh" type="checkbox" checked>
+              <span>Auto-refresh</span>
+            </label>
+            <button id="refresh-button" type="button">Refresh now</button>
+          </div>
+          <div id="codex-budget-indicator" class="topbar-status" aria-live="polite">
+            <p id="codex-budget-label" class="topbar-status-label">weekly budget left</p>
+            <p id="codex-budget-value" class="topbar-status-value">unknown</p>
+            <p id="codex-budget-reset" class="topbar-status-meta subtle"></p>
+          </div>
         </div>
       </header>
 
