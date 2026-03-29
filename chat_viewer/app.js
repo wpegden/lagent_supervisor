@@ -1,11 +1,21 @@
+function normalizeViewerVersion(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized || /^__.*__$/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
 const state = {
   repos: [],
   currentProjectName: null,
   currentMeta: null,
+  currentTimelineRepoName: null,
   currentEvents: [],
   currentProjectRepos: [],
   codexBudgetStatus: null,
-  refreshHandle: null,
+  loadingOlderHistory: false,
+  viewerVersion: normalizeViewerVersion(document.documentElement.dataset.viewerVersion),
 };
 
 const elements = {
@@ -31,11 +41,13 @@ const elements = {
   emptyState: document.querySelector("#empty-state"),
   transcript: document.querySelector("#transcript"),
   refreshButton: document.querySelector("#refresh-button"),
-  autoRefresh: document.querySelector("#auto-refresh"),
   codexBudgetIndicator: document.querySelector("#codex-budget-indicator"),
   codexBudgetLabel: document.querySelector("#codex-budget-label"),
   codexBudgetValue: document.querySelector("#codex-budget-value"),
   codexBudgetReset: document.querySelector("#codex-budget-reset"),
+  historyControls: document.querySelector("#history-controls"),
+  historyLoadOlder: document.querySelector("#history-load-older"),
+  historyMeta: document.querySelector("#history-meta"),
 };
 
 function cacheBusted(path) {
@@ -55,7 +67,20 @@ async function fetchJson(path, fallback) {
   }
 }
 
-async function fetchEvents(repoName) {
+async function ensureViewerCurrent() {
+  if (!state.viewerVersion) {
+    return true;
+  }
+  const payload = await fetchJson("_assets/viewer-version.json", null);
+  const latestVersion = normalizeViewerVersion(payload?.version);
+  if (!latestVersion || latestVersion === state.viewerVersion) {
+    return true;
+  }
+  window.location.reload();
+  return false;
+}
+
+async function fetchLegacyEvents(repoName) {
   try {
     const response = await fetch(cacheBusted(`${repoName}/events.jsonl`), { cache: "no-store" });
     if (!response.ok) {
@@ -70,6 +95,58 @@ async function fetchEvents(repoName) {
   } catch (_error) {
     return [];
   }
+}
+
+async function fetchEventsManifest(repoName) {
+  const fallback = { chunk_size_cycles: 0, chunks: [] };
+  const payload = await fetchJson(`${repoName}/events-manifest.json`, fallback);
+  if (!payload || !Array.isArray(payload.chunks)) {
+    return fallback;
+  }
+  const chunks = payload.chunks
+    .filter((chunk) => chunk && typeof chunk.file === "string")
+    .map((chunk) => ({
+      file: String(chunk.file),
+      start_cycle: Number(chunk.start_cycle) || 0,
+      end_cycle: Number(chunk.end_cycle) || 0,
+      event_count: Number(chunk.event_count) || 0,
+      updated_at: chunk.updated_at || null,
+    }))
+    .sort((left, right) => Number(right.start_cycle) - Number(left.start_cycle));
+  return {
+    chunk_size_cycles: Number(payload.chunk_size_cycles) || 0,
+    chunks,
+  };
+}
+
+async function fetchEventsChunk(repoName, filePath) {
+  try {
+    const response = await fetch(cacheBusted(`${repoName}/${filePath}`), { cache: "no-store" });
+    if (!response.ok) {
+      return [];
+    }
+    const text = await response.text();
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch (_error) {
+    return [];
+  }
+}
+
+function manifestLooksStale(meta, eventsManifest) {
+  const chunks = Array.isArray(eventsManifest?.chunks) ? eventsManifest.chunks : [];
+  if (!chunks.length) {
+    return false;
+  }
+  const newestChunk = chunks[0];
+  const metaCycle = Number(meta?.current_cycle) || 0;
+  if (metaCycle > (Number(newestChunk?.end_cycle) || 0)) {
+    return true;
+  }
+  return timestampValue(meta?.updated_at) > timestampValue(newestChunk?.updated_at);
 }
 
 function eventTitle(event) {
@@ -331,11 +408,24 @@ function filteredProjects() {
   });
 }
 
+function repoRunStatus(meta) {
+  return String(meta?.run_status || "").trim().toLowerCase();
+}
+
+function repoIsPaused(meta) {
+  return repoRunStatus(meta) === "paused";
+}
+
+function projectIsPaused(project) {
+  return repoIsPaused(project?.newestRepo);
+}
+
 function projectSummary(project) {
   const newest = project.newestRepo || {};
   const leafCount = projectLeafRepos(project).length || project.repos.length;
   const prefix = project.hasBranching ? `${leafCount} leaf timeline${leafCount === 1 ? "" : "s"} · ` : "";
-  return `${newest.current_phase || "No phase yet"} · ${prefix}${formatTimestamp(newest.updated_at)}`;
+  const pausedPrefix = projectIsPaused(project) ? "paused · " : "";
+  return `${pausedPrefix}${newest.current_phase || "No phase yet"} · ${prefix}${formatTimestamp(newest.updated_at)}`;
 }
 
 function renderRepoList() {
@@ -564,10 +654,189 @@ function cycleSummaryData(events) {
   };
 }
 
-function buildCycleCard(cycle, events, extraClass = "") {
+function cycleLeanDelta(projectRepo, cycle) {
+  const cycles = projectRepo?.leanCycleStats?.cycles;
+  if (!cycles || typeof cycles !== "object") {
+    return null;
+  }
+  const entry = cycles[String(cycle)] || cycles[cycle];
+  if (!entry) {
+    return null;
+  }
+  const added = Number(entry.lean_added);
+  const removed = Number(entry.lean_removed);
+  const filesTouched = Number(entry.lean_files_touched);
+  if (!Number.isFinite(added) || !Number.isFinite(removed)) {
+    return null;
+  }
+  return {
+    added,
+    removed,
+    filesTouched: Number.isFinite(filesTouched) ? filesTouched : 0,
+  };
+}
+
+function timelineLeanTotals(projectRepo) {
+  const cycles = projectRepo?.leanCycleStats?.cycles;
+  if (!cycles || typeof cycles !== "object") {
+    return null;
+  }
+
+  let added = 0;
+  let removed = 0;
+  let fileTouchCount = 0;
+  let cycleCount = 0;
+
+  Object.values(cycles).forEach((entry) => {
+    const cycleAdded = Number(entry?.lean_added);
+    const cycleRemoved = Number(entry?.lean_removed);
+    const cycleFiles = Number(entry?.lean_files_touched);
+    if (!Number.isFinite(cycleAdded) || !Number.isFinite(cycleRemoved)) {
+      return;
+    }
+    added += cycleAdded;
+    removed += cycleRemoved;
+    if (Number.isFinite(cycleFiles) && cycleFiles > 0) {
+      fileTouchCount += cycleFiles;
+    }
+    cycleCount += 1;
+  });
+
+  if (cycleCount === 0) {
+    return null;
+  }
+
+  return {
+    added,
+    removed,
+    fileTouchCount,
+    cycleCount,
+  };
+}
+
+function accumulateLeanTotals(left, right) {
+  if (!right) {
+    return left;
+  }
+  return {
+    added: (left?.added || 0) + right.added,
+    removed: (left?.removed || 0) + right.removed,
+    fileTouchCount: (left?.fileTouchCount || 0) + (right?.fileTouchCount || 0),
+    cycleCount: (left?.cycleCount || 0) + right.cycleCount,
+  };
+}
+
+function lineageLeanTotals(projectRepo, nodes = null) {
+  if (!projectRepo?.meta) {
+    return null;
+  }
+  const timelineNodes = nodes || projectTimelineNodes();
+  const node = timelineNodes.get(timelineKeyFromMeta(projectRepo.meta));
+  if (!node) {
+    return timelineLeanTotals(projectRepo);
+  }
+  const chain = ancestorChainFromLeaf(node, timelineNodes).reverse();
+  let totals = null;
+  chain.forEach((ancestor) => {
+    totals = accumulateLeanTotals(totals, timelineLeanTotals(ancestor.projectRepo));
+  });
+  return totals;
+}
+
+function formatLeanDelta(delta) {
+  if (!delta) {
+    return "";
+  }
+  const filesSuffix =
+    delta.filesTouched > 0 ? ` · ${delta.filesTouched} file${delta.filesTouched === 1 ? "" : "s"}` : "";
+  return `Lean +${delta.added} / -${delta.removed}${filesSuffix}`;
+}
+
+function buildLeanDeltaElement(delta) {
+  if (!delta) {
+    return null;
+  }
+  const line = document.createElement("p");
+  line.className = "subtle cycle-delta";
+
+  const label = document.createElement("span");
+  label.className = "cycle-delta-label";
+  label.textContent = "Lean ";
+
+  const added = document.createElement("span");
+  added.className = "cycle-delta-added";
+  added.textContent = `+${delta.added}`;
+
+  const separator = document.createElement("span");
+  separator.className = "cycle-delta-separator";
+  separator.textContent = " / ";
+
+  const removed = document.createElement("span");
+  removed.className = "cycle-delta-removed";
+  removed.textContent = `-${delta.removed}`;
+
+  line.append(label, added, separator, removed);
+  if (delta.filesTouched > 0) {
+    const files = document.createElement("span");
+    files.className = "cycle-delta-files";
+    files.textContent = ` · ${delta.filesTouched} file${delta.filesTouched === 1 ? "" : "s"}`;
+    line.append(files);
+  }
+  line.title = formatLeanDelta(delta);
+  return line;
+}
+
+function formatLeanTotals(totals) {
+  if (!totals) {
+    return "";
+  }
+  const cycleSuffix =
+    totals.cycleCount > 0
+      ? ` · ${totals.cycleCount} validated cycle${totals.cycleCount === 1 ? "" : "s"}`
+      : "";
+  return `Lean total +${totals.added} / -${totals.removed}${cycleSuffix}`;
+}
+
+function buildLeanTotalsElement(totals, labelText = "Lean total ") {
+  if (!totals) {
+    return null;
+  }
+
+  const line = document.createElement("p");
+  line.className = "subtle timeline-total-delta";
+
+  const label = document.createElement("span");
+  label.className = "cycle-delta-label";
+  label.textContent = labelText;
+
+  const added = document.createElement("span");
+  added.className = "cycle-delta-added";
+  added.textContent = `+${totals.added}`;
+
+  const separator = document.createElement("span");
+  separator.className = "cycle-delta-separator";
+  separator.textContent = " / ";
+
+  const removed = document.createElement("span");
+  removed.className = "cycle-delta-removed";
+  removed.textContent = `-${totals.removed}`;
+
+  line.append(label, added, separator, removed);
+  if (totals.cycleCount > 0) {
+    const cycles = document.createElement("span");
+    cycles.className = "cycle-delta-files";
+    cycles.textContent = ` · ${totals.cycleCount} validated cycle${totals.cycleCount === 1 ? "" : "s"}`;
+    line.append(cycles);
+  }
+  line.title = formatLeanTotals(totals);
+  return line;
+}
+
+function buildCycleCard(cycle, events, extraClass = "", projectRepo = null) {
   const firstEvent = events[0];
   const lastEvent = events[events.length - 1];
   const summary = cycleSummaryData(events);
+  const leanDelta = cycleLeanDelta(projectRepo, cycle);
 
   const cycleCard = document.createElement("article");
   cycleCard.className = `cycle-card ${extraClass}`.trim();
@@ -584,6 +853,12 @@ function buildCycleCard(cycle, events, extraClass = "") {
   meta.className = "subtle cycle-meta";
   meta.textContent = `${formatPhaseLabel(firstEvent?.phase)} · ${events.length} event${events.length === 1 ? "" : "s"} · ${formatTimestamp(lastEvent?.timestamp)}`;
   heading.append(title, meta);
+  if (leanDelta) {
+    const delta = buildLeanDeltaElement(leanDelta);
+    if (delta) {
+      heading.append(delta);
+    }
+  }
 
   const badges = document.createElement("div");
   badges.className = "cycle-status-badges";
@@ -626,8 +901,42 @@ function buildCycleCard(cycle, events, extraClass = "") {
   return cycleCard;
 }
 
-function projectIsBranched() {
-  return Boolean(state.currentMeta?.branch_overview?.has_branching) || state.currentProjectRepos.length > 1;
+function projectIsBranched(projectRepos = state.currentProjectRepos) {
+  return projectRepos.some((projectRepo) => Boolean(projectRepo?.meta?.branch_overview?.has_branching)) || projectRepos.length > 1;
+}
+
+function currentRootRepoName(projectRepos = state.currentProjectRepos) {
+  const project = currentProjectGroup();
+  return project?.primaryRepo?.repo_name || state.currentProjectName || projectRepos[0]?.meta?.repo_name || "";
+}
+
+function currentTranscriptProjectRepo(projectRepos = state.currentProjectRepos) {
+  if (!projectRepos.length) {
+    return null;
+  }
+  if (state.currentTimelineRepoName) {
+    const explicit = projectRepos.find((repo) => repo.meta.repo_name === state.currentTimelineRepoName);
+    if (explicit) {
+      return explicit;
+    }
+  }
+  if (!projectIsBranched(projectRepos)) {
+    const primaryRepoName = currentRootRepoName(projectRepos);
+    return projectRepos.find((repo) => repo.meta.repo_name === primaryRepoName) || projectRepos[0] || null;
+  }
+
+  const nodes = projectTimelineNodes(projectRepos);
+  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
+  if (liveLeaves.length) {
+    return liveLeaves[0].projectRepo;
+  }
+
+  const primaryRepoName = currentRootRepoName(projectRepos);
+  return projectRepos.find((repo) => repo.meta.repo_name === primaryRepoName) || projectRepos[0] || null;
+}
+
+function shouldShowTranscript() {
+  return state.currentProjectRepos.length > 0;
 }
 
 function projectBranchOverview() {
@@ -679,29 +988,27 @@ function renderBranchOverview() {
   }
 
   elements.branchPanel.hidden = false;
-  elements.branchTitle.textContent = "Project tree so far";
+  elements.branchTitle.textContent = "Branch history so far";
   elements.branchMeta.textContent =
     `${overview.episodes?.length || 0} branch episode${(overview.episodes?.length || 0) === 1 ? "" : "s"} · ` +
-    `${overview.active_leaf_count || 0} active leaf timeline${(overview.active_leaf_count || 0) === 1 ? "" : "s"}`;
+    `${overview.active_leaf_count || 0} live timeline${(overview.active_leaf_count || 0) === 1 ? "" : "s"}`;
 
   elements.branchCurrentPath.replaceChildren();
-  const currentPathLabel = document.createElement("p");
-  currentPathLabel.className = "branch-current-label";
-  if ((overview.active_leaf_count || 0) === 1) {
-    currentPathLabel.textContent = "Current path";
-    const currentPathValue = document.createElement("p");
-    currentPathValue.className = "branch-current-value";
-    currentPathValue.textContent = (overview.current_path_newest_to_oldest || []).join(" ← ");
-    elements.branchCurrentPath.append(currentPathLabel, currentPathValue);
-  } else {
-    currentPathLabel.textContent = "Current frontier";
-    elements.branchCurrentPath.append(currentPathLabel);
-    (overview.active_leaf_paths || []).forEach((path) => {
-      const item = document.createElement("p");
-      item.className = "branch-current-value";
-      item.textContent = path.join(" ← ");
-      elements.branchCurrentPath.append(item);
-    });
+  const transcriptRepo = currentTranscriptProjectRepo();
+  const nodes = projectTimelineNodes();
+  const transcriptPath = transcriptRepo ? timelinePath(transcriptRepo.meta) : null;
+  if (transcriptPath?.length) {
+    const transcriptLabel = document.createElement("p");
+    transcriptLabel.className = "branch-current-label";
+    transcriptLabel.textContent = "Transcript shown below";
+    const transcriptValue = document.createElement("p");
+    transcriptValue.className = "branch-current-value";
+    transcriptValue.textContent = transcriptPath.join(" ← ");
+    const transcriptTotals = buildLeanTotalsElement(lineageLeanTotals(transcriptRepo, nodes));
+    elements.branchCurrentPath.append(transcriptLabel, transcriptValue);
+    if (transcriptTotals) {
+      elements.branchCurrentPath.append(transcriptTotals);
+    }
   }
 
   elements.branchEpisodes.replaceChildren();
@@ -720,11 +1027,28 @@ function renderBranchOverview() {
     meta.textContent = `${formatPhaseLabel(episode.phase)} · ${episode.status} · context ${contextPath}`;
     header.append(title, meta);
 
+    const summaries = document.createElement("div");
+    summaries.className = "branch-episode-summaries";
+    if (episode.branchSummary) {
+      const branchSummary = document.createElement("p");
+      branchSummary.className = "branch-item-summary";
+      branchSummary.textContent = `BRANCH: ${strippedBoundarySummary("BRANCH", episode.branchSummary)}`;
+      summaries.append(branchSummary);
+    }
+    if (episode.selectionSummary) {
+      const selectionSummary = document.createElement("p");
+      selectionSummary.className = "branch-item-summary";
+      selectionSummary.textContent = `SELECT_BRANCH: ${strippedBoundarySummary("SELECT_BRANCH", episode.selectionSummary)}`;
+      summaries.append(selectionSummary);
+    }
+
     const branchList = document.createElement("div");
     branchList.className = "branch-list";
     const branches = [...(episode.branches || [])].sort((left, right) => {
-      if (Boolean(right.is_current_path) !== Boolean(left.is_current_path)) {
-        return Number(Boolean(right.is_current_path)) - Number(Boolean(left.is_current_path));
+      const leftLive = left.status === "active" || left.status === "selected";
+      const rightLive = right.status === "active" || right.status === "selected";
+      if (leftLive !== rightLive) {
+        return Number(rightLive) - Number(leftLive);
       }
       const rank = { active: 3, selected: 2, dead: 1 };
       return (rank[right.status] || 0) - (rank[left.status] || 0);
@@ -756,7 +1080,11 @@ function renderBranchOverview() {
       branchList.append(item);
     });
 
-    card.append(header, branchList);
+    card.append(header);
+    if (summaries.childElementCount) {
+      card.append(summaries);
+    }
+    card.append(branchList);
     elements.branchEpisodes.append(card);
   });
 }
@@ -776,7 +1104,7 @@ function branchStatusMap() {
 }
 
 function timelineStatus(projectRepo) {
-  const rootRepoName = state.currentMeta?.repo_name || state.currentProjectName || "";
+  const rootRepoName = currentRootRepoName();
   if (projectRepo.meta.repo_name === rootRepoName) {
     return "mainline";
   }
@@ -788,16 +1116,16 @@ function timelineStatus(projectRepo) {
 }
 
 function timelineName(projectRepo) {
-  const rootRepoName = state.currentMeta?.repo_name || state.currentProjectName || "";
+  const rootRepoName = currentRootRepoName();
   if (projectRepo.meta.repo_name === rootRepoName) {
     return "mainline";
   }
   return timelinePath(projectRepo.meta)[0] || projectRepo.meta.repo_display_name || projectRepo.meta.repo_name;
 }
 
-function projectTimelineNodes() {
+function projectTimelineNodes(projectRepos = state.currentProjectRepos) {
   const nodes = new Map();
-  [...state.currentProjectRepos]
+  [...projectRepos]
     .filter((projectRepo) => projectRepo?.meta)
     .forEach((projectRepo) => {
       const pathNewToOld = timelinePath(projectRepo.meta);
@@ -1135,6 +1463,7 @@ function buildCardsRowElement(cards, columnCount) {
     const slot = slots[index];
     const content = buildTimelineNodeCard(card.node, card.events, {
       summary: segmentSummary(card.events, card.node.projectRepo.meta.last_summary || "No summary recorded yet."),
+      selectable: true,
     });
     content.style.gridColumn = `${slot.start} / span ${slot.span}`;
     rowElement.append(content);
@@ -1166,8 +1495,13 @@ function buildBoundaryRowElement(row, columnCount) {
 
 function buildTimelineNodeCard(node, events, options = {}) {
   const projectRepo = node.projectRepo;
+  const branchLeanTotals = timelineLeanTotals(projectRepo);
   const nodeCard = document.createElement("article");
-  nodeCard.className = `timeline-column branch-tree-node status-${node.status}${options.extraClass ? ` ${options.extraClass}` : ""}`;
+  const selected = projectRepo.meta.repo_name === state.currentTimelineRepoName;
+  nodeCard.className =
+    `timeline-column branch-tree-node status-${node.status}` +
+    `${selected ? " is-selected-transcript" : ""}` +
+    `${options.extraClass ? ` ${options.extraClass}` : ""}`;
 
   const header = document.createElement("div");
   header.className = "timeline-column-header";
@@ -1179,8 +1513,14 @@ function buildTimelineNodeCard(node, events, options = {}) {
   title.textContent = options.title || node.name;
   const badges = document.createElement("div");
   badges.className = "timeline-column-badges";
+  if (repoIsPaused(projectRepo.meta)) {
+    badges.append(createBadge("paused", "status-paused"));
+  }
   badges.append(createBadge(projectRepo.meta.current_phase || "unknown"));
   badges.append(createBadge(node.status, `status-${node.status}`));
+  if (selected) {
+    badges.append(createBadge("transcript", "status-selected"));
+  }
   headingRow.append(title, badges);
 
   const path = document.createElement("p");
@@ -1190,14 +1530,32 @@ function buildTimelineNodeCard(node, events, options = {}) {
   const summary = document.createElement("p");
   summary.className = "timeline-column-summary";
   summary.textContent = options.summary || segmentSummary(events, projectRepo.meta.last_summary || "No summary recorded yet.");
+  const totalsLine = buildLeanTotalsElement(branchLeanTotals, "Lean branch ");
 
   const docs = document.createElement("div");
   docs.className = "timeline-column-docs";
   appendTimelineDocLinks(docs, projectRepo);
 
   header.append(headingRow, path, summary);
+  if (totalsLine) {
+    header.append(totalsLine);
+  }
   if (docs.childElementCount) {
     header.append(docs);
+  }
+
+  if (options.selectable) {
+    nodeCard.tabIndex = 0;
+    nodeCard.role = "button";
+    nodeCard.setAttribute("aria-pressed", selected ? "true" : "false");
+    const activate = () => updateTranscriptSelection(projectRepo.meta.repo_name);
+    nodeCard.addEventListener("click", activate);
+    nodeCard.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        activate();
+      }
+    });
   }
 
   const cycles = document.createElement("div");
@@ -1210,12 +1568,76 @@ function buildTimelineNodeCard(node, events, options = {}) {
     cycles.append(empty);
   } else {
     grouped.forEach(({ cycle, events: cycleEvents }) => {
-      cycles.append(buildCycleCard(cycle, cycleEvents, "branch-cycle-card"));
+      cycles.append(buildCycleCard(cycle, cycleEvents, "branch-cycle-card", projectRepo));
     });
   }
 
   nodeCard.append(header, cycles);
   return nodeCard;
+}
+
+function updateTranscriptSelection(repoName) {
+  state.currentTimelineRepoName = repoName;
+  const transcriptRepo = currentTranscriptProjectRepo();
+  state.currentEvents = transcriptRepo?.events || [];
+  populateFilters(state.currentEvents);
+  renderHeader();
+  renderFilters();
+  renderBranchOverview();
+  renderBranchBoard();
+  renderEvents();
+}
+
+function buildTimelineSelectorCard(node) {
+  const projectRepo = node.projectRepo;
+  const selected = projectRepo.meta.repo_name === state.currentTimelineRepoName;
+
+  const card = document.createElement("article");
+  card.className = `timeline-selector-card status-${node.status}${selected ? " is-selected-transcript" : ""}`;
+  card.tabIndex = 0;
+  card.role = "button";
+  card.setAttribute("aria-pressed", selected ? "true" : "false");
+
+  const headingRow = document.createElement("div");
+  headingRow.className = "timeline-column-heading-row";
+  const title = document.createElement("h4");
+  title.className = "timeline-column-title";
+  title.textContent = node.name;
+  const badges = document.createElement("div");
+  badges.className = "timeline-column-badges";
+  if (repoIsPaused(projectRepo.meta)) {
+    badges.append(createBadge("paused", "status-paused"));
+  }
+  badges.append(createBadge(projectRepo.meta.current_phase || "unknown"));
+  badges.append(createBadge(node.status, `status-${node.status}`));
+  if (selected) {
+    badges.append(createBadge("transcript", "status-selected"));
+  }
+  headingRow.append(title, badges);
+
+  const path = document.createElement("p");
+  path.className = "timeline-column-path subtle";
+  path.textContent = node.pathNewToOld.join(" ← ");
+
+  const summary = document.createElement("p");
+  summary.className = "timeline-column-summary";
+  summary.textContent = projectRepo.meta.last_summary || "No summary recorded yet.";
+
+  const meta = document.createElement("p");
+  meta.className = "timeline-empty";
+  meta.textContent = `cycle ${projectRepo.meta.current_cycle || "?"} · last update ${formatTimestamp(projectRepo.meta.updated_at)}`;
+
+  const activate = () => updateTranscriptSelection(projectRepo.meta.repo_name);
+  card.addEventListener("click", activate);
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activate();
+    }
+  });
+
+  card.append(headingRow, path, summary, meta);
+  return card;
 }
 
 function appendTimelineDocLinks(container, projectRepo) {
@@ -1242,23 +1664,25 @@ function renderBranchBoard() {
 
   const nodes = projectTimelineNodes();
   const rootNode = [...nodes.values()].find((node) => !node.parentKey) || null;
-  const episodesByContext = projectEpisodesByContext(nodes);
-  const rows = buildProjectRowsForNode(rootNode, nodes, episodesByContext, null);
-  const cardsOnly = rows.filter((row) => row.type === "cards");
-  const liveLeaves = liveLeafNodes(nodes).sort(leafSort);
-  if (!rootNode || !rows.length || !cardsOnly.length) {
+  if (!rootNode) {
     elements.branchBoard.hidden = true;
     elements.branchBoardGrid.replaceChildren();
     return;
   }
-  const columnCount = Math.max(1, ...cardsOnly.map((row) => row.cards.length));
+  const episodesByContext = projectEpisodesByContext(nodes);
+  const rows = buildProjectRowsForNode(rootNode, nodes, episodesByContext);
+  const columnCount = Math.max(
+    1,
+    ...rows
+      .filter((row) => row.type === "cards")
+      .map((row) => row.cards.length),
+  );
 
   elements.branchBoard.hidden = false;
-  elements.branchBoardTitle.textContent = `${liveLeaves.length} current leaf timeline${liveLeaves.length === 1 ? "" : "s"} above shared history`;
+  elements.branchBoardTitle.textContent = "Branch timelines";
   elements.branchBoardMeta.textContent =
-    "Leaf branches stay side by side until one is pruned and the surviving route continues as the main branch above.";
+    "Recent branch activity appears above earlier shared history. Click any timeline column to focus that branch and update the project links above.";
   elements.branchBoardGrid.replaceChildren();
-
   rows.forEach((row) => {
     if (row.type === "boundary") {
       elements.branchBoardGrid.append(buildBoundaryRowElement(row, columnCount));
@@ -1269,7 +1693,7 @@ function renderBranchBoard() {
 }
 
 function renderFilters() {
-  elements.filters.hidden = projectIsBranched();
+  elements.filters.hidden = projectIsBranched() || !(state.currentProjectRepos.length && state.currentEvents.length);
 }
 
 function renderHeader() {
@@ -1284,27 +1708,95 @@ function renderHeader() {
     return;
   }
 
-  elements.repoKicker.textContent = projectIsBranched() ? "Project" : state.currentMeta.current_phase || "Transcript";
-  elements.repoTitle.textContent = project.displayName;
+  const paused = projectIsPaused(project);
+  elements.repoKicker.textContent = paused
+    ? projectIsBranched()
+      ? "Project paused"
+      : `${state.currentMeta.current_phase || "Transcript"} paused`
+    : projectIsBranched()
+      ? "Project"
+      : state.currentMeta.current_phase || "Transcript";
+  elements.repoTitle.textContent = paused ? `${project.displayName} (paused)` : project.displayName;
   const timelineLabel = `${project.repos.length} timeline${project.repos.length === 1 ? "" : "s"}`;
-  elements.repoMeta.textContent =
-    `${project.primaryRepo?.repo_path || state.currentMeta.repo_path} · ${timelineLabel} · ` +
-    `last update ${formatTimestamp(project.newestRepo?.updated_at || state.currentMeta.updated_at)}`;
+  const metaParts = [
+    project.primaryRepo?.repo_path || state.currentMeta.repo_path,
+    timelineLabel,
+  ];
+  if (paused) {
+    metaParts.push(`paused ${formatTimestamp(project.newestRepo?.paused_at || project.newestRepo?.updated_at)}`);
+  }
+  metaParts.push(`last update ${formatTimestamp(project.newestRepo?.updated_at || state.currentMeta.updated_at)}`);
+  elements.repoMeta.textContent = metaParts.join(" · ");
 
-  const files =
-    projectIsBranched() || !Array.isArray(state.currentMeta.markdown_files) ? [] : state.currentMeta.markdown_files;
+  const transcriptRepo = currentTranscriptProjectRepo();
+  const files = Array.isArray(transcriptRepo?.meta?.markdown_files) ? transcriptRepo.meta.markdown_files : [];
   elements.repoDocLinks.replaceChildren();
   elements.repoDocPanel.hidden = !files.length;
   files.forEach((file) => {
     const link = document.createElement("a");
     link.className = "doc-link";
-    link.href = markdownViewerHref(state.currentMeta.repo_name, file);
+    link.href = markdownViewerHref(transcriptRepo.meta.repo_name, file);
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.textContent = file.label || file.path || "Markdown file";
     link.title = file.path || file.label || "Markdown file";
     elements.repoDocLinks.append(link);
   });
+}
+
+function rebuildRepoEvents(projectRepo) {
+  const loadedChunks = Array.isArray(projectRepo.loadedChunks) ? projectRepo.loadedChunks : [];
+  const events = loadedChunks
+    .slice()
+    .sort((left, right) => Number(left.start_cycle) - Number(right.start_cycle))
+    .flatMap((chunk) => chunk.events || []);
+  projectRepo.events = events;
+  projectRepo.loadedAllHistory =
+    !projectRepo.eventsManifest || loadedChunks.length >= (projectRepo.eventsManifest.chunks || []).length;
+  return projectRepo;
+}
+
+function repoHasOlderHistory(projectRepo) {
+  return Boolean(projectRepo?.eventsManifest?.chunks?.length) &&
+    (projectRepo.loadedChunks || []).length < (projectRepo.eventsManifest.chunks || []).length;
+}
+
+function nextOlderChunkMeta(projectRepo) {
+  if (!projectRepo?.eventsManifest?.chunks?.length) {
+    return null;
+  }
+  const loaded = new Set((projectRepo.loadedChunks || []).map((chunk) => chunk.file));
+  return projectRepo.eventsManifest.chunks.find((chunk) => !loaded.has(chunk.file)) || null;
+}
+
+function renderHistoryControls() {
+  if (!elements.historyControls) {
+    return;
+  }
+  const currentProject = currentProjectGroup();
+  if (!state.currentMeta || !currentProject || !state.currentProjectRepos.length) {
+    elements.historyControls.hidden = true;
+    return;
+  }
+  const reposWithOlder = state.currentProjectRepos.filter(repoHasOlderHistory);
+  if (!reposWithOlder.length) {
+    elements.historyControls.hidden = true;
+    return;
+  }
+  elements.historyControls.hidden = false;
+  elements.historyLoadOlder.disabled = state.loadingOlderHistory;
+  elements.historyLoadOlder.textContent = state.loadingOlderHistory ? "Loading older history..." : "Load older history";
+
+  const remainingChunks = reposWithOlder.reduce((sum, repo) => {
+    const total = (repo.eventsManifest?.chunks || []).length;
+    const loaded = (repo.loadedChunks || []).length;
+    return sum + Math.max(0, total - loaded);
+  }, 0);
+  const timelineCount = reposWithOlder.length;
+  elements.historyMeta.textContent =
+    timelineCount === 1
+      ? `${remainingChunks} older chunk${remainingChunks === 1 ? "" : "s"} available.`
+      : `${remainingChunks} older chunk${remainingChunks === 1 ? "" : "s"} available across ${timelineCount} timelines. Each click loads one older chunk per timeline.`;
 }
 
 function renderCodexBudgetStatus() {
@@ -1327,9 +1819,9 @@ function renderCodexBudgetStatus() {
 
 function renderEvents() {
   if (projectIsBranched()) {
-    elements.transcript.replaceChildren();
+    elements.emptyState.hidden = true;
     elements.transcript.hidden = true;
-    elements.emptyState.hidden = state.currentProjectRepos.length > 0;
+    elements.transcript.replaceChildren();
     return;
   }
 
@@ -1343,9 +1835,67 @@ function renderEvents() {
 
   elements.emptyState.hidden = true;
   elements.transcript.hidden = false;
+  const transcriptRepo = currentTranscriptProjectRepo();
   groupedCycles.forEach(({ cycle, events }) => {
-    elements.transcript.append(buildCycleCard(cycle, events));
+    elements.transcript.append(buildCycleCard(cycle, events, "", transcriptRepo));
   });
+}
+
+async function buildProjectRepoData(repo, existingProjectRepo = null) {
+  const [meta, events, leanCycleStats] = await Promise.all([
+    fetchJson(`${repo.repo_name}/meta.json`, repo),
+    fetchLegacyEvents(repo.repo_name),
+    fetchJson(`${repo.repo_name}/lean-cycle-stats.json`, null),
+  ]);
+  const resolvedMeta = meta || repo;
+  return {
+    meta: resolvedMeta,
+    eventsManifest: null,
+    loadedChunks: [],
+    loadedAllHistory: true,
+    events,
+    leanCycleStats,
+  };
+}
+
+async function loadOlderHistoryForProject() {
+  if (state.loadingOlderHistory || !state.currentProjectRepos.length) {
+    return;
+  }
+  state.loadingOlderHistory = true;
+  renderHistoryControls();
+  try {
+    const updatedRepos = await Promise.all(
+      state.currentProjectRepos.map(async (projectRepo) => {
+        const nextChunk = nextOlderChunkMeta(projectRepo);
+        if (!nextChunk) {
+          return projectRepo;
+        }
+        const events = await fetchEventsChunk(projectRepo.meta.repo_name, nextChunk.file);
+        return rebuildRepoEvents({
+          ...projectRepo,
+          loadedChunks: [...(projectRepo.loadedChunks || []), { ...nextChunk, events }],
+        });
+      }),
+    );
+    state.currentProjectRepos = updatedRepos;
+    const primaryRepoName = state.currentMeta?.repo_name;
+    const primary = updatedRepos.find((repo) => repo.meta.repo_name === primaryRepoName) || updatedRepos[0] || null;
+    const transcriptRepo = currentTranscriptProjectRepo(updatedRepos);
+    state.currentMeta = primary?.meta || null;
+    state.currentTimelineRepoName = transcriptRepo?.meta?.repo_name || null;
+    state.currentEvents = transcriptRepo?.events || [];
+    populateFilters(state.currentEvents);
+    renderHeader();
+    renderFilters();
+    renderHistoryControls();
+    renderBranchOverview();
+    renderBranchBoard();
+    renderEvents();
+  } finally {
+    state.loadingOlderHistory = false;
+    renderHistoryControls();
+  }
 }
 
 async function selectProject(projectName, updateHash = false) {
@@ -1357,44 +1907,49 @@ async function selectProject(projectName, updateHash = false) {
   const project = currentProjectGroup();
   if (!project) {
     state.currentMeta = null;
+    state.currentTimelineRepoName = null;
     state.currentEvents = [];
     state.currentProjectRepos = [];
     renderRepoList();
     renderHeader();
     renderFilters();
+    renderHistoryControls();
     renderBranchOverview();
     renderBranchBoard();
     renderEvents();
     return;
   }
 
+  const existingByRepoName = new Map(
+    (state.currentProjectName === project.projectName ? state.currentProjectRepos : []).map((projectRepo) => [
+      projectRepo.meta?.repo_name,
+      projectRepo,
+    ]),
+  );
   const fetchedRepos = await Promise.all(
-    project.repos.map(async (repo) => {
-      const [meta, events] = await Promise.all([
-        fetchJson(`${repo.repo_name}/meta.json`, repo),
-        fetchEvents(repo.repo_name),
-      ]);
-      return {
-        meta: meta || repo,
-        events,
-      };
-    }),
+    project.repos.map((repo) => buildProjectRepoData(repo, existingByRepoName.get(repo.repo_name))),
   );
 
   const primary = fetchedRepos.find((repo) => repo.meta.repo_name === project.primaryRepo.repo_name) || fetchedRepos[0] || null;
+  const transcriptRepo = currentTranscriptProjectRepo(fetchedRepos);
   state.currentProjectRepos = fetchedRepos;
   state.currentMeta = primary?.meta || null;
-  state.currentEvents = primary?.events || [];
+  state.currentTimelineRepoName = transcriptRepo?.meta?.repo_name || null;
+  state.currentEvents = transcriptRepo?.events || [];
   populateFilters(state.currentEvents);
   renderRepoList();
   renderHeader();
   renderFilters();
+  renderHistoryControls();
   renderBranchOverview();
   renderBranchBoard();
   renderEvents();
 }
 
 async function refreshRepos() {
+  if (!(await ensureViewerCurrent())) {
+    return;
+  }
   const [payload, budgetStatus] = await Promise.all([
     fetchJson("repos.json", { repos: [] }),
     fetchJson("codex-budget.json", null),
@@ -1412,10 +1967,12 @@ async function refreshRepos() {
   if (!desiredProject) {
     state.currentProjectName = null;
     state.currentMeta = null;
+    state.currentTimelineRepoName = null;
     state.currentEvents = [];
     state.currentProjectRepos = [];
     renderHeader();
     renderFilters();
+    renderHistoryControls();
     renderBranchOverview();
     renderBranchBoard();
     renderEvents();
@@ -1428,22 +1985,11 @@ async function refreshRepos() {
   await selectProject(desiredProject, false);
 }
 
-function scheduleRefresh() {
-  window.clearInterval(state.refreshHandle);
-  if (!elements.autoRefresh.checked) {
-    return;
-  }
-  state.refreshHandle = window.setInterval(() => {
-    refreshRepos();
-  }, 15000);
-}
-
 elements.repoSearch.addEventListener("input", () => renderRepoList());
 elements.cycleFilter.addEventListener("change", () => renderEvents());
 elements.kindFilter.addEventListener("change", () => renderEvents());
 elements.refreshButton.addEventListener("click", () => refreshRepos());
-elements.autoRefresh.addEventListener("change", () => scheduleRefresh());
+elements.historyLoadOlder?.addEventListener("click", () => loadOlderHistoryForProject());
 window.addEventListener("hashchange", () => refreshRepos());
 
 refreshRepos();
-scheduleRefresh();

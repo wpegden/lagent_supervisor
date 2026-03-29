@@ -35,6 +35,7 @@ class SupervisorTestCase(unittest.TestCase):
         repo_path: Path,
         *,
         start_phase: str = "proof_formalization",
+        theorem_frontier_phase: str = "off",
         chat_root_dir: Path | None = None,
         git_remote_url: str | None = None,
         session_name: str | None = None,
@@ -60,6 +61,7 @@ class SupervisorTestCase(unittest.TestCase):
                 approved_axioms_path=repo_path / "APPROVED_AXIOMS.json",
                 human_input_path=repo_path / "HUMAN_INPUT.md",
                 input_request_path=repo_path / "INPUT_REQUEST.md",
+                theorem_frontier_phase=theorem_frontier_phase,
             ),
             chat=supervisor.ChatConfig(
                 root_dir=chat_root_dir or (repo_path.parent / "lagent-chats"),
@@ -135,6 +137,34 @@ class CommandTests(SupervisorTestCase):
             supervisor.phase_specific_reviewer_decisions("proof_formalization"),
             ("CONTINUE", "ADVANCE_PHASE", "STUCK"),
         )
+
+    def test_theorem_stating_worker_prompt_requires_main_results_manifest(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase="theorem_stating", theorem_frontier_phase="full")
+
+        prompt = supervisor.build_worker_prompt(config, {"phase": "theorem_stating"}, "theorem_stating", True)
+
+        self.assertIn("paper_main_results.json", prompt)
+        self.assertIn("machine-readable main-results manifest", prompt)
+        self.assertIn("initial_active_node_id", prompt)
+
+    def test_theorem_stating_reviewer_prompt_mentions_main_results_manifest(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase="theorem_stating", theorem_frontier_phase="full")
+
+        prompt = supervisor.build_reviewer_prompt(
+            config,
+            {"phase": "theorem_stating", "last_worker_output": "", "last_worker_handoff": {}},
+            "theorem_stating",
+            "",
+            "{}",
+            {"build": {"ok": True}, "syntax_checks": [], "sorry_policy": {"disallowed_entries": []}, "axioms": {"unapproved": []}},
+            True,
+        )
+
+        self.assertIn("paper_main_results.json", prompt)
+        self.assertIn("includes all main paper results", prompt)
+        self.assertIn("excludes support-only statements", prompt)
 
     def test_sanitize_tmux_session_name_replaces_dots(self) -> None:
         self.assertEqual(
@@ -233,6 +263,45 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(config.branching.max_current_branches, 4)
         self.assertEqual(config.branching.evaluation_cycle_budget, 27)
         self.assertEqual(config.branching.poll_seconds, 123.5)
+
+    def test_load_config_defaults_theorem_frontier_phase_full(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.workflow.theorem_frontier_phase, "full")
+
+    def test_load_config_reads_theorem_frontier_phase_override(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "workflow": {"theorem_frontier_phase": "phase0"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.workflow.theorem_frontier_phase, "phase0")
 
     def test_load_config_defaults_chat_project_name_to_repo_name(self) -> None:
         repo_path = self.make_repo()
@@ -999,6 +1068,91 @@ class PolicyTests(SupervisorTestCase):
         self.assertIn("parent-managed branch frontier", prompt)
         self.assertIn("proposing up to 2 replacement child strategies", prompt)
 
+    def test_branch_selection_question_for_state_uses_active_theorem_node(self) -> None:
+        state = {
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "current": {
+                    "blocker_cluster": "graph-pair local RI collapse",
+                },
+                "nodes": {
+                    "ri.local.graph_pair": {
+                        "node_id": "ri.local.graph_pair",
+                        "kind": "support",
+                        "status": "active",
+                        "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                        "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                        "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                        "paper_provenance": "Section 4 RI collapse.",
+                        "closure_mode": "leaf",
+                        "parent_ids": [],
+                        "child_ids": [],
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "acceptance_evidence": "Close the theorem.",
+                        "notes": "The live theorem bottleneck.",
+                    }
+                },
+            }
+        }
+
+        question = supervisor.branch_selection_question_for_state(state)
+
+        self.assertIn("`ri.local.graph_pair`", question)
+        self.assertIn("`Twobites.IndependentSets.ri_local_graph_pair`", question)
+        self.assertIn("finish formalizing the whole paper", question)
+
+    def test_full_theorem_frontier_branch_strategy_prompt_mentions_active_node_rule(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "review_log": [],
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "nodes": {
+                    "ri.local.graph_pair": {
+                        "node_id": "ri.local.graph_pair",
+                        "kind": "support",
+                        "status": "active",
+                        "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                        "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                        "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                        "paper_provenance": "Section 4 RI collapse.",
+                        "closure_mode": "leaf",
+                        "parent_ids": [],
+                        "child_ids": [],
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "acceptance_evidence": "Close the theorem.",
+                        "notes": "The live theorem bottleneck.",
+                    }
+                },
+            },
+        }
+
+        prompt = supervisor.build_branch_strategy_prompt(
+            config,
+            state,
+            "proof_formalization",
+            "worker terminal output",
+            '{"status":"STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            {
+                "phase": "proof_formalization",
+                "decision": "STUCK",
+                "confidence": 0.9,
+                "reason": "The route may need a rewrite.",
+                "next_prompt": "",
+                "cycle": 20,
+            },
+            False,
+        )
+
+        self.assertIn("active theorem node `ri.local.graph_pair`", prompt)
+        self.assertIn("Do not propose branches that widen the frontier above or outside that node's subtree.", prompt)
+        self.assertIn("If the routes still share the same blocker cluster and unresolved hypothesis set, prefer `NO_BRANCH`.", prompt)
+        self.assertIn("wrapper-building or bookkeeping variants", prompt)
+
     def test_branch_selection_prompt_mentions_eventual_whole_paper_success(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path)
@@ -1020,6 +1174,63 @@ class PolicyTests(SupervisorTestCase):
 
         self.assertIn("Which branch seems more likely to eventually succeed at formalizing the whole paper?", prompt)
         self.assertIn("Do not default to the branch that is merely furthest along today.", prompt)
+
+    def test_full_theorem_frontier_branch_selection_prompt_mentions_dependency_reduction(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "review_log": [],
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "nodes": {
+                    "ri.local.graph_pair": {
+                        "node_id": "ri.local.graph_pair",
+                        "kind": "support",
+                        "status": "active",
+                        "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                        "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                        "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                        "paper_provenance": "Section 4 RI collapse.",
+                        "closure_mode": "leaf",
+                        "parent_ids": [],
+                        "child_ids": [],
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "acceptance_evidence": "Close the theorem.",
+                        "notes": "The live theorem bottleneck.",
+                    }
+                },
+            },
+        }
+
+        prompt = supervisor.build_branch_selection_prompt(
+            config,
+            state,
+            "proof_formalization",
+            {
+                "id": "episode-001",
+                "selection_question": "Which branch seems more likely to close theorem-frontier node `ri.local.graph_pair` and then finish formalizing the whole paper?",
+            },
+            [
+                {
+                    "name": "continue-current-route",
+                    "progress_reviews": 5,
+                    "latest_review_decision": "CONTINUE",
+                    "theorem_frontier_open_hypotheses_count": 3,
+                },
+                {
+                    "name": "major-rewrite",
+                    "progress_reviews": 5,
+                    "latest_review_decision": "CONTINUE",
+                    "theorem_frontier_open_hypotheses_count": 2,
+                },
+            ],
+            False,
+        )
+
+        self.assertIn("strictly reduces the unresolved hypothesis set", prompt)
+        self.assertIn("shrinking the anchored node's unresolved dependency set", prompt)
+        self.assertIn("Penalize branches that mainly add wrappers", prompt)
 
     def test_branch_selection_prompt_tightens_after_initial_checkpoint(self) -> None:
         repo_path = self.make_repo()
@@ -1124,6 +1335,108 @@ class PolicyTests(SupervisorTestCase):
 
         self.assertEqual(decision["branch_decision"], "BRANCH")
         self.assertEqual(len(decision["strategies"]), 2)
+
+    def test_validate_branch_strategy_decision_requires_frontier_anchor_in_full_mode(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "nodes": {
+                    "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
+                        {
+                            "node_id": "ri.local.graph_pair",
+                            "kind": "support",
+                            "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                            "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                            "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                            "paper_provenance": "Section 4 RI collapse.",
+                            "closure_mode": "leaf",
+                            "blocker_cluster": "graph-pair local RI collapse",
+                            "acceptance_evidence": "Close the theorem.",
+                            "notes": "Live frontier node.",
+                        },
+                        status="active",
+                        parent_ids=[],
+                        child_ids=[],
+                    )
+                },
+            }
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "frontier_anchor_node_id"):
+            supervisor.validate_branch_strategy_decision(
+                config,
+                "proof_formalization",
+                {
+                    "phase": "proof_formalization",
+                    "branch_decision": "branch",
+                    "confidence": 0.7,
+                    "reason": "There are two routes.",
+                    "strategies": [
+                        {
+                            "name": "route-a",
+                            "summary": "A",
+                            "worker_prompt": "A",
+                            "why_this_might_eventually_succeed": "A",
+                            "rewrite_scope": "incremental",
+                        },
+                        {
+                            "name": "route-b",
+                            "summary": "B",
+                            "worker_prompt": "B",
+                            "why_this_might_eventually_succeed": "B",
+                            "rewrite_scope": "major",
+                        },
+                    ],
+                },
+                state,
+            )
+
+    def test_validate_branch_selection_decision_requires_frontier_anchor_in_full_mode(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "nodes": {
+                    "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
+                        {
+                            "node_id": "ri.local.graph_pair",
+                            "kind": "support",
+                            "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                            "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                            "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                            "paper_provenance": "Section 4 RI collapse.",
+                            "closure_mode": "leaf",
+                            "blocker_cluster": "graph-pair local RI collapse",
+                            "acceptance_evidence": "Close the theorem.",
+                            "notes": "Live frontier node.",
+                        },
+                        status="active",
+                        parent_ids=[],
+                        child_ids=[],
+                    )
+                },
+            }
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "frontier_anchor_node_id"):
+            supervisor.validate_branch_selection_decision(
+                config,
+                "proof_formalization",
+                {
+                    "phase": "proof_formalization",
+                    "selection_decision": "SELECT_BRANCH",
+                    "confidence": 0.9,
+                    "reason": "One route is better.",
+                    "selected_branch": "major-rewrite",
+                },
+                ["major-rewrite", "continue-current-route"],
+                state,
+            )
 
     def test_should_consider_branching_for_cycle_20_style_route_pivot(self) -> None:
         repo_path = self.make_repo()
@@ -1801,6 +2114,56 @@ class PolicyTests(SupervisorTestCase):
             "branch_episode_counter": 2,
             "branch_history": [{"id": "episode-001", "selected_branch": "route-a", "status": "selected"}],
             "branch_lineage": [{"episode_id": "episode-001", "branch_name": "route-a", "summary": "old", "rewrite_scope": "major"}],
+            "last_theorem_frontier_worker_update": {"phase": "proof_formalization"},
+            "last_theorem_frontier_review": {"phase": "proof_formalization"},
+            "last_theorem_frontier_paper_review": {"decision": "APPROVE"},
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "current_action": "CLOSE",
+                "current": {
+                    "cycle": 40,
+                    "reviewed_node_id": "ri.local.graph_pair",
+                    "next_active_leaf_id": "ri.local.graph_pair",
+                    "requested_action": "CLOSE",
+                    "assessed_action": "CLOSE",
+                    "outcome": "STILL_OPEN",
+                    "blocker_cluster": "graph-pair local RI collapse",
+                    "cone_purity": "LOW",
+                    "open_hypotheses": ["hLossGap"],
+                    "justification": "Still open.",
+                    "updated_at": "2026-03-29T00:00:00-04:00",
+                },
+                "metrics": {
+                    "active_leaf_age": 4,
+                    "blocker_cluster_age": 4,
+                    "closed_nodes_count": 1,
+                    "refuted_nodes_count": 0,
+                    "paper_nodes_closed": 0,
+                    "failed_close_attempts": 2,
+                    "low_cone_purity_streak": 2,
+                    "cone_purity": "LOW",
+                    "structural_churn": 3,
+                },
+                "escalation": {"required": True, "reasons": ["same blocker cluster persisted for five reviews; mandatory escalation"]},
+                "nodes": {
+                    "ri.local.graph_pair": {
+                        "node_id": "ri.local.graph_pair",
+                        "kind": "support",
+                        "status": "active",
+                        "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                        "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                        "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                        "paper_provenance": "Section 4 RI collapse.",
+                        "closure_mode": "leaf",
+                        "parent_ids": [],
+                        "child_ids": [],
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "acceptance_evidence": "Close the theorem.",
+                        "notes": "The live theorem bottleneck.",
+                    }
+                },
+            },
         }
 
         child_state = supervisor.build_child_branch_state(
@@ -1823,6 +2186,327 @@ class PolicyTests(SupervisorTestCase):
             [entry["branch_name"] for entry in child_state["branch_lineage"]],
             ["route-a", "route-b"],
         )
+        self.assertIsNone(child_state["last_theorem_frontier_worker_update"])
+        self.assertIsNone(child_state["last_theorem_frontier_review"])
+        self.assertIsNone(child_state["last_theorem_frontier_paper_review"])
+        self.assertEqual(child_state["theorem_frontier"]["metrics"]["active_leaf_age"], 0)
+        self.assertEqual(child_state["theorem_frontier"]["metrics"]["blocker_cluster_age"], 0)
+        self.assertEqual(child_state["theorem_frontier"]["metrics"]["failed_close_attempts"], 0)
+        self.assertEqual(child_state["theorem_frontier"]["metrics"]["low_cone_purity_streak"], 0)
+        self.assertEqual(child_state["theorem_frontier"]["metrics"]["structural_churn"], 0)
+        self.assertIsNone(child_state["theorem_frontier"]["metrics"]["cone_purity"])
+        self.assertEqual(child_state["theorem_frontier"]["current_action"], None)
+        self.assertEqual(child_state["theorem_frontier"]["escalation"], {"required": False, "reasons": []})
+        self.assertIsNone(child_state["theorem_frontier"]["current"])
+
+    def test_create_branch_episode_writes_child_theorem_frontier_file(self) -> None:
+        repo_path = self.make_repo()
+        self.git(repo_path, "init", "-b", "main")
+        self.git(repo_path, "config", "user.name", "Test User")
+        self.git(repo_path, "config", "user.email", "test@example.com")
+        (repo_path / "Main.lean").write_text("theorem t : True := by trivial\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "init")
+
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "cycle": 12,
+            "review_log": [],
+            "branch_history": [],
+            "branch_lineage": [],
+            "last_review": {
+                "phase": "proof_formalization",
+                "decision": "CONTINUE",
+                "reason": "Try alternatives.",
+                "cycle": 12,
+            },
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "current_action": "CLOSE",
+                "current": {
+                    "cycle": 12,
+                    "reviewed_node_id": "ri.local.graph_pair",
+                    "next_active_leaf_id": "ri.local.graph_pair",
+                    "requested_action": "CLOSE",
+                    "assessed_action": "CLOSE",
+                    "outcome": "STILL_OPEN",
+                    "blocker_cluster": "graph-pair local RI collapse",
+                    "cone_purity": "HIGH",
+                    "open_hypotheses": ["hLossGap"],
+                    "justification": "Still open.",
+                    "updated_at": "2026-03-29T00:00:00-04:00",
+                },
+                "metrics": {
+                    "active_leaf_age": 3,
+                    "blocker_cluster_age": 3,
+                    "closed_nodes_count": 0,
+                    "refuted_nodes_count": 0,
+                    "paper_nodes_closed": 0,
+                    "failed_close_attempts": 1,
+                    "low_cone_purity_streak": 0,
+                    "cone_purity": "HIGH",
+                    "structural_churn": 1,
+                },
+                "nodes": {
+                    "ri.local.graph_pair": {
+                        "node_id": "ri.local.graph_pair",
+                        "kind": "support",
+                        "status": "active",
+                        "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                        "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                        "lean_anchor": "Main.ri_local_graph_pair",
+                        "paper_provenance": "Section 4 RI collapse.",
+                        "closure_mode": "leaf",
+                        "parent_ids": [],
+                        "child_ids": [],
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "acceptance_evidence": "Close the theorem.",
+                        "notes": "The live theorem bottleneck.",
+                    }
+                },
+            },
+        }
+        supervisor.save_state(config, state)
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "add frontier state")
+
+        proposal = {
+            "phase": "proof_formalization",
+            "branch_decision": "BRANCH",
+            "frontier_anchor_node_id": "ri.local.graph_pair",
+            "confidence": 0.8,
+            "reason": "Two materially different routes.",
+            "strategies": [
+                {
+                    "name": "route-a",
+                    "summary": "continue",
+                    "worker_prompt": "continue",
+                    "why_this_might_eventually_succeed": "close directly",
+                    "rewrite_scope": "incremental",
+                },
+                {
+                    "name": "route-b",
+                    "summary": "rewrite",
+                    "worker_prompt": "rewrite",
+                    "why_this_might_eventually_succeed": "replace route",
+                    "rewrite_scope": "major",
+                },
+            ],
+        }
+
+        with mock.patch.object(supervisor, "start_supervisor_tmux_session"):
+            episode = supervisor.create_branch_episode(
+                config,
+                state,
+                "proof_formalization",
+                state["last_review"],
+                proposal,
+            )
+
+        self.assertEqual(episode["frontier_anchor_node_id"], "ri.local.graph_pair")
+        child_path = Path(episode["branches"][0]["worktree_path"]) / ".agent-supervisor" / "theorem_frontier.json"
+        self.assertTrue(child_path.exists())
+        child_payload = supervisor.JsonFile.load(child_path, {})
+        self.assertEqual(child_payload["active_leaf_id"], "ri.local.graph_pair")
+        self.assertEqual(child_payload["metrics"]["active_leaf_age"], 0)
+        self.assertEqual(child_payload["metrics"]["blocker_cluster_age"], 0)
+        self.assertEqual(child_payload["current"], None)
+
+    def test_branch_episode_snapshots_include_theorem_frontier_summary(self) -> None:
+        repo_path = self.make_repo()
+        branch_path = repo_path.parent / "branch"
+        branch_path.mkdir(parents=True, exist_ok=True)
+        state_dir = branch_path / ".agent-supervisor"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        supervisor.JsonFile.dump(
+            state_dir / "state.json",
+            {
+                "cycle": 40,
+                "phase": "proof_formalization",
+                "last_review": {
+                    "decision": "CONTINUE",
+                    "reason": "The frontier is narrowing.",
+                    "cycle": 40,
+                },
+                "last_validation": {"git": {"head": "abc123"}},
+                "theorem_frontier": {
+                    **supervisor.default_theorem_frontier_payload("full"),
+                    "active_leaf_id": "ri.local.graph_pair",
+                    "current_action": "EXPAND",
+                    "current": {
+                        "cycle": 40,
+                        "reviewed_node_id": "ri.local.graph_pair",
+                        "next_active_leaf_id": "ri.local.child",
+                        "requested_action": "EXPAND",
+                        "assessed_action": "EXPAND",
+                        "outcome": "EXPANDED",
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "cone_purity": "HIGH",
+                        "open_hypotheses": ["hLossGap", "hBlueCap"],
+                        "justification": "Split the local theorem.",
+                        "updated_at": "2026-03-29T00:00:00-04:00",
+                    },
+                    "metrics": {
+                        "active_leaf_age": 1,
+                        "blocker_cluster_age": 3,
+                        "closed_nodes_count": 0,
+                        "refuted_nodes_count": 0,
+                        "paper_nodes_closed": 0,
+                        "failed_close_attempts": 1,
+                        "low_cone_purity_streak": 0,
+                        "cone_purity": "HIGH",
+                        "structural_churn": 0,
+                    },
+                    "escalation": {"required": True, "reasons": ["same blocker cluster persisted for five reviews; mandatory escalation"]},
+                    "nodes": {
+                        "ri.local.graph_pair": {
+                            "node_id": "ri.local.graph_pair",
+                            "kind": "support",
+                            "status": "active",
+                            "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                            "lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+                            "lean_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+                            "paper_provenance": "Section 4 RI collapse.",
+                            "closure_mode": "leaf",
+                            "parent_ids": [],
+                            "child_ids": [],
+                            "blocker_cluster": "graph-pair local RI collapse",
+                            "acceptance_evidence": "Close the theorem.",
+                            "notes": "The live theorem bottleneck.",
+                        }
+                    },
+                },
+            },
+        )
+
+        snapshots = supervisor.branch_episode_snapshots(
+            {
+                "base_review_count": 0,
+                "frontier_anchor_node_id": "ri.local.graph_pair",
+                "branches": [
+                    {
+                        "name": "major-rewrite",
+                        "status": "active",
+                        "frontier_anchor_node_id": "ri.local.graph_pair",
+                        "worktree_path": str(branch_path),
+                        "config_path": str(branch_path / "branch.json"),
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(snapshots[0]["frontier_anchor_node_id"], "ri.local.graph_pair")
+        self.assertEqual(snapshots[0]["theorem_frontier_active_leaf_id"], "ri.local.graph_pair")
+        self.assertEqual(snapshots[0]["theorem_frontier_open_hypotheses_count"], 2)
+        self.assertEqual(snapshots[0]["theorem_frontier_blocker_cluster"], "graph-pair local RI collapse")
+        self.assertTrue(snapshots[0]["theorem_frontier_escalation_required"])
+
+    def test_proposal_snapshot_can_replace_frontier_rejects_anchor_drift(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        episode = {
+            "id": "episode-002",
+            "frontier_anchor_node_id": "ri.local.graph_pair",
+            "branches": [
+                {"name": "boundary-genericity", "status": "active"},
+                {"name": "local-transversality", "status": "active"},
+            ],
+        }
+        snapshots = [
+            {"name": "boundary-genericity", "branch_status": "active"},
+            {"name": "local-transversality", "branch_status": "active"},
+        ]
+        proposal_snapshot = {
+            "name": "boundary-genericity",
+            "pending_branch_proposal_confidence": 0.95,
+            "pending_branch_proposal": {
+                "phase": "proof_formalization",
+                "branch_decision": "BRANCH",
+                "frontier_anchor_node_id": "ri.local.child",
+                "confidence": 0.95,
+                "reason": "Split lower in the tree.",
+                "strategies": [{"name": "a"}, {"name": "b"}],
+            },
+        }
+
+        self.assertFalse(
+            supervisor.proposal_snapshot_can_replace_frontier(
+                config,
+                episode,
+                snapshots,
+                proposal_snapshot,
+            )
+        )
+
+    def test_monitor_active_branch_episode_rejects_replacement_proposal_with_anchor_drift(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = {
+            "cycle": 44,
+            "active_branch_episode": {
+                "id": "episode-002",
+                "phase": "proof_formalization",
+                "frontier_anchor_node_id": "ri.local.graph_pair",
+                "branches": [
+                    {"name": "boundary-genericity", "status": "active"},
+                    {"name": "local-transversality", "status": "active"},
+                ],
+            },
+        }
+        reviewer = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "reviewer",
+            config,
+            state,
+            ["bash", "-lc", "exit 0"],
+        )
+        snapshots = [
+            {
+                "name": "boundary-genericity",
+                "branch_status": "active",
+                "frontier_anchor_node_id": "ri.local.graph_pair",
+                "pending_branch_proposal": {
+                    "phase": "proof_formalization",
+                    "branch_decision": "BRANCH",
+                    "frontier_anchor_node_id": "ri.local.child",
+                    "confidence": 0.91,
+                    "reason": "Both proposed child routes are better long-term bets.",
+                    "strategies": [
+                        {"name": "route-a"},
+                        {"name": "route-b"},
+                    ],
+                },
+                "pending_branch_proposal_confidence": 0.91,
+                "pending_branch_proposal_strategy_count": 2,
+                "review_count": 50,
+                "progress_reviews": 6,
+                "cycle": 44,
+                "phase": "proof_formalization",
+                "config_path": "/tmp/boundary-genericity.json",
+                "supervisor_session": "boundary-genericity-supervisor",
+            },
+            {
+                "name": "local-transversality",
+                "branch_status": "active",
+                "frontier_anchor_node_id": "ri.local.graph_pair",
+                "review_count": 51,
+                "progress_reviews": 7,
+                "cycle": 45,
+                "phase": "proof_formalization",
+            },
+        ]
+
+        with (
+            mock.patch.object(supervisor, "branch_episode_snapshots", side_effect=[snapshots, RuntimeError("stop loop")]),
+            mock.patch.object(supervisor, "clear_pending_branch_proposal_in_snapshot") as clear_mock,
+            mock.patch.object(supervisor, "restart_branch_supervisor_from_snapshot") as restart_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop loop"):
+                supervisor.monitor_active_branch_episode(config, state, reviewer, "proof_formalization")
+
+        clear_mock.assert_called_once()
+        restart_mock.assert_called_once_with(snapshots[0])
 
     def test_child_branch_config_payload_preserves_project_name(self) -> None:
         repo_path = self.make_repo()
@@ -2022,7 +2706,7 @@ later noise
         self.assertEqual(state["last_worker_handoff"]["status"], "STUCK")
         self.assertEqual(state["last_worker_output"], "worker output")
         self.assertEqual(state["last_validation"]["cycle"], 12)
-        validation_mock.assert_called_once_with(config, "proof_formalization", 12)
+        validation_mock.assert_called_once_with(config, "proof_formalization", 12, previous_validation=None)
         self.assertEqual(record_mock.call_count, 2)
 
     def test_recover_interrupted_worker_state_from_log_only(self) -> None:
@@ -2059,7 +2743,7 @@ worker output
         self.assertEqual(state["last_worker_handoff"]["status"], "NOT_STUCK")
         self.assertIn("made progress", state["last_worker_output"])
         self.assertEqual(state["last_validation"]["cycle"], 12)
-        validation_mock.assert_called_once_with(config, "proof_formalization", 12)
+        validation_mock.assert_called_once_with(config, "proof_formalization", 12, previous_validation=None)
         self.assertEqual(record_mock.call_count, 2)
 
 
@@ -2341,6 +3025,339 @@ class WorkflowTests(SupervisorTestCase):
         ]
         self.assertEqual(len(transition_events), 1)
         self.assertEqual(transition_events[0]["phase"], supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP)
+
+    def test_main_advances_from_theorem_stating_and_seeds_initial_theorem_frontier(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="theorem_stating",
+            theorem_frontier_phase="full",
+        )
+        config.max_cycles = 1
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "phase": "theorem_stating",
+            "main_results": [
+                {
+                    "node_id": "paper.main",
+                    "kind": "paper",
+                    "natural_language_statement": "The paper main theorem holds.",
+                    "lean_statement": "def paperMainStatement : Prop := True",
+                    "lean_anchor": "PaperTheorems.paperMainStatement",
+                    "paper_provenance": "Paper Theorem `main`.",
+                    "closure_mode": "all_children",
+                    "blocker_cluster": "paper main result",
+                    "acceptance_evidence": "Close this paper-facing result or approved descendants that prove it.",
+                    "notes": "Primary graph theorem.",
+                },
+                {
+                    "node_id": "paper.main2",
+                    "kind": "paper",
+                    "natural_language_statement": "The paper Ramsey corollary holds.",
+                    "lean_statement": "def paperMain2Statement : Prop := True",
+                    "lean_anchor": "PaperTheorems.paperMain2Statement",
+                    "paper_provenance": "Paper Theorem `main2`.",
+                    "closure_mode": "all_children",
+                    "blocker_cluster": "paper ramsey corollary",
+                    "acceptance_evidence": "Close this paper-facing result or approved descendants that prove it.",
+                    "notes": "Ramsey-number corollary.",
+                },
+            ],
+            "dependency_edges": [
+                {
+                    "parent": "paper.main2",
+                    "child": "paper.main",
+                    "edge_type": "reduction",
+                    "justification": "The Ramsey corollary reduces to the main graph theorem.",
+                }
+            ],
+            "initial_active_node_id": "paper.main",
+        }
+        supervisor.paper_main_results_manifest_path(config).write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        state = {
+            "phase": "theorem_stating",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+        }
+
+        result, launches, record_chat_event_mock, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": "theorem_stating",
+                    "status": "DONE",
+                    "summary_of_changes": "statement files and manifest are ready",
+                    "current_frontier": "main results stated",
+                    "likely_next_step": "proof formalization",
+                    "input_request": "",
+                },
+                {
+                    "phase": "theorem_stating",
+                    "decision": "ADVANCE_PHASE",
+                    "confidence": 0.95,
+                    "reason": "Statements are ready for proof formalization.",
+                    "next_prompt": "",
+                },
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": "theorem_stating",
+                    "build": {"ok": True},
+                    "syntax_checks": [{"ok": True}, {"ok": True}],
+                    "sorry_policy": {"disallowed_entries": []},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "statement-head"},
+                },
+            ],
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual([entry["stage_label"] for entry in launches], ["worker burst", "reviewer burst"])
+        self.assertEqual(state["phase"], "proof_formalization")
+        self.assertEqual(state["theorem_frontier"]["active_leaf_id"], "paper.main")
+        self.assertEqual(sorted(state["theorem_frontier"]["nodes"].keys()), ["paper.main", "paper.main2"])
+        seed_events = [
+            call.kwargs for call in record_chat_event_mock.mock_calls if call.kwargs.get("kind") == "theorem_frontier_seed"
+        ]
+        self.assertEqual(len(seed_events), 1)
+        self.assertEqual(seed_events[0]["phase"], "proof_formalization")
+
+    def test_main_phase0_records_theorem_frontier_artifacts_and_state(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="proof_formalization",
+            theorem_frontier_phase="phase0",
+        )
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+        }
+        worker_frontier = {
+            "phase": "proof_formalization",
+            "active_theorem_id": "ri.local.graph_pair",
+            "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "active_theorem_lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+            "active_theorem_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+            "requested_action": "CLOSE",
+            "blocker_cluster": "graph-pair local RI collapse",
+            "cone_scope": "Only local graph-pair support lemmas are allowed.",
+            "result_summary": "The burst stayed on the graph-pair theorem.",
+        }
+        reviewer_frontier = {
+            "phase": "proof_formalization",
+            "active_theorem_id": "ri.local.graph_pair",
+            "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "active_theorem_lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+            "active_theorem_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+            "assessed_action": "CLOSE",
+            "blocker_cluster": "graph-pair local RI collapse",
+            "outcome": "STILL_OPEN",
+            "justification": "The active theorem remains the central blocker.",
+        }
+
+        result, launches, record_chat_event_mock, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": "proof_formalization",
+                    "status": "DONE",
+                    "summary_of_changes": "proof complete",
+                    "current_frontier": "none",
+                    "likely_next_step": "cleanup",
+                    "input_request": "",
+                },
+                worker_frontier,
+                {
+                    "phase": "proof_formalization",
+                    "decision": "ADVANCE_PHASE",
+                    "confidence": 0.95,
+                    "reason": "Proof complete; move to cleanup.",
+                    "next_prompt": "",
+                },
+                reviewer_frontier,
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "STUCK",
+                    "summary_of_changes": "No worthwhile cleanup found.",
+                    "current_frontier": "cleanup done",
+                    "likely_next_step": "stop",
+                    "input_request": "",
+                },
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": "proof_formalization",
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head"},
+                },
+                {
+                    "cycle": 2,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head"},
+                },
+            ],
+        )
+
+        self.assertEqual(result, 0)
+        self.assertIn("Theorem-frontier artifact requirements (Phase 0)", launches[0]["prompt"])
+        self.assertIn("Theorem-frontier review requirements (Phase 0)", launches[1]["prompt"])
+        self.assertNotIn("Theorem-frontier artifact requirements (Phase 0)", launches[2]["prompt"])
+        self.assertEqual(state["last_theorem_frontier_worker_update"]["active_theorem_id"], "ri.local.graph_pair")
+        self.assertEqual(state["theorem_frontier"]["active_theorem_id"], "ri.local.graph_pair")
+        self.assertEqual(state["theorem_frontier"]["active_theorem_age"], 1)
+        saved_frontier = json.loads(supervisor.theorem_frontier_state_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(saved_frontier["current"]["active_theorem_id"], "ri.local.graph_pair")
+        kinds = [call.kwargs.get("kind") for call in record_chat_event_mock.mock_calls]
+        self.assertIn("theorem_frontier_update", kinds)
+        self.assertIn("theorem_frontier_review", kinds)
+
+    def test_main_full_theorem_frontier_runs_paper_verifier_and_updates_dag(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="proof_formalization",
+            theorem_frontier_phase="full",
+        )
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+        }
+        worker_frontier = {
+            "phase": "proof_formalization",
+            "active_node": {
+                "node_id": "paper.main",
+                "kind": "paper",
+                "natural_language_statement": "The paper main theorem witness exists.",
+                "lean_statement": "theorem paper_main : True := by trivial",
+                "lean_anchor": "PaperTheorems.paper_main",
+                "paper_provenance": "Main theorem in the paper.",
+                "closure_mode": "leaf",
+                "blocker_cluster": "final witness supply",
+                "acceptance_evidence": "Close the public paper theorem wrapper.",
+                "notes": "Final paper-facing theorem shell.",
+            },
+            "requested_action": "CLOSE",
+            "cone_scope": "Only the paper main theorem shell and its direct witness lemma.",
+            "allowed_edit_paths": ["PaperTheorems.lean"],
+            "result_summary": "Closed the paper theorem shell.",
+            "proposed_nodes": [],
+            "proposed_edges": [],
+            "next_candidate_ids": ["paper.main"],
+            "structural_change_reason": "",
+        }
+        paper_review = {
+            "phase": "proof_formalization",
+            "parent_node_id": "paper.main",
+            "change_kind": "CREATE_ACTIVE",
+            "decision": "APPROVE",
+            "classification": "paper_exact",
+            "approved_node_ids": ["paper.main"],
+            "approved_edges": [],
+            "justification": "This is the paper theorem itself.",
+            "caveat": "",
+        }
+        reviewer_frontier = {
+            "phase": "proof_formalization",
+            "active_theorem_id": "paper.main",
+            "active_theorem_nl_statement": "The paper main theorem witness exists.",
+            "active_theorem_lean_statement": "theorem paper_main : True := by trivial",
+            "active_theorem_anchor": "PaperTheorems.paper_main",
+            "assessed_action": "CLOSE",
+            "blocker_cluster": "final witness supply",
+            "outcome": "CLOSED",
+            "next_active_theorem_id": "",
+            "cone_purity": "HIGH",
+            "open_hypotheses": [],
+            "justification": "The active paper theorem closed cleanly.",
+        }
+
+        result, launches, record_chat_event_mock, _ = self._run_main_with_mocked_bursts(
+            config,
+            state,
+            artifacts=[
+                {
+                    "phase": "proof_formalization",
+                    "status": "DONE",
+                    "summary_of_changes": "proof complete",
+                    "current_frontier": "none",
+                    "likely_next_step": "cleanup",
+                    "input_request": "",
+                },
+                worker_frontier,
+                paper_review,
+                {
+                    "phase": "proof_formalization",
+                    "decision": "ADVANCE_PHASE",
+                    "confidence": 0.95,
+                    "reason": "Proof complete; move to cleanup.",
+                    "next_prompt": "",
+                },
+                reviewer_frontier,
+                {
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "status": "STUCK",
+                    "summary_of_changes": "No worthwhile cleanup found.",
+                    "current_frontier": "cleanup done",
+                    "likely_next_step": "stop",
+                    "input_request": "",
+                },
+            ],
+            validations=[
+                {
+                    "cycle": 1,
+                    "phase": "proof_formalization",
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head"},
+                },
+                {
+                    "cycle": 2,
+                    "phase": supervisor.PHASE_PROOF_COMPLETE_STYLE_CLEANUP,
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head"},
+                },
+            ],
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [entry["stage_label"] for entry in launches],
+            ["worker burst", "paper-verifier burst", "reviewer burst", "worker burst"],
+        )
+        self.assertIn("paper-verifier", launches[1]["prompt"])
+        self.assertEqual(state["theorem_frontier"]["active_leaf_id"], None)
+        self.assertEqual(state["theorem_frontier"]["nodes"]["paper.main"]["status"], "closed")
+        self.assertEqual(state["theorem_frontier"]["metrics"]["paper_nodes_closed"], 1)
+        kinds = [call.kwargs.get("kind") for call in record_chat_event_mock.mock_calls]
+        self.assertIn("theorem_frontier_paper_verifier_review", kinds)
+        self.assertIn("theorem_frontier_review", kinds)
 
     def test_main_cleanup_invalid_worker_cycle_restores_and_stops_before_reviewer(self) -> None:
         repo_path = self.make_repo()
@@ -2700,6 +3717,32 @@ class WorkflowTests(SupervisorTestCase):
         self.assertFalse(summary["policy_ok"])
         self.assertEqual(summary["sorry_policy"]["allowed_files"], ["repo/PaperTheorems.lean"])
 
+    def test_run_validation_reports_changed_lean_files_since_previous_validation(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        self.git(repo_path, "init", "-b", "main")
+        self.git(repo_path, "config", "user.name", "Test User")
+        self.git(repo_path, "config", "user.email", "test@example.com")
+        (repo_path / "A.lean").write_text("theorem a : True := by trivial\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "init")
+        previous_head = self.git(repo_path, "rev-parse", "HEAD").stdout.strip()
+
+        (repo_path / "A.lean").write_text("theorem a : True := by trivial\n\ntheorem a2 : True := by trivial\n", encoding="utf-8")
+        (repo_path / "B.lean").write_text("theorem b : True := by trivial\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "lean changes")
+
+        summary = supervisor.run_validation(
+            config,
+            "proof_formalization",
+            2,
+            previous_validation={"git": {"head": previous_head}},
+        )
+
+        self.assertEqual(summary["git"]["previous_validation_head"], previous_head)
+        self.assertEqual(summary["git"]["changed_lean_files"], ["A.lean", "B.lean"])
+
     def test_cleanup_phase_stuck_review_does_not_trigger_stuck_recovery(self) -> None:
         state = {
             "last_review": {
@@ -2861,7 +3904,14 @@ class WorkflowTests(SupervisorTestCase):
         self.assertTrue((chat_root / "_assets" / "markdown-viewer.html").exists())
         self.assertTrue((chat_root / "_assets" / "markdown-viewer.js").exists())
         self.assertTrue((chat_root / "_assets" / "styles.css").exists())
+        self.assertTrue((chat_root / "_assets" / "viewer-version.json").exists())
         self.assertTrue((chat_root / config.chat.repo_name / "index.html").exists())
+        viewer_version = json.loads((chat_root / "_assets" / "viewer-version.json").read_text(encoding="utf-8"))["version"]
+        root_index = (chat_root / "index.html").read_text(encoding="utf-8")
+        markdown_index = (chat_root / "_assets" / "markdown-viewer.html").read_text(encoding="utf-8")
+        self.assertRegex(viewer_version, r"^[0-9a-f]{12}$")
+        self.assertIn(f'data-viewer-version="{viewer_version}"', root_index)
+        self.assertIn(f'data-viewer-version="{viewer_version}"', markdown_index)
 
         manifest = json.loads((chat_root / "repos.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["repos"][0]["repo_name"], config.chat.repo_name)
@@ -2881,6 +3931,108 @@ class WorkflowTests(SupervisorTestCase):
         self.assertTrue(all(entry.get("href") for entry in meta["markdown_files"]))
         self.assertTrue(all(entry.get("label") for entry in meta["markdown_files"]))
         self.assertIsNone(meta["branch_overview"])
+
+    def test_chat_event_export_writes_events_manifest_and_chunk_files(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="planning")
+        state = {"phase": "planning", "cycle": 2, "awaiting_human_input": False}
+
+        supervisor.record_chat_event(
+            config,
+            state,
+            cycle=2,
+            phase="planning",
+            kind="worker_prompt",
+            actor="supervisor",
+            target="worker",
+            content="Plan the project.",
+            content_type="text",
+        )
+        supervisor.record_chat_event(
+            config,
+            state,
+            cycle=31,
+            phase="planning",
+            kind="reviewer_decision",
+            actor="reviewer",
+            target="supervisor",
+            content={
+                "phase": "planning",
+                "decision": "CONTINUE",
+                "confidence": 0.7,
+                "reason": "Keep going.",
+                "next_prompt": "Continue.",
+            },
+            content_type="json",
+        )
+
+        manifest = json.loads(supervisor.chat_repo_events_manifest_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["chunk_size_cycles"], supervisor.CHAT_EVENT_CYCLE_CHUNK_SIZE)
+        self.assertEqual(len(manifest["chunks"]), 2)
+        self.assertEqual(manifest["chunks"][0]["start_cycle"], 26)
+        self.assertEqual(manifest["chunks"][0]["end_cycle"], 50)
+        self.assertEqual(manifest["chunks"][1]["start_cycle"], 1)
+        self.assertEqual(manifest["chunks"][1]["end_cycle"], 25)
+
+        newer_chunk = chat_root / config.chat.repo_name / manifest["chunks"][0]["file"]
+        older_chunk = chat_root / config.chat.repo_name / manifest["chunks"][1]["file"]
+        self.assertTrue(newer_chunk.exists())
+        self.assertTrue(older_chunk.exists())
+        newer_lines = [json.loads(line) for line in newer_chunk.read_text(encoding="utf-8").splitlines() if line.strip()]
+        older_lines = [json.loads(line) for line in older_chunk.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(newer_lines[0]["cycle"], 31)
+        self.assertEqual(older_lines[0]["cycle"], 2)
+
+    def test_ensure_chat_event_chunks_backfills_legacy_log(self) -> None:
+        repo_path = self.make_repo()
+        chat_root = repo_path.parent / "chat site"
+        config = self.make_config(repo_path, chat_root_dir=chat_root, start_phase="planning")
+        repo_dir = supervisor.chat_repo_dir(config)
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        legacy_events = [
+            {
+                "timestamp": "2026-03-27T12:00:00-04:00",
+                "repo_name": config.chat.repo_name,
+                "cycle": 3,
+                "phase": "planning",
+                "kind": "worker_prompt",
+                "actor": "supervisor",
+                "target": "worker",
+                "content_type": "text",
+                "summary": "Prompt",
+                "content": "Plan.",
+            },
+            {
+                "timestamp": "2026-03-27T12:05:00-04:00",
+                "repo_name": config.chat.repo_name,
+                "cycle": 29,
+                "phase": "planning",
+                "kind": "reviewer_decision",
+                "actor": "reviewer",
+                "target": "supervisor",
+                "content_type": "json",
+                "summary": "Decision",
+                "content": {"phase": "planning", "decision": "CONTINUE"},
+            },
+        ]
+        supervisor.chat_repo_events_path(config).write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in legacy_events),
+            encoding="utf-8",
+        )
+        manifest_path = supervisor.chat_repo_events_manifest_path(config)
+        if manifest_path.exists():
+            manifest_path.unlink()
+
+        manifest = supervisor.ensure_chat_event_chunks(config)
+
+        self.assertEqual(len(manifest["chunks"]), 2)
+        chunk_paths = [chat_root / config.chat.repo_name / entry["file"] for entry in manifest["chunks"]]
+        self.assertTrue(all(path.exists() for path in chunk_paths))
+        newer_lines = [json.loads(line) for line in chunk_paths[0].read_text(encoding="utf-8").splitlines() if line.strip()]
+        older_lines = [json.loads(line) for line in chunk_paths[1].read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(newer_lines[0]["cycle"], 29)
+        self.assertEqual(older_lines[0]["cycle"], 3)
 
     def test_chat_event_export_writes_codex_budget_status_file(self) -> None:
         repo_path = self.make_repo()
@@ -3035,6 +4187,1173 @@ class WorkflowTests(SupervisorTestCase):
         self.assertTrue(payload["available"])
         self.assertEqual(payload["percent_left"], 73.0)
         self.assertEqual(payload["used_percent"], 27.0)
+
+
+class TheoremFrontierTests(SupervisorTestCase):
+    def paper_main_results_manifest(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "theorem_stating",
+            "main_results": [
+                self.full_node(
+                    "paper.main",
+                    kind="paper",
+                    natural_language_statement="The paper main theorem holds.",
+                    lean_statement="def paperMainStatement : Prop := True",
+                    lean_anchor="PaperTheorems.paperMainStatement",
+                    paper_provenance="Paper Theorem `main`.",
+                    closure_mode="all_children",
+                    blocker_cluster="paper main result",
+                    acceptance_evidence="Close this paper-facing result or approved descendants that prove it.",
+                    notes="Primary graph theorem.",
+                ),
+                self.full_node(
+                    "paper.main2",
+                    kind="paper",
+                    natural_language_statement="The paper Ramsey corollary holds.",
+                    lean_statement="def paperMain2Statement : Prop := True",
+                    lean_anchor="PaperTheorems.paperMain2Statement",
+                    paper_provenance="Paper Theorem `main2`.",
+                    closure_mode="all_children",
+                    blocker_cluster="paper ramsey corollary",
+                    acceptance_evidence="Close this paper-facing result or approved descendants that prove it.",
+                    notes="Ramsey-number corollary.",
+                ),
+            ],
+            "dependency_edges": [
+                {
+                    "parent": "paper.main2",
+                    "child": "paper.main",
+                    "edge_type": "reduction",
+                    "justification": "The Ramsey corollary reduces to the main graph theorem.",
+                }
+            ],
+            "initial_active_node_id": "paper.main",
+        }
+        payload.update(overrides)
+        return payload
+
+    def full_node(self, node_id: str = "ri.local.graph_pair", **overrides: object) -> dict:
+        payload = {
+            "node_id": node_id,
+            "kind": "support",
+            "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "lean_statement": f"theorem {node_id.replace('.', '_')} : True := by trivial",
+            "lean_anchor": f"Twobites.IndependentSets.{node_id.replace('.', '_')}",
+            "paper_provenance": "Section 4 fixed-embedding RI collapse.",
+            "closure_mode": "leaf",
+            "blocker_cluster": "graph-pair local RI collapse",
+            "acceptance_evidence": "A proved theorem closing the fixed graph-pair RI bound.",
+            "notes": "The live endgame bottleneck.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def full_worker_update(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "proof_formalization",
+            "active_node": self.full_node(),
+            "requested_action": "CLOSE",
+            "cone_scope": "Only the active graph-pair theorem and its immediate mechanical support lemmas.",
+            "allowed_edit_paths": ["Twobites/IndependentSets.lean"],
+            "result_summary": "Stayed on the active theorem.",
+            "proposed_nodes": [],
+            "proposed_edges": [],
+            "next_candidate_ids": ["ri.local.graph_pair"],
+            "structural_change_reason": "",
+        }
+        payload.update(overrides)
+        return payload
+
+    def full_frontier_review(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "proof_formalization",
+            "active_theorem_id": "ri.local.graph_pair",
+            "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "active_theorem_lean_statement": "theorem ri_local_graph_pair : True := by trivial",
+            "active_theorem_anchor": "Twobites.IndependentSets.ri_local_graph_pair",
+            "assessed_action": "CLOSE",
+            "blocker_cluster": "graph-pair local RI collapse",
+            "outcome": "STILL_OPEN",
+            "next_active_theorem_id": "ri.local.graph_pair",
+            "cone_purity": "HIGH",
+            "open_hypotheses": ["close the fixed graph-pair RI theorem"],
+            "justification": "The active theorem remains the bottleneck.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def paper_verifier_review(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "proof_formalization",
+            "parent_node_id": "ri.local.graph_pair",
+            "change_kind": "EXPAND",
+            "decision": "APPROVE",
+            "classification": "paper_faithful_reformulation",
+            "approved_node_ids": ["ri.local.remaining", "ri.local.red_cap"],
+            "approved_edges": [
+                {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                {"parent": "ri.local.graph_pair", "child": "ri.local.red_cap"},
+            ],
+            "justification": "This is the paper-faithful local split of the graph-pair RI obstruction.",
+            "caveat": "",
+        }
+        payload.update(overrides)
+        return payload
+
+    def worker_update(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "proof_formalization",
+            "active_theorem_id": "ri.local.graph_pair",
+            "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "active_theorem_lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+            "active_theorem_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+            "requested_action": "CLOSE",
+            "blocker_cluster": "graph-pair local RI collapse",
+            "cone_scope": "Only local graph-pair support lemmas needed for the active theorem.",
+            "result_summary": "Reduced the remaining gap to one graph-pair lemma.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def frontier_review(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "proof_formalization",
+            "active_theorem_id": "ri.local.graph_pair",
+            "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "active_theorem_lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+            "active_theorem_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+            "assessed_action": "CLOSE",
+            "blocker_cluster": "graph-pair local RI collapse",
+            "outcome": "STILL_OPEN",
+            "justification": "The active theorem is still the bottleneck.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_ensure_repo_files_initializes_phase0_theorem_frontier_state(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="phase0")
+
+        supervisor.ensure_repo_files(config, "proof_formalization")
+
+        payload = json.loads(supervisor.theorem_frontier_state_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(payload["mode"], "phase0")
+        self.assertIsNone(payload["current"])
+        self.assertEqual(payload["metrics"]["active_theorem_age"], 0)
+        self.assertEqual(payload["metrics"]["blocker_cluster_age"], 0)
+
+    def test_ensure_repo_files_initializes_full_theorem_frontier_state(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+
+        supervisor.ensure_repo_files(config, "proof_formalization")
+
+        payload = json.loads(supervisor.theorem_frontier_state_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(payload["mode"], "full")
+        self.assertEqual(payload["active_leaf_id"], None)
+        self.assertEqual(payload["nodes"], {})
+        self.assertEqual(payload["metrics"]["active_leaf_age"], 0)
+        self.assertEqual(payload["metrics"]["failed_close_attempts"], 0)
+
+    def test_validate_paper_main_results_manifest_accepts_main_results_and_edges(self) -> None:
+        manifest = supervisor.validate_paper_main_results_manifest(
+            "theorem_stating",
+            self.paper_main_results_manifest(),
+        )
+
+        self.assertEqual(manifest["initial_active_node_id"], "paper.main")
+        self.assertEqual(len(manifest["main_results"]), 2)
+        self.assertEqual(manifest["dependency_edges"][0]["parent"], "paper.main2")
+
+    def test_validate_paper_main_results_manifest_rejects_support_node(self) -> None:
+        manifest = self.paper_main_results_manifest()
+        manifest["main_results"][1]["kind"] = "support"
+
+        with self.assertRaises(supervisor.SupervisorError):
+            supervisor.validate_paper_main_results_manifest("theorem_stating", manifest)
+
+    def test_seed_theorem_frontier_from_main_results_manifest_populates_initial_dag(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        state = {"phase": "theorem_stating"}
+
+        payload = supervisor.seed_theorem_frontier_from_main_results_manifest(
+            config,
+            state,
+            supervisor.validate_paper_main_results_manifest("theorem_stating", self.paper_main_results_manifest()),
+            cycle=7,
+        )
+
+        self.assertEqual(payload["active_leaf_id"], "paper.main")
+        self.assertEqual(sorted(payload["nodes"].keys()), ["paper.main", "paper.main2"])
+        self.assertEqual(payload["nodes"]["paper.main"]["status"], "active")
+        self.assertEqual(payload["nodes"]["paper.main2"]["status"], "open")
+        self.assertEqual(payload["edges"][0]["paper_verifier_status"], "APPROVE")
+        saved_payload = json.loads(supervisor.theorem_frontier_state_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(saved_payload["active_leaf_id"], "paper.main")
+
+    def test_phase0_worker_prompt_includes_theorem_frontier_requirements(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="phase0")
+
+        prompt = supervisor.build_worker_prompt(
+            config,
+            {"phase": "proof_formalization", "review_log": []},
+            "proof_formalization",
+            False,
+        )
+
+        self.assertIn("Theorem-frontier artifact requirements (Phase 0)", prompt)
+        self.assertIn("theorem_frontier_update.json", prompt)
+        self.assertIn("exact Lean statement", prompt)
+        self.assertIn("`CLOSE`, `EXPAND`, and `REFUTE_REPLACE`", prompt)
+
+    def test_phase0_reviewer_prompt_includes_worker_frontier_json_and_review_requirements(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="phase0")
+        state = {
+            "phase": "proof_formalization",
+            "review_log": [],
+            "last_theorem_frontier_worker_update": self.worker_update(),
+        }
+
+        prompt = supervisor.build_reviewer_prompt(
+            config,
+            state,
+            "proof_formalization",
+            "worker terminal output",
+            json.dumps({"status": "NOT_STUCK"}),
+            {"build": {"ok": True}, "sorries": {"count": 0}, "axioms": {"unapproved": []}},
+            False,
+        )
+
+        self.assertIn("Theorem-frontier review requirements (Phase 0)", prompt)
+        self.assertIn("Worker theorem-frontier JSON", prompt)
+        self.assertIn("theorem_frontier_review.json", prompt)
+        self.assertIn('"active_theorem_id": "ri.local.graph_pair"', prompt)
+        self.assertIn("Judge the cycle by theorem-frontier standards", prompt)
+
+    def test_full_worker_prompt_includes_authoritative_dag_requirements(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+
+        prompt = supervisor.build_worker_prompt(
+            config,
+            {"phase": "proof_formalization", "review_log": []},
+            "proof_formalization",
+            False,
+        )
+
+        self.assertIn("authoritative theorem-frontier DAG", prompt)
+        self.assertIn('"active_node": {', prompt)
+        self.assertIn('"allowed_edit_paths": ["repo-relative .lean files allowed inside that cone for this burst"]', prompt)
+        self.assertIn('"proposed_nodes": [{ exact node objects, if any }]', prompt)
+        self.assertIn("active cone", prompt)
+        self.assertIn("Any Lean file changed outside `allowed_edit_paths` will fail theorem-frontier cone validation", prompt)
+
+    def test_full_reviewer_prompt_includes_paper_verifier_review(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "phase": "proof_formalization",
+            "review_log": [],
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+            "last_theorem_frontier_worker_update": self.full_worker_update(),
+            "last_theorem_frontier_paper_review": self.paper_verifier_review(),
+        }
+
+        prompt = supervisor.build_reviewer_prompt(
+            config,
+            state,
+            "proof_formalization",
+            "worker terminal output",
+            json.dumps({"status": "NOT_STUCK"}),
+            {"build": {"ok": True}, "sorries": {"count": 0}, "axioms": {"unapproved": []}},
+            False,
+        )
+
+        self.assertIn("Paper-verifier structural review", prompt)
+        self.assertIn('"classification": "paper_faithful_reformulation"', prompt)
+        self.assertIn('"cone_purity": "HIGH" | "MEDIUM" | "LOW"', prompt)
+
+    def test_full_paper_verifier_prompt_mentions_structural_gate(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "phase": "proof_formalization",
+            "review_log": [],
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        prompt = supervisor.build_theorem_frontier_paper_verifier_prompt(
+            config,
+            state,
+            "proof_formalization",
+            "worker terminal output",
+            json.dumps({"status": "NOT_STUCK"}),
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[
+                    self.full_node("ri.local.remaining"),
+                    self.full_node("ri.local.red_cap"),
+                ],
+                proposed_edges=[
+                    {
+                        "parent": "ri.local.graph_pair",
+                        "child": "ri.local.remaining",
+                        "edge_type": "all_of",
+                        "justification": "Both local bounds are needed.",
+                    }
+                ],
+                next_candidate_ids=["ri.local.remaining"],
+                structural_change_reason="Split the live blocker into local siblings.",
+            ),
+            False,
+        )
+
+        self.assertIn("paper-verifier for theorem-frontier structural edits", prompt)
+        self.assertIn("paper-faithful reformulation", prompt)
+        self.assertIn("theorem_frontier_paper_verifier.json", prompt)
+
+    def test_validate_theorem_frontier_worker_update_requires_exact_statements(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "active_theorem_lean_statement"):
+            supervisor.validate_theorem_frontier_worker_update(
+                "proof_formalization",
+                self.worker_update(active_theorem_lean_statement=""),
+            )
+
+    def test_validate_theorem_frontier_worker_update_rejects_invalid_action(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Invalid theorem frontier action"):
+            supervisor.validate_theorem_frontier_worker_update(
+                "proof_formalization",
+                self.worker_update(requested_action="WRAP"),
+            )
+
+    def test_validate_theorem_frontier_review_rejects_invalid_outcome(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Invalid theorem frontier outcome"):
+            supervisor.validate_theorem_frontier_review(
+                "proof_formalization",
+                self.frontier_review(outcome="WRAPPER_PROGRESS"),
+            )
+
+    def test_validate_full_worker_update_requires_exact_active_node_statement(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "lean_statement"):
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                self.full_worker_update(
+                    active_node=self.full_node(lean_statement=""),
+                ),
+            )
+
+    def test_validate_full_worker_update_requires_allowed_edit_paths(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "allowed_edit_paths"):
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                self.full_worker_update(allowed_edit_paths=[]),
+            )
+
+    def test_validate_full_worker_update_rejects_non_relative_allowed_edit_paths(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "repo-relative path"):
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                self.full_worker_update(allowed_edit_paths=["/tmp/Bad.lean"]),
+            )
+
+    def test_validate_full_paper_verifier_review_rejects_invalid_classification(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "paper verifier classification"):
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(classification="wrapper_progress"),
+            )
+
+    def test_validate_full_worker_update_rejects_off_frontier_edges(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "proposed_edges must stay within the active node"):
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                self.full_worker_update(
+                    requested_action="EXPAND",
+                    proposed_nodes=[self.full_node("ri.local.remaining")],
+                    proposed_edges=[
+                        {
+                            "parent": "paper.main",
+                            "child": "ri.local.remaining",
+                            "edge_type": "all_of",
+                            "justification": "Illegally attach outside the active cone.",
+                        }
+                    ],
+                    next_candidate_ids=["ri.local.remaining"],
+                    structural_change_reason="Bad off-frontier edit.",
+                ),
+            )
+
+    def test_apply_theorem_frontier_cone_file_guard_rejects_off_cone_lean_edit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        validation_summary = {
+            "git": {
+                "changed_lean_files": ["Twobites/IndependentSets.lean", "Twobites/ParameterBounds.lean"],
+            }
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "outside allowed_edit_paths"):
+            supervisor.apply_theorem_frontier_cone_file_guard(
+                config,
+                "proof_formalization",
+                validation_summary,
+                self.full_worker_update(allowed_edit_paths=["Twobites/IndependentSets.lean"]),
+            )
+
+    def test_apply_theorem_frontier_cone_file_guard_accepts_declared_lean_edits(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        validation_summary = {
+            "git": {
+                "changed_lean_files": ["Twobites/IndependentSets.lean"],
+            }
+        }
+
+        result = supervisor.apply_theorem_frontier_cone_file_guard(
+            config,
+            "proof_formalization",
+            validation_summary,
+            self.full_worker_update(allowed_edit_paths=["Twobites/IndependentSets.lean"]),
+        )
+
+        self.assertTrue(result["enforced"])
+        self.assertEqual(result["disallowed_changed_lean_files"], [])
+
+    def test_update_theorem_frontier_state_tracks_ages_and_counts(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="phase0")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {"phase": "proof_formalization", "theorem_frontier": None}
+
+        first = supervisor.update_theorem_frontier_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_review("proof_formalization", self.frontier_review()),
+            cycle=11,
+        )
+        self.assertEqual(first["active_theorem_age"], 1)
+        self.assertEqual(first["blocker_cluster_age"], 1)
+        self.assertEqual(first["closed_nodes_count"], 0)
+        self.assertEqual(first["refuted_nodes_count"], 0)
+
+        second = supervisor.update_theorem_frontier_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_review(
+                "proof_formalization",
+                self.frontier_review(outcome="NO_FRONTIER_PROGRESS"),
+            ),
+            cycle=12,
+        )
+        self.assertEqual(second["active_theorem_age"], 2)
+        self.assertEqual(second["blocker_cluster_age"], 2)
+
+        third = supervisor.update_theorem_frontier_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_review(
+                "proof_formalization",
+                self.frontier_review(
+                    active_theorem_id="ri.local.embedding_sum",
+                    active_theorem_anchor="Twobites.IndependentSets.embedding_sum_bound",
+                    active_theorem_lean_statement="theorem embedding_sum_bound : True := by trivial",
+                    assessed_action="EXPAND",
+                    outcome="EXPANDED",
+                ),
+            ),
+            cycle=13,
+        )
+        self.assertEqual(third["active_theorem_age"], 1)
+        self.assertEqual(third["blocker_cluster_age"], 3)
+
+        fourth = supervisor.update_theorem_frontier_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_review(
+                "proof_formalization",
+                self.frontier_review(
+                    active_theorem_id="ri.local.replacement_route",
+                    active_theorem_anchor="Twobites.IndependentSets.replacement_route",
+                    active_theorem_lean_statement="theorem replacement_route : True := by trivial",
+                    blocker_cluster="replacement route for RI collapse",
+                    assessed_action="REFUTE_REPLACE",
+                    outcome="REFUTED_REPLACED",
+                ),
+            ),
+            cycle=14,
+        )
+        self.assertEqual(fourth["active_theorem_age"], 1)
+        self.assertEqual(fourth["blocker_cluster_age"], 1)
+        self.assertEqual(fourth["refuted_nodes_count"], 1)
+
+        fifth = supervisor.update_theorem_frontier_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_review(
+                "proof_formalization",
+                self.frontier_review(
+                    active_theorem_id="ri.local.replacement_route",
+                    active_theorem_anchor="Twobites.IndependentSets.replacement_route",
+                    active_theorem_lean_statement="theorem replacement_route : True := by trivial",
+                    blocker_cluster="replacement route for RI collapse",
+                    outcome="CLOSED",
+                ),
+            ),
+            cycle=15,
+        )
+        self.assertEqual(fifth["active_theorem_age"], 2)
+        self.assertEqual(fifth["blocker_cluster_age"], 2)
+        self.assertEqual(fifth["closed_nodes_count"], 1)
+
+        history_lines = supervisor.theorem_frontier_history_path(config).read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(history_lines), 5)
+
+    def test_update_theorem_frontier_full_state_records_expansion_and_escalation(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        active_payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    change_kind="CREATE_ACTIVE",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    approved_edges=[],
+                ),
+            ),
+            cycle=11,
+        )
+        self.assertEqual(active_payload["active_leaf_id"], "ri.local.graph_pair")
+        self.assertEqual(active_payload["metrics"]["active_leaf_age"], 1)
+        self.assertEqual(active_payload["metrics"]["failed_close_attempts"], 1)
+
+        expanded_payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[
+                    self.full_node("ri.local.remaining"),
+                    self.full_node("ri.local.red_cap"),
+                ],
+                proposed_edges=[
+                    {
+                        "parent": "ri.local.graph_pair",
+                        "child": "ri.local.remaining",
+                        "edge_type": "all_of",
+                        "justification": "The remaining-pairs lower bound is needed.",
+                    },
+                    {
+                        "parent": "ri.local.graph_pair",
+                        "child": "ri.local.red_cap",
+                        "edge_type": "all_of",
+                        "justification": "The red cap is also needed.",
+                    },
+                ],
+                next_candidate_ids=["ri.local.remaining", "ri.local.red_cap"],
+                structural_change_reason="Split the live blocker into local siblings.",
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    assessed_action="EXPAND",
+                    outcome="EXPANDED",
+                    next_active_theorem_id="ri.local.remaining",
+                    open_hypotheses=["close the remaining-pairs lower bound child"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(),
+            ),
+            cycle=12,
+        )
+        self.assertEqual(expanded_payload["active_leaf_id"], "ri.local.remaining")
+        self.assertIn("ri.local.red_cap", expanded_payload["nodes"])
+        self.assertEqual(expanded_payload["nodes"]["ri.local.graph_pair"]["status"], "open")
+        self.assertEqual(expanded_payload["nodes"]["ri.local.remaining"]["status"], "active")
+        self.assertEqual(len(expanded_payload["edges"]), 2)
+
+        low_purity_payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                active_node=self.full_node("ri.local.remaining"),
+                next_candidate_ids=["ri.local.remaining"],
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    active_theorem_id="ri.local.remaining",
+                    active_theorem_lean_statement="theorem ri_local_remaining : True := by trivial",
+                    active_theorem_anchor="Twobites.IndependentSets.ri_local_remaining",
+                    outcome="NO_FRONTIER_PROGRESS",
+                    next_active_theorem_id="ri.local.remaining",
+                    cone_purity="LOW",
+                    open_hypotheses=["still missing the remaining-pairs lower bound"],
+                ),
+            ),
+            None,
+            cycle=13,
+        )
+        low_purity_payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                active_node=self.full_node("ri.local.remaining"),
+                next_candidate_ids=["ri.local.remaining"],
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    active_theorem_id="ri.local.remaining",
+                    active_theorem_lean_statement="theorem ri_local_remaining : True := by trivial",
+                    active_theorem_anchor="Twobites.IndependentSets.ri_local_remaining",
+                    outcome="NO_FRONTIER_PROGRESS",
+                    next_active_theorem_id="ri.local.remaining",
+                    cone_purity="LOW",
+                    open_hypotheses=["still missing the remaining-pairs lower bound"],
+                ),
+            ),
+            None,
+            cycle=14,
+        )
+        self.assertTrue(low_purity_payload["escalation"]["required"])
+        self.assertIn("low cone purity", " ".join(low_purity_payload["escalation"]["reasons"]))
+
+    def test_update_theorem_frontier_full_state_rejects_unapproved_create_active(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Cannot create or activate"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(),
+                ),
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        change_kind="CREATE_ACTIVE",
+                        decision="REJECT",
+                        approved_node_ids=[],
+                        approved_edges=[],
+                    ),
+                ),
+                cycle=11,
+            )
+
+    def test_update_theorem_frontier_full_state_rejects_mutating_existing_node(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    change_kind="CREATE_ACTIVE",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    approved_edges=[],
+                ),
+            ),
+            cycle=11,
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "immutable"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(
+                    active_node=self.full_node(
+                        "ri.local.graph_pair",
+                        lean_statement="theorem altered_statement : False := by trivial",
+                        natural_language_statement="Altered statement",
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(
+                        active_theorem_lean_statement="theorem altered_statement : False := by trivial",
+                        active_theorem_nl_statement="Altered statement",
+                    ),
+                ),
+                None,
+                cycle=12,
+            )
+
+    def test_update_theorem_frontier_full_state_rejects_closed_node_as_next_active(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "cannot be both CLOSED and the next active leaf"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(
+                        outcome="CLOSED",
+                        next_active_theorem_id="ri.local.graph_pair",
+                        open_hypotheses=[],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        change_kind="CREATE_ACTIVE",
+                        approved_node_ids=["ri.local.graph_pair"],
+                        approved_edges=[],
+                    ),
+                ),
+                cycle=11,
+            )
+
+    def test_update_theorem_frontier_full_state_only_admits_paper_approved_subset(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    change_kind="CREATE_ACTIVE",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    approved_edges=[],
+                ),
+            ),
+            cycle=11,
+        )
+
+        payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[
+                    self.full_node("ri.local.remaining"),
+                    self.full_node("ri.local.red_cap"),
+                ],
+                proposed_edges=[
+                    {
+                        "parent": "ri.local.graph_pair",
+                        "child": "ri.local.remaining",
+                        "edge_type": "all_of",
+                        "justification": "The remaining-pairs child is needed.",
+                    },
+                    {
+                        "parent": "ri.local.graph_pair",
+                        "child": "ri.local.red_cap",
+                        "edge_type": "all_of",
+                        "justification": "The red-cap child is proposed too.",
+                    },
+                ],
+                next_candidate_ids=["ri.local.remaining"],
+                structural_change_reason="Split the blocker in two.",
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    assessed_action="EXPAND",
+                    outcome="EXPANDED",
+                    next_active_theorem_id="ri.local.remaining",
+                    open_hypotheses=["close the remaining-pairs child"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    approved_node_ids=["ri.local.remaining"],
+                    approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                ),
+            ),
+            cycle=12,
+        )
+        self.assertIn("ri.local.remaining", payload["nodes"])
+        self.assertNotIn("ri.local.red_cap", payload["nodes"])
+        self.assertEqual(
+            [(edge["parent"], edge["child"]) for edge in payload["edges"]],
+            [("ri.local.graph_pair", "ri.local.remaining")],
+        )
+
+    def test_update_theorem_frontier_full_state_rejects_next_active_not_paper_approved(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    change_kind="CREATE_ACTIVE",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    approved_edges=[],
+                ),
+            ),
+            cycle=11,
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Next active theorem id"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(
+                    requested_action="EXPAND",
+                    proposed_nodes=[self.full_node("ri.local.remaining")],
+                    proposed_edges=[
+                        {
+                            "parent": "ri.local.graph_pair",
+                            "child": "ri.local.remaining",
+                            "edge_type": "all_of",
+                            "justification": "The remaining-pairs child is proposed.",
+                        }
+                    ],
+                    next_candidate_ids=["ri.local.remaining"],
+                    structural_change_reason="Split the blocker.",
+                ),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(
+                        assessed_action="EXPAND",
+                        outcome="EXPANDED",
+                        next_active_theorem_id="ri.local.remaining",
+                        open_hypotheses=["close the remaining-pairs child"],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        approved_node_ids=[],
+                        approved_edges=[],
+                    ),
+                ),
+                cycle=12,
+            )
+
+    def test_update_theorem_frontier_full_state_rejects_approved_edge_to_unapproved_node(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    change_kind="CREATE_ACTIVE",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    approved_edges=[],
+                ),
+            ),
+            cycle=11,
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "approved_edges may only reference nodes"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(
+                    requested_action="EXPAND",
+                    proposed_nodes=[self.full_node("ri.local.remaining")],
+                    proposed_edges=[
+                        {
+                            "parent": "ri.local.graph_pair",
+                            "child": "ri.local.remaining",
+                            "edge_type": "all_of",
+                            "justification": "The remaining-pairs child is proposed.",
+                        }
+                    ],
+                    next_candidate_ids=["ri.local.remaining"],
+                    structural_change_reason="Split the blocker.",
+                ),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(
+                        assessed_action="EXPAND",
+                        outcome="EXPANDED",
+                        next_active_theorem_id="ri.local.graph_pair",
+                        open_hypotheses=["close the remaining-pairs child"],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        approved_node_ids=[],
+                        approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                    ),
+                ),
+                cycle=12,
+            )
+
+    def test_update_theorem_frontier_full_state_failed_close_attempts_track_leaf_not_blocker(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    change_kind="CREATE_ACTIVE",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    approved_edges=[],
+                ),
+            ),
+            cycle=11,
+        )
+        expanded = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[self.full_node("ri.local.remaining")],
+                proposed_edges=[
+                    {
+                        "parent": "ri.local.graph_pair",
+                        "child": "ri.local.remaining",
+                        "edge_type": "all_of",
+                        "justification": "The remaining-pairs child is needed.",
+                    }
+                ],
+                next_candidate_ids=["ri.local.remaining"],
+                structural_change_reason="Split to the remaining-pairs child.",
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    assessed_action="EXPAND",
+                    outcome="EXPANDED",
+                    next_active_theorem_id="ri.local.remaining",
+                    open_hypotheses=["close the remaining-pairs child"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    approved_node_ids=["ri.local.remaining"],
+                    approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                ),
+            ),
+            cycle=12,
+        )
+        self.assertEqual(expanded["metrics"]["failed_close_attempts"], 0)
+
+        next_payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                active_node=self.full_node("ri.local.remaining"),
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    active_theorem_id="ri.local.remaining",
+                    active_theorem_nl_statement="For one good graph pair, the bad-event mass is bounded by the RI target.",
+                    active_theorem_lean_statement="theorem ri_local_remaining : True := by trivial",
+                    active_theorem_anchor="Twobites.IndependentSets.ri_local_remaining",
+                    blocker_cluster="graph-pair local RI collapse",
+                    assessed_action="CLOSE",
+                    outcome="NO_FRONTIER_PROGRESS",
+                    next_active_theorem_id="ri.local.remaining",
+                ),
+            ),
+            None,
+            cycle=13,
+        )
+        self.assertEqual(next_payload["metrics"]["failed_close_attempts"], 1)
+        self.assertEqual(next_payload["current_action"], "CLOSE")
+
+    def test_load_state_rejects_invalid_theorem_frontier_payload(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        supervisor.JsonFile.dump(
+            config.state_dir / "state.json",
+            {
+                "phase": "proof_formalization",
+                "theorem_frontier": {
+                    "mode": "full",
+                    "active_leaf_id": "missing.node",
+                    "nodes": {},
+                    "edges": [],
+                    "metrics": {},
+                    "escalation": {"required": False, "reasons": []},
+                    "paper_verifier_history": [],
+                    "current": None,
+                },
+            },
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "active_leaf_id"):
+            supervisor.load_state(config)
+
+    def test_load_state_rejects_multiple_active_theorem_frontier_nodes(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        payload = supervisor.default_theorem_frontier_payload("full")
+        payload["active_leaf_id"] = "ri.local.graph_pair"
+        payload["nodes"] = {
+            "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.graph_pair"),
+                status="active",
+                parent_ids=[],
+                child_ids=[],
+            ),
+            "ri.local.remaining": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.remaining"),
+                status="active",
+                parent_ids=[],
+                child_ids=[],
+            ),
+        }
+        supervisor.JsonFile.dump(
+            config.state_dir / "state.json",
+            {
+                "phase": "proof_formalization",
+                "theorem_frontier": payload,
+            },
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "exactly one active node"):
+            supervisor.load_state(config)
+
+    def test_recover_interrupted_worker_state_restores_phase0_frontier_artifact(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="phase0")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "worker_handoff.json").write_text(
+            json.dumps(
+                {
+                    "phase": "proof_formalization",
+                    "status": "NOT_STUCK",
+                    "summary_of_changes": "Made local progress.",
+                    "current_frontier": "graph-pair bound",
+                    "likely_next_step": "finish the active theorem",
+                    "input_request": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        supervisor.theorem_frontier_worker_update_path(config).write_text(
+            json.dumps(self.worker_update()),
+            encoding="utf-8",
+        )
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 3,
+            "review_log": [],
+            "awaiting_human_input": False,
+            "roles": {},
+        }
+
+        with (
+            mock.patch.object(
+                supervisor,
+                "run_validation",
+                return_value={
+                    "cycle": 3,
+                    "phase": "proof_formalization",
+                    "build": {"ok": True},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                },
+            ),
+            mock.patch.object(supervisor, "record_chat_event") as record_chat_event_mock,
+        ):
+            recovered = supervisor.recover_interrupted_worker_state(config, state, "proof_formalization")
+
+        self.assertTrue(recovered)
+        self.assertEqual(state["last_theorem_frontier_worker_update"]["active_theorem_id"], "ri.local.graph_pair")
+        kinds = [call.kwargs.get("kind") for call in record_chat_event_mock.mock_calls]
+        self.assertIn("worker_handoff", kinds)
+        self.assertIn("theorem_frontier_update", kinds)
+        self.assertIn("validation_summary", kinds)
 
 
 class ProviderContextTests(SupervisorTestCase):

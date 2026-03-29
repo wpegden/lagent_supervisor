@@ -194,6 +194,7 @@ Pick one of the example configs in `configs/` and update:
 - optional `workflow.start_phase`
 - optional `workflow.paper_tex_path`
 - optional `workflow.sorry_mode`
+- optional `workflow.theorem_frontier_phase`
 - optional model names
 - optional timeout settings:
   - `startup_timeout_seconds` for launch failures before the burst script starts
@@ -207,6 +208,23 @@ Pick one of the example configs in `configs/` and update:
   - `branching.poll_seconds` seeds the default branch-monitor poll interval in the live policy file; default `300`
 
 The supervisor also supports a shared hot-reloadable policy file. By default it lives next to the config as `<config>.policy.json`, or you can set `policy_path` explicitly. Child branch configs inherit the same `policy_path`, so one edit affects the whole project frontier on the next loop/poll boundary without restarting the supervisors.
+
+Experimental theorem-frontier rollout:
+
+- If `workflow.theorem_frontier_phase` is omitted, the default is now `"full"`.
+- `workflow.theorem_frontier_phase: "full"` enables the theorem-frontier DAG workflow for `proof_formalization`.
+- `workflow.theorem_frontier_phase: "phase0"` keeps the lighter manual-discipline variant for synthetic tests and migration work.
+- `workflow.theorem_frontier_phase: "off"` keeps the legacy proof-formalization workflow only for compatibility/testing.
+- The full mode adds machine-validated theorem-frontier worker/reviewer artifacts, a structural paper-verifier gate, an authoritative local theorem DAG, blocker/cone metrics, and active-leaf escalation tracking.
+- In full mode, existing DAG nodes are immutable: if a theorem statement/provenance changes, it must appear as a replacement node rather than a silent in-place edit.
+- In full mode, a node cannot enter the authoritative DAG without paper-verifier approval, and a node marked `CLOSED` cannot be reactivated in the same review step.
+- In full mode, `approved_node_ids` / `approved_edges` are enforced exactly: only the paper-verifier-approved subset of a proposed structural edit is admitted into the authoritative DAG.
+- In full mode, `theorem_stating` must also write `.agent-supervisor/paper_main_results.json`, a machine-readable manifest of the paper's main results. The `theorem_stating -> proof_formalization` transition validates that manifest and seeds the initial theorem-frontier DAG from it, so proof formalization starts with all main paper results already present as authoritative paper nodes.
+- In full mode, branching artifacts are anchored to the current theorem-frontier active leaf via `frontier_anchor_node_id`.
+- In full mode, a new child branch inherits the authoritative DAG itself but resets local frontier-aging/escalation pressure (`active_leaf_age`, blocker age, failed-close streak, cone-purity streak, escalation, and last frontier artifacts), so fresh branches do not inherit parent stagnation pressure.
+- Branch monitoring snapshots now include theorem-frontier summaries for each child branch: current active leaf, blocker cluster, open-hypothesis count, frontier ages, and escalation state.
+- Branching guidance changes under the theorem-frontier model: branch only when there are genuinely competing routes for the same anchored theorem node or its subtree, not merely multiple wrapper-building variants of the same blocker.
+- The detailed non-live rollout and testing plan is documented in [`theorem_frontier_testing_strategy.md`](theorem_frontier_testing_strategy.md).
 
 Phase-1 live policy settings are:
 

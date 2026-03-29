@@ -381,6 +381,17 @@ button:hover {
   min-width: 11rem;
 }
 
+.history-controls {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.history-controls p {
+  margin: 0;
+}
+
 .empty-state {
   text-align: center;
   padding: 3.4rem 1.2rem;
@@ -441,6 +452,12 @@ button:hover {
 .branch-episodes {
   display: grid;
   gap: 0.9rem;
+}
+
+.branch-episode-summaries {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.8rem;
 }
 
 .branch-board-grid {
@@ -549,12 +566,24 @@ button:hover {
 .branch-item-path,
 .branch-episode-meta,
 .cycle-meta,
+.cycle-delta,
+.timeline-total-delta,
 .timeline-column-path,
 .timeline-empty {
   color: var(--muted);
   font-size: 0.83rem;
   line-height: 1.45;
   margin: 0;
+}
+
+.cycle-delta-added {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.cycle-delta-removed {
+  color: #a0392b;
+  font-weight: 600;
 }
 
 .branch-item-name {
@@ -603,6 +632,32 @@ button:hover {
   gap: 0.8rem;
 }
 
+.timeline-selector-card {
+  border: 1px solid var(--line);
+  border-radius: 1.15rem;
+  padding: 1rem;
+  background: rgba(255, 250, 240, 0.92);
+  display: grid;
+  gap: 0.75rem;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+
+.timeline-selector-card:hover {
+  border-color: rgba(31, 106, 82, 0.3);
+}
+
+.timeline-selector-card.is-selected-transcript {
+  border-color: rgba(31, 106, 82, 0.34);
+  background: linear-gradient(135deg, rgba(31, 106, 82, 0.1), rgba(255, 252, 245, 0.95));
+}
+
+.timeline-selector-card:focus-visible {
+  outline: 2px solid rgba(31, 106, 82, 0.34);
+  outline-offset: 0.2rem;
+}
+
 .branch-cycle-card {
   max-width: 100%;
   width: 100%;
@@ -646,8 +701,27 @@ button:hover {
   color: #7c3822;
 }
 
+.status-paused {
+  background: rgba(155, 108, 21, 0.14);
+  color: #8a5a12;
+}
+
 .timeline-column.status-dead {
   opacity: 0.74;
+}
+
+.timeline-column.is-selected-transcript {
+  border-color: rgba(31, 106, 82, 0.34);
+  background: linear-gradient(135deg, rgba(31, 106, 82, 0.1), rgba(255, 252, 245, 0.95));
+}
+
+.timeline-column[role="button"] {
+  cursor: pointer;
+}
+
+.timeline-column[role="button"]:focus-visible {
+  outline: 2px solid rgba(31, 106, 82, 0.34);
+  outline-offset: 0.2rem;
 }
 
 .branch-tree-row {
