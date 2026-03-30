@@ -5793,9 +5793,16 @@ def log_supervisor_warning(
         "message": message,
     }
     if detail is not None:
-        entry["detail"] = detail
+        try:
+            json.dumps(detail, ensure_ascii=False)
+            entry["detail"] = detail
+        except (TypeError, ValueError):
+            entry["detail"] = repr(detail)
     print(f"WARNING [{category}] cycle {cycle}: {message}")
-    append_jsonl(supervisor_warnings_log_path(config), entry)
+    try:
+        append_jsonl(supervisor_warnings_log_path(config), entry)
+    except (TypeError, ValueError, OSError) as exc:
+        print(f"WARNING: Could not write warning log entry: {exc}")
 
 
 def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
@@ -6524,7 +6531,7 @@ def run_burst_with_validation(
                     phase=phase or "",
                     category="validation_retry",
                     message=f"{stage_label} attempt {attempt}/{validation_retry_limit + 1}: {last_error}",
-                    detail={"artifact_path": run.get("artifact_path")},
+                    detail={"artifact_path": str(run.get("artifact_path", ""))},
                 )
             else:
                 print(
