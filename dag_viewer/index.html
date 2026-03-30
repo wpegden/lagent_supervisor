@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Theorem Frontier DAG Browser</title>
+<link rel="stylesheet" href="_assets/dag-browser.css?v=__VIEWER_VERSION__">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <h1 class="sidebar-title">Frontier DAGs</h1>
+    <div id="project-list"></div>
+  </aside>
+  <main id="main">
+    <header id="topbar">
+      <div id="topbar-left">
+        <span id="project-label">Select a project</span>
+        <span id="phase-badge" class="badge hidden"></span>
+      </div>
+      <div id="topbar-center">
+        <button id="cycle-prev" class="cycle-btn" title="Previous cycle">&lsaquo;</button>
+        <span id="cycle-label">--</span>
+        <button id="cycle-next" class="cycle-btn" title="Next cycle">&rsaquo;</button>
+        <button id="cycle-play" class="cycle-btn" title="Play">&#9654;</button>
+      </div>
+      <div id="topbar-right">
+        <select id="branch-select" class="hidden"></select>
+        <div id="metrics-bar"></div>
+      </div>
+    </header>
+    <div id="canvas-wrap">
+      <canvas id="dag-canvas"></canvas>
+      <div id="minimap-wrap">
+        <canvas id="minimap-canvas" width="180" height="120"></canvas>
+      </div>
+      <div id="status-filters">
+        <label><input type="checkbox" data-status="closed" checked> closed</label>
+        <label><input type="checkbox" data-status="open" checked> open</label>
+        <label><input type="checkbox" data-status="active" checked> active</label>
+        <label><input type="checkbox" data-status="refuted"> refuted</label>
+        <label><input type="checkbox" data-status="replaced"> replaced</label>
+        <label><input type="checkbox" data-status="proposed" checked> proposed</label>
+        <label><input type="checkbox" data-status="frozen" checked> frozen</label>
+      </div>
+      <div id="search-bar">
+        <input id="search-input" type="text" placeholder="Search nodes...">
+      </div>
+    </div>
+    <div id="scrubber-wrap" class="hidden">
+      <div id="scrubber-track">
+        <div id="scrubber-ticks"></div>
+        <input id="scrubber" type="range" min="0" max="0" value="0">
+      </div>
+    </div>
+    <div id="directive-panel" class="panel hidden">
+      <div class="panel-header">Worker Directive</div>
+      <div id="directive-content"></div>
+    </div>
+    <div id="detail-panel" class="panel hidden">
+      <button id="detail-close" class="panel-close">&times;</button>
+      <div id="detail-content"></div>
+    </div>
+  </main>
+</div>
+<script src="_assets/dag-browser.js?v=__VIEWER_VERSION__"></script>
+</body>
+</html>

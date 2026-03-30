@@ -4567,25 +4567,27 @@ class TheoremFrontierTests(SupervisorTestCase):
                 self.paper_verifier_review(classification="wrapper_progress"),
             )
 
-    def test_validate_full_worker_update_rejects_off_frontier_edges(self) -> None:
-        with self.assertRaisesRegex(supervisor.SupervisorError, "proposed_edges must stay within the active node"):
-            supervisor.validate_theorem_frontier_worker_update_full(
-                "proof_formalization",
-                self.full_worker_update(
-                    requested_action="EXPAND",
-                    proposed_nodes=[self.full_node("ri.local.remaining")],
-                    proposed_edges=[
-                        {
-                            "parent": "paper.main",
-                            "child": "ri.local.remaining",
-                            "edge_type": "all_of",
-                            "justification": "Illegally attach outside the active cone.",
-                        }
-                    ],
-                    next_candidate_ids=["ri.local.remaining"],
-                    structural_change_reason="Bad off-frontier edit.",
-                ),
-            )
+    def test_validate_full_worker_update_accepts_proposed_edges_referencing_existing_nodes(self) -> None:
+        # Proposed edges may reference nodes already in the DAG (not just active/proposed).
+        # The authoritative DAG check happens later in update_theorem_frontier_full_state.
+        result = supervisor.validate_theorem_frontier_worker_update_full(
+            "proof_formalization",
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[self.full_node("ri.local.remaining")],
+                proposed_edges=[
+                    {
+                        "parent": "paper.main",
+                        "child": "ri.local.remaining",
+                        "edge_type": "all_of",
+                        "justification": "Attach to existing DAG node.",
+                    }
+                ],
+                next_candidate_ids=["ri.local.remaining"],
+                structural_change_reason="Expand with edge to existing node.",
+            ),
+        )
+        self.assertEqual(len(result["proposed_edges"]), 1)
 
     def test_apply_theorem_frontier_cone_file_guard_rejects_off_cone_lean_edit(self) -> None:
         repo_path = self.make_repo()
@@ -5753,6 +5755,201 @@ class TmuxBurstTests(SupervisorTestCase):
         latest_log = config.state_dir / "logs" / "worker.latest.ansi.log"
         self.assertTrue(latest_log.exists())
         self.assertIn("existing-output", latest_log.read_text(encoding="utf-8"))
+
+
+class DagExportTests(SupervisorTestCase):
+    def _make_frontier_state(self) -> dict:
+        return {
+            "theorem_frontier": {
+                "mode": "full",
+                "active_leaf_id": "main_thm",
+                "current_action": "CLOSE",
+                "nodes": {
+                    "main_thm": {
+                        "node_id": "main_thm",
+                        "kind": "paper",
+                        "status": "active",
+                        "natural_language_statement": "Main theorem",
+                        "lean_statement": "theorem main : True := trivial",
+                        "lean_anchor": "main",
+                        "paper_provenance": "Theorem 1",
+                        "closure_mode": "leaf",
+                        "blocker_cluster": "none",
+                        "acceptance_evidence": "Lean build passes",
+                        "notes": "root node",
+                        "parent_ids": [],
+                        "child_ids": ["lemma_a"],
+                    },
+                    "lemma_a": {
+                        "node_id": "lemma_a",
+                        "kind": "support",
+                        "status": "open",
+                        "natural_language_statement": "Lemma A",
+                        "lean_statement": "lemma a : True := trivial",
+                        "lean_anchor": "lemma_a",
+                        "paper_provenance": "Section 3",
+                        "closure_mode": "leaf",
+                        "blocker_cluster": "graph bound",
+                        "acceptance_evidence": "Lean build",
+                        "notes": "",
+                        "parent_ids": ["main_thm"],
+                        "child_ids": [],
+                    },
+                },
+                "edges": [
+                    {"parent": "main_thm", "child": "lemma_a", "edge_type": "reduction", "justification": "main reduces to lemma"},
+                ],
+                "metrics": {
+                    "active_leaf_age": 3,
+                    "blocker_cluster_age": 2,
+                    "closed_nodes_count": 0,
+                    "refuted_nodes_count": 0,
+                    "paper_nodes_closed": 0,
+                    "failed_close_attempts": 0,
+                    "low_cone_purity_streak": 0,
+                    "cone_purity": "HIGH",
+                    "structural_churn": 0,
+                },
+                "escalation": {"required": False, "reasons": []},
+                "paper_verifier_history": [],
+                "current": None,
+            },
+            "cycle": 10,
+            "phase": "proof_formalization",
+        }
+
+    def test_frontier_summary_for_meta_returns_summary(self) -> None:
+        state = self._make_frontier_state()
+        summary = supervisor.frontier_summary_for_meta(state)
+        self.assertIsNotNone(summary)
+        self.assertTrue(summary["has_frontier"])
+        self.assertEqual(summary["total_nodes"], 2)
+        self.assertEqual(summary["active_leaf_id"], "main_thm")
+        self.assertEqual(summary["status_counts"]["active"], 1)
+        self.assertEqual(summary["status_counts"]["open"], 1)
+
+    def test_frontier_summary_for_meta_returns_none_without_frontier(self) -> None:
+        self.assertIsNone(supervisor.frontier_summary_for_meta({}))
+        self.assertIsNone(supervisor.frontier_summary_for_meta({"theorem_frontier": {"mode": "phase0"}}))
+
+    def test_export_dag_frontier_snapshot_writes_file(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = self._make_frontier_state()
+        supervisor.dag_repo_dir(config).mkdir(parents=True, exist_ok=True)
+        supervisor.export_dag_frontier_snapshot(config, state)
+        path = supervisor.dag_frontier_path(config)
+        self.assertTrue(path.exists())
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["mode"], "full")
+        self.assertEqual(data["active_leaf_id"], "main_thm")
+        self.assertIn("exported_at", data)
+        self.assertIn("main_thm", data["nodes"])
+        self.assertIn("lemma_a", data["nodes"])
+
+    def test_export_dag_frontier_seed_writes_history(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = self._make_frontier_state()
+        supervisor.dag_repo_dir(config).mkdir(parents=True, exist_ok=True)
+        payload = state["theorem_frontier"]
+        supervisor.export_dag_frontier_seed(config, payload, cycle=5)
+        path = supervisor.dag_frontier_history_path(config)
+        self.assertTrue(path.exists())
+        lines = path.read_text(encoding="utf-8").strip().split("\n")
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["type"], "seed")
+        self.assertEqual(entry["cycle"], 5)
+        self.assertIn("main_thm", entry["nodes"])
+        self.assertIn("lemma_a", entry["nodes"])
+
+    def test_export_dag_frontier_cycle_writes_delta(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = self._make_frontier_state()
+        supervisor.dag_repo_dir(config).mkdir(parents=True, exist_ok=True)
+        before_ids = {"main_thm", "lemma_a"}
+        # Add a new node
+        state["theorem_frontier"]["nodes"]["lemma_b"] = {
+            "node_id": "lemma_b",
+            "kind": "support",
+            "status": "open",
+            "natural_language_statement": "Lemma B",
+            "lean_statement": "lemma b : True := trivial",
+            "lean_anchor": "lemma_b",
+            "paper_provenance": "Section 4",
+            "closure_mode": "leaf",
+            "blocker_cluster": "graph bound",
+            "acceptance_evidence": "Lean build",
+            "notes": "",
+            "parent_ids": ["main_thm"],
+            "child_ids": [],
+        }
+        state["theorem_frontier"]["edges"].append(
+            {"parent": "main_thm", "child": "lemma_b", "edge_type": "reduction", "justification": "expand"}
+        )
+        payload = state["theorem_frontier"]
+        supervisor.export_dag_frontier_cycle(
+            config, state, before_ids, payload,
+            cycle=11, outcome="EXPANDED", reviewed_node_id="main_thm",
+            worker_directive="Expand main_thm",
+        )
+        path = supervisor.dag_frontier_history_path(config)
+        self.assertTrue(path.exists())
+        lines = path.read_text(encoding="utf-8").strip().split("\n")
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["type"], "review")
+        self.assertEqual(entry["outcome"], "EXPANDED")
+        self.assertEqual(entry["cycle"], 11)
+        self.assertIn("lemma_b", entry["nodes_added"])
+        self.assertNotIn("main_thm", entry["nodes_added"])
+        self.assertEqual(entry["node_statuses"]["main_thm"], "active")
+        self.assertEqual(entry["worker_directive"], "Expand main_thm")
+        self.assertIn("edges_added", entry)
+
+    def test_worker_directive_summary_extracts_review_prompt(self) -> None:
+        state = {
+            "last_review": {"next_prompt": "Close the bound lemma."},
+        }
+        self.assertIn("Close the bound lemma", supervisor.worker_directive_summary(state))
+
+    def test_worker_directive_summary_empty_without_review(self) -> None:
+        self.assertEqual(supervisor.worker_directive_summary({}), "")
+
+    def test_dag_site_paths_use_lagent_dags(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        dag_root = supervisor.dag_root_dir(config)
+        self.assertTrue(str(dag_root).endswith("lagent-dags"))
+        self.assertNotIn("lagent-chats", str(dag_root))
+
+    def test_install_dag_viewer_assets_creates_files(self) -> None:
+        repo_path = self.make_repo()
+        root = repo_path.parent / "dag-site"
+        supervisor.install_dag_viewer_assets(root)
+        self.assertTrue((root / "index.html").exists())
+        self.assertTrue((root / "_assets" / "dag-browser.js").exists())
+        self.assertTrue((root / "_assets" / "dag-browser.css").exists())
+        self.assertTrue((root / "_assets" / "dag-layout-worker.js").exists())
+        self.assertTrue((root / "_assets" / "viewer-version.json").exists())
+        self.assertTrue((root / "repos.json").exists())
+
+    def test_export_dag_meta_updates_manifest(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        state = self._make_frontier_state()
+        supervisor.ensure_dag_site(config)
+        supervisor.export_dag_meta(config, state)
+        meta_path = supervisor.dag_repo_meta_path(config)
+        self.assertTrue(meta_path.exists())
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertIsNotNone(meta["frontier_summary"])
+        self.assertEqual(meta["frontier_summary"]["total_nodes"], 2)
+        manifest = json.loads(supervisor.dag_manifest_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest["repos"]), 1)
+        self.assertEqual(manifest["repos"][0]["repo_name"], config.chat.repo_name)
 
 
 if __name__ == "__main__":

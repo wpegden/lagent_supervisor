@@ -1,0 +1,50 @@
+{
+  "repo_path": "/home/leanagent/math/connectivity_threshold_gnp_claude",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 150,
+  "sleep_seconds": 1.0,
+  "startup_timeout_seconds": 30.0,
+  "burst_timeout_seconds": 7200.0,
+  "workflow": {
+    "start_phase": "paper_check",
+    "paper_tex_path": "paper/connectivity_threshold_gnp.tex",
+    "sorry_mode": "default",
+    "approved_axioms_path": "APPROVED_AXIOMS.json",
+    "human_input_path": "HUMAN_INPUT.md",
+    "input_request_path": "INPUT_REQUEST.md"
+  },
+  "git": {
+    "remote_url": null,
+    "remote_name": "origin",
+    "branch": "main",
+    "author_name": "leanagent",
+    "author_email": "leanagent@packer.math.cmu.edu"
+  },
+  "tmux": {
+    "session_name": "gnp-claude-agents",
+    "dashboard_window_name": "dashboard",
+    "kill_windows_after_capture": false
+  },
+  "chat": {
+    "root_dir": "~/lagent-dags-chat",
+    "repo_name": "connectivity-threshold-gnp-claude",
+    "public_base_url": "https://packer.math.cmu.edu/lagent-dags-chat/"
+  },
+  "worker": {
+    "provider": "claude",
+    "model": "opus",
+    "extra_args": [
+      "--effort",
+      "max"
+    ]
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "opus",
+    "extra_args": [
+      "--effort",
+      "max"
+    ]
+  }
+}
