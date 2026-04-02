@@ -218,6 +218,31 @@ class CommandTests(SupervisorTestCase):
         self.assertEqual(config.branching.poll_seconds, supervisor.DEFAULT_BRANCH_POLL_SECONDS)
         self.assertEqual(config.policy_path, config_path.with_suffix(".policy.json"))
 
+    def test_load_config_reads_provider_fallback_model(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {
+                        "provider": "gemini",
+                        "model": "gemini-3.1-pro-preview",
+                        "fallback_model": "gemini-2.5-flash",
+                    },
+                    "reviewer": {"provider": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.worker.provider, "gemini")
+        self.assertEqual(config.worker.model, "gemini-3.1-pro-preview")
+        self.assertEqual(config.worker.fallback_model, "gemini-2.5-flash")
+
     def test_load_config_reads_explicit_relative_policy_path(self) -> None:
         repo_path = self.make_repo()
         config_path = repo_path.parent / "config.json"
@@ -665,6 +690,72 @@ class PolicyTests(SupervisorTestCase):
         self.assertIn(f"WORK_DIR={shlex.quote(str(repo_path))}", script_text)
         self.assertIn(f"export GEMINI_CLI_HOME={shlex.quote(str(config.state_dir / 'scopes' / 'gemini-worker'))}", script_text)
         self.assertLess(script_text.index("export GEMINI_CLI_HOME="), script_text.index("cmd=("))
+
+    def test_prepare_gemini_cli_home_merges_fail_fast_setting_when_fallback_enabled(self) -> None:
+        source_home = Path(tempfile.mkdtemp(prefix="lagent gemini source "))
+        self.addCleanup(shutil.rmtree, source_home, True)
+        (source_home / ".gemini").mkdir(parents=True, exist_ok=True)
+        (source_home / ".gemini" / "settings.json").write_text(
+            json.dumps(
+                {
+                    "security": {"auth": {"selectedType": "oauth-personal"}},
+                    "general": {"retryFetchErrors": True},
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        scope_dir = self.make_repo() / ".agent-supervisor" / "scopes" / "gemini-worker"
+        with mock.patch.object(supervisor.Path, "home", return_value=source_home):
+            supervisor.prepare_gemini_cli_home(scope_dir, fail_fast_on_rate_limit=True)
+
+        settings = json.loads((scope_dir / ".gemini" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings["security"]["auth"]["selectedType"], "oauth-personal")
+        self.assertTrue(settings["general"]["retryFetchErrors"])
+        self.assertEqual(settings["general"]["maxAttempts"], 1)
+
+    def test_gemini_burst_env_enables_fail_fast_only_when_fallback_model_is_configured(self) -> None:
+        source_home = Path(tempfile.mkdtemp(prefix="lagent gemini source "))
+        self.addCleanup(shutil.rmtree, source_home, True)
+        (source_home / ".gemini").mkdir(parents=True, exist_ok=True)
+        (source_home / ".gemini" / "settings.json").write_text(
+            json.dumps({"general": {"retryFetchErrors": True}}, indent=2),
+            encoding="utf-8",
+        )
+
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        with mock.patch.object(supervisor.Path, "home", return_value=source_home):
+            adapter_no_fallback = supervisor.GeminiAdapter(
+                supervisor.ProviderConfig(provider="gemini", model="gemini-3.1-pro-preview", extra_args=[]),
+                "worker",
+                config,
+                {},
+            )
+            adapter_no_fallback.burst_env()
+            no_fallback_settings = json.loads(
+                (config.state_dir / "scopes" / "gemini-worker" / ".gemini" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("maxAttempts", no_fallback_settings.get("general", {}))
+
+        fallback_scope = config.state_dir / "scopes" / "gemini-reviewer"
+        with mock.patch.object(supervisor.Path, "home", return_value=source_home):
+            adapter_with_fallback = supervisor.GeminiAdapter(
+                supervisor.ProviderConfig(
+                    provider="gemini",
+                    model="gemini-3.1-pro-preview",
+                    extra_args=[],
+                    fallback_model="gemini-2.5-flash",
+                ),
+                "reviewer",
+                config,
+                {},
+            )
+            adapter_with_fallback.burst_env()
+            fallback_settings = json.loads((fallback_scope / ".gemini" / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(fallback_settings["general"]["maxAttempts"], 1)
 
     def test_determine_resume_cycle_and_stage_starts_new_cycle_after_completed_review(self) -> None:
         cycle, stage = supervisor.determine_resume_cycle_and_stage(
@@ -2889,6 +2980,250 @@ class BurstRetryTests(SupervisorTestCase):
 
         sleep_mock.assert_called_once_with(5.0)
 
+    def test_launch_tmux_burst_with_retries_uses_gemini_fallback_on_rate_limit(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = supervisor.GeminiAdapter(
+            supervisor.ProviderConfig(
+                provider="gemini",
+                model="gemini-3.1-pro-preview",
+                extra_args=[],
+                fallback_model="gemini-2.5-flash",
+            ),
+            "worker",
+            config,
+            {},
+        )
+        failed_log = repo_path / "gemini-failed.log"
+        failed_log.write_text("429 RESOURCE_EXHAUSTED MODEL_CAPACITY_EXHAUSTED", encoding="utf-8")
+        failed = {
+            "captured_output": "Attempt 1 failed with status 429. MODEL_CAPACITY_EXHAUSTED",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": failed_log,
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[failed, succeeded]) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            run = supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                7,
+                "prompt",
+                stage_label="worker burst",
+            )
+
+        self.assertEqual(run, succeeded)
+        self.assertEqual(launch_mock.call_count, 2)
+        self.assertEqual(launch_mock.call_args_list[0].args[0].cfg.model, "gemini-3.1-pro-preview")
+        self.assertEqual(launch_mock.call_args_list[1].args[0].cfg.model, "gemini-2.5-flash")
+        sleep_mock.assert_not_called()
+
+    def test_launch_tmux_burst_with_retries_does_not_use_gemini_fallback_for_non_rate_limit_failure(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = supervisor.GeminiAdapter(
+            supervisor.ProviderConfig(
+                provider="gemini",
+                model="gemini-3.1-pro-preview",
+                extra_args=[],
+                fallback_model="gemini-2.5-flash",
+            ),
+            "worker",
+            config,
+            {},
+        )
+        failed = {
+            "captured_output": "plain parse failure",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "failed.log",
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[failed, succeeded]) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            run = supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                7,
+                "prompt",
+                stage_label="worker burst",
+            )
+
+        self.assertEqual(run, succeeded)
+        self.assertEqual(launch_mock.call_count, 2)
+        self.assertEqual([call.args[0].cfg.model for call in launch_mock.call_args_list], ["gemini-3.1-pro-preview", "gemini-3.1-pro-preview"])
+        sleep_mock.assert_called_once_with(supervisor.AGENT_CLI_RETRY_DELAYS_SECONDS[0])
+
+    def test_launch_tmux_burst_with_retries_waits_fifteen_minutes_on_budget_error(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="claude", model="opus", extra_args=["--effort", "max"]),
+            "worker",
+            config,
+            {},
+            ["bash", "-lc", "exit 0"],
+        )
+        failed_log = repo_path / "budget-failed.log"
+        failed_log.write_text("usage limit reached; please retry later", encoding="utf-8")
+        failed = {
+            "captured_output": "usage limit reached",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": failed_log,
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[failed, succeeded]) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            run = supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                8,
+                "prompt",
+                stage_label="worker burst",
+            )
+
+        self.assertEqual(run, succeeded)
+        self.assertEqual(launch_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(supervisor.BUDGET_ERROR_RETRY_DELAY_SECONDS)
+
+    def test_burst_hit_budget_error_detects_claude_limit_message(self) -> None:
+        repo_path = self.make_repo()
+        log_path = repo_path / "claude-limit.log"
+        log_path.write_text("You've hit your limit. Please wait until 3am to continue.", encoding="utf-8")
+
+        self.assertTrue(
+            supervisor.burst_hit_budget_error(
+                {
+                    "captured_output": "",
+                    "per_cycle_log": log_path,
+                    "exit_code": 1,
+                }
+            )
+        )
+
+    def test_budget_error_does_not_consume_normal_retry_budget(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="claude", model="opus", extra_args=["--effort", "max"]),
+            "reviewer",
+            config,
+            {},
+            ["bash", "-lc", "exit 0"],
+        )
+        policy = supervisor.Policy(
+            stuck_recovery=supervisor.StuckRecoveryPolicy(),
+            branching=supervisor.BranchingPolicy(
+                evaluation_cycle_budget=config.branching.evaluation_cycle_budget,
+                poll_seconds=config.branching.poll_seconds,
+                proposal_cooldown_reviews=5,
+                replacement_min_confidence=0.8,
+            ),
+            timing=supervisor.TimingPolicy(
+                sleep_seconds=config.sleep_seconds,
+                agent_retry_delays_seconds=(5.0, 7.0),
+            ),
+            codex_budget_pause=supervisor.CodexBudgetPausePolicy(),
+            prompt_notes=supervisor.PromptNotesPolicy(),
+        )
+        budget_log = repo_path / "budget-failed.log"
+        budget_log.write_text("quota exceeded", encoding="utf-8")
+        budget_failed = {
+            "captured_output": "quota exceeded",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": budget_log,
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        non_budget_failed = {
+            "captured_output": "plain parse failure",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "failed.log",
+            "exit_code": 1,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%3",
+            "window_id": "@3",
+        }
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[budget_failed, non_budget_failed, succeeded]) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            run = supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                9,
+                "prompt",
+                stage_label="reviewer burst",
+                policy=policy,
+            )
+
+        self.assertEqual(run, succeeded)
+        self.assertEqual(launch_mock.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            [supervisor.BUDGET_ERROR_RETRY_DELAY_SECONDS, 5.0],
+        )
+
+    def test_clear_supervisor_artifacts_removes_primary_and_auxiliary_files(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        primary = config.state_dir / "worker_handoff.json"
+        frontier = supervisor.theorem_frontier_worker_update_path(config)
+        legacy = config.repo_path / "supervisor" / "worker_handoff.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        for path in (primary, frontier, legacy):
+            path.write_text("{}", encoding="utf-8")
+
+        supervisor.clear_supervisor_artifacts(config, primary, frontier)
+
+        self.assertFalse(primary.exists())
+        self.assertFalse(frontier.exists())
+        self.assertFalse(legacy.exists())
+
 
 class WorkflowTests(SupervisorTestCase):
     def _run_main_with_mocked_bursts(
@@ -3130,6 +3465,291 @@ class WorkflowTests(SupervisorTestCase):
         self.assertEqual(len(seed_events), 1)
         self.assertEqual(seed_events[0]["phase"], "proof_formalization")
 
+    def test_main_theorem_stating_transition_requires_manifest_seeding_in_full_mode(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="theorem_stating",
+            theorem_frontier_phase="full",
+        )
+        config.max_cycles = 1
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "phase": "theorem_stating",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "paper main-results manifest"):
+            self._run_main_with_mocked_bursts(
+                config,
+                state,
+                artifacts=[
+                    {
+                        "phase": "theorem_stating",
+                        "status": "DONE",
+                        "summary_of_changes": "statement files are ready",
+                        "current_frontier": "main results stated",
+                        "likely_next_step": "proof formalization",
+                        "input_request": "",
+                    },
+                    {
+                        "phase": "theorem_stating",
+                        "decision": "ADVANCE_PHASE",
+                        "confidence": 0.95,
+                        "reason": "Statements are ready for proof formalization.",
+                        "next_prompt": "",
+                    },
+                ],
+                validations=[
+                    {
+                        "cycle": 1,
+                        "phase": "theorem_stating",
+                        "build": {"ok": True},
+                        "syntax_checks": [{"ok": True}, {"ok": True}],
+                        "sorry_policy": {"disallowed_entries": []},
+                        "sorries": {"count": 0},
+                        "axioms": {"unapproved": []},
+                        "git": {"head": "statement-head"},
+                    },
+                ],
+            )
+        self.assertEqual(state["phase"], "theorem_stating")
+
+    def test_main_records_blocked_transition_error_when_theorem_stating_cannot_advance(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase="theorem_stating", theorem_frontier_phase="off")
+        config.max_cycles = 1
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "phase": "theorem_stating",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "disallowed sorrys"):
+            self._run_main_with_mocked_bursts(
+                config,
+                state,
+                artifacts=[
+                    {
+                        "phase": "theorem_stating",
+                        "status": "DONE",
+                        "summary_of_changes": "statement files are ready",
+                        "current_frontier": "main results stated",
+                        "likely_next_step": "proof formalization",
+                        "input_request": "",
+                    },
+                    {
+                        "phase": "theorem_stating",
+                        "decision": "ADVANCE_PHASE",
+                        "confidence": 0.9,
+                        "reason": "advance",
+                        "next_prompt": "",
+                    },
+                ],
+                validations=[
+                    {
+                        "cycle": 1,
+                        "phase": "theorem_stating",
+                        "build": {"ok": True},
+                        "syntax_checks": [{"ok": True}, {"ok": True}],
+                        "sorry_policy": {"disallowed_entries": [{"path": "repo/PaperTheorems.lean", "line": 1}]},
+                        "sorries": {"count": 1},
+                        "axioms": {"unapproved": []},
+                        "git": {"head": "statement-head"},
+                    },
+                ],
+            )
+
+        self.assertEqual(state["phase"], "theorem_stating")
+        self.assertEqual(state["last_transition_error"]["decision"], "ADVANCE_PHASE")
+        self.assertIn("disallowed sorrys", state["last_transition_error"]["error"])
+
+    def test_main_full_mode_rejects_invalid_worker_frontier_artifact(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="proof_formalization",
+            theorem_frontier_phase="full",
+        )
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Theorem-frontier worker update phase mismatch"):
+            self._run_main_with_mocked_bursts(
+                config,
+                state,
+                artifacts=[
+                    {
+                        "phase": "proof_formalization",
+                        "status": "NOT_STUCK",
+                        "summary_of_changes": "Stayed on the active theorem.",
+                        "current_frontier": "graph-pair RI collapse",
+                        "likely_next_step": "continue",
+                        "input_request": "",
+                    },
+                    {
+                        "phase": "planning",
+                        "active_node_id": "ri.local.graph_pair",
+                        "active_node": {
+                            "node_id": "ri.local.graph_pair",
+                            "kind": "support",
+                            "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                            "lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+                            "lean_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+                            "paper_provenance": "Paper Lemma RISI local graph-pair bound.",
+                            "closure_mode": "all_children",
+                            "blocker_cluster": "graph-pair local RI collapse",
+                            "acceptance_evidence": "Close this theorem or approved descendants.",
+                            "notes": "Primary local blocker.",
+                        },
+                        "requested_action": "CLOSE",
+                        "cone_scope": "Only local graph-pair lemmas.",
+                        "allowed_edit_paths": ["Twobites/IndependentSets.lean"],
+                        "result_summary": "Stayed on the active theorem.",
+                        "proposed_nodes": [],
+                        "proposed_edges": [],
+                        "next_candidate_ids": ["ri.local.graph_pair"],
+                        "structural_change_reason": "",
+                    },
+                ],
+                validations=[
+                    {
+                        "cycle": 1,
+                        "phase": "proof_formalization",
+                        "build": {"ok": True},
+                        "syntax_checks": [{"ok": True}, {"ok": True}],
+                        "sorry_policy": {"disallowed_entries": []},
+                        "sorries": {"count": 0},
+                        "axioms": {"unapproved": []},
+                        "git": {"head": "proof-head"},
+                    },
+                ],
+            )
+
+    def test_main_full_mode_rejects_invalid_frontier_review_artifact(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="proof_formalization",
+            theorem_frontier_phase="full",
+        )
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        active_node = supervisor.theorem_frontier_node_record(
+            {
+                "node_id": "ri.local.graph_pair",
+                "kind": "support",
+                "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                "lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+                "lean_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+                "paper_provenance": "Paper Lemma RISI local graph-pair bound.",
+                "closure_mode": "all_children",
+                "blocker_cluster": "graph-pair local RI collapse",
+                "acceptance_evidence": "Close this theorem or approved descendants.",
+                "notes": "Primary local blocker.",
+            },
+            status="active",
+            parent_ids=[],
+            child_ids=[],
+        )
+        state = {
+            "phase": "proof_formalization",
+            "cycle": 0,
+            "roles": {},
+            "review_log": [],
+            "awaiting_human_input": False,
+            "theorem_frontier": {
+                **supervisor.default_theorem_frontier_payload("full"),
+                "active_leaf_id": "ri.local.graph_pair",
+                "nodes": {"ri.local.graph_pair": active_node},
+            },
+        }
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Theorem-frontier review phase mismatch"):
+            self._run_main_with_mocked_bursts(
+                config,
+                state,
+                artifacts=[
+                    {
+                        "phase": "proof_formalization",
+                        "status": "NOT_STUCK",
+                        "summary_of_changes": "Stayed on the active theorem.",
+                        "current_frontier": "graph-pair RI collapse",
+                        "likely_next_step": "continue",
+                        "input_request": "",
+                    },
+                    {
+                        "phase": "proof_formalization",
+                        "active_node_id": "ri.local.graph_pair",
+                        "active_node": {
+                            "node_id": "ri.local.graph_pair",
+                            "kind": "support",
+                            "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                            "lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+                            "lean_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+                            "paper_provenance": "Paper Lemma RISI local graph-pair bound.",
+                            "closure_mode": "all_children",
+                            "blocker_cluster": "graph-pair local RI collapse",
+                            "acceptance_evidence": "Close this theorem or approved descendants.",
+                            "notes": "Primary local blocker.",
+                        },
+                        "requested_action": "CLOSE",
+                        "cone_scope": "Only local graph-pair lemmas.",
+                        "allowed_edit_paths": ["Twobites/IndependentSets.lean"],
+                        "result_summary": "Stayed on the active theorem.",
+                        "proposed_nodes": [],
+                        "proposed_edges": [],
+                        "next_candidate_ids": ["ri.local.graph_pair"],
+                        "structural_change_reason": "",
+                    },
+                    {
+                        "phase": "proof_formalization",
+                        "decision": "CONTINUE",
+                        "confidence": 0.8,
+                        "reason": "Keep working the same local theorem.",
+                        "next_prompt": "Continue.",
+                    },
+                    {
+                        "phase": "planning",
+                        "active_theorem_id": "ri.local.graph_pair",
+                        "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+                        "active_theorem_lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
+                        "active_theorem_anchor": "Twobites.IndependentSets.graph_pair_bad_event_bound",
+                        "assessed_action": "CLOSE",
+                        "blocker_cluster": "graph-pair local RI collapse",
+                        "outcome": "STILL_OPEN",
+                        "next_active_theorem_id": "ri.local.graph_pair",
+                        "cone_purity": "HIGH",
+                        "open_hypotheses": ["Close the local graph-pair theorem."],
+                        "justification": "Still the main blocker.",
+                    },
+                ],
+                validations=[
+                    {
+                        "cycle": 1,
+                        "phase": "proof_formalization",
+                        "build": {"ok": True},
+                        "syntax_checks": [{"ok": True}, {"ok": True}],
+                        "sorry_policy": {"disallowed_entries": []},
+                        "sorries": {"count": 0},
+                        "axioms": {"unapproved": []},
+                        "git": {"head": "proof-head"},
+                    },
+                ],
+            )
+
     def test_main_phase0_records_theorem_frontier_artifacts_and_state(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(
@@ -3248,6 +3868,7 @@ class WorkflowTests(SupervisorTestCase):
         }
         worker_frontier = {
             "phase": "proof_formalization",
+            "active_node_id": "paper.main",
             "active_node": {
                 "node_id": "paper.main",
                 "kind": "paper",
@@ -3675,6 +4296,18 @@ class WorkflowTests(SupervisorTestCase):
         supervisor.ensure_repo_files(config, "planning")
         self.assertTrue((repo_path / "PLAN.md").exists())
 
+    def test_ensure_repo_files_writes_paper_main_results_manifest_stub_in_full_theorem_stating(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase="theorem_stating", theorem_frontier_phase="full")
+
+        supervisor.ensure_repo_files(config, "theorem_stating")
+
+        manifest = json.loads(supervisor.paper_main_results_manifest_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["phase"], "theorem_stating")
+        self.assertEqual(manifest["initial_active_node_id"], "paper.main")
+        self.assertEqual(len(manifest["main_results"]), 1)
+        self.assertEqual(manifest["main_results"][0]["node_id"], "paper.main")
+
     def test_run_validation_flags_unapproved_axioms_and_disallowed_sorries(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path, start_phase="proof_formalization")
@@ -3698,6 +4331,53 @@ class WorkflowTests(SupervisorTestCase):
         self.assertFalse(summary["policy_ok"])
         self.assertTrue(summary["axioms"]["unapproved"])
         self.assertTrue(summary["sorry_policy"]["disallowed_entries"])
+
+    def test_validation_sorry_policy_allows_module_layout_paper_theorems_file(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, start_phase="theorem_stating")
+        (repo_path / "PaperDefinitions.lean").write_text("def rootDef : Nat := 0\n", encoding="utf-8")
+        (repo_path / "PaperTheorems.lean").write_text("import Repo.PaperTheorems\n", encoding="utf-8")
+        (repo_path / "Repo").mkdir(exist_ok=True)
+        (repo_path / "Repo" / "PaperTheorems.lean").write_text(
+            "theorem stated : True := by\n  sorry\n",
+            encoding="utf-8",
+        )
+
+        summary = supervisor.run_validation(config, "theorem_stating", 1)
+
+        allowed = summary["sorry_policy"]["allowed_files"]
+        self.assertIn("repo/PaperTheorems.lean", allowed)
+        self.assertIn("repo/Repo/PaperTheorems.lean", allowed)
+        self.assertEqual(summary["sorry_policy"]["disallowed_entries"], [])
+
+    def test_run_validation_flags_theorem_stating_edits_outside_statement_file_cone(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(
+            repo_path,
+            start_phase="theorem_stating",
+            theorem_frontier_phase="off",
+            git_remote_url="git@example.com:test/repo.git",
+        )
+        self.git(repo_path, "init", "-b", "main")
+        self.git(repo_path, "config", "user.name", "Test User")
+        self.git(repo_path, "config", "user.email", "test@example.com")
+        (repo_path / "PaperDefinitions.lean").write_text("def paperDef : Nat := 0\n", encoding="utf-8")
+        (repo_path / "PaperTheorems.lean").write_text("theorem paperStmt : True := by\n  trivial\n", encoding="utf-8")
+        (repo_path / "Support.lean").write_text("def helper : Nat := 0\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "init theorem stating files")
+        previous_head = self.git(repo_path, "rev-parse", "HEAD").stdout.strip()
+
+        (repo_path / "Support.lean").write_text("def helper : Nat := 1\n", encoding="utf-8")
+
+        summary = supervisor.run_validation(
+            config,
+            "theorem_stating",
+            2,
+            previous_validation={"git": {"head": previous_head}},
+        )
+
+        self.assertIn("Support.lean", summary["theorem_stating_edit_policy"]["disallowed_changed_lean_files"])
 
     def test_cleanup_phase_shares_proof_sorry_policy(self) -> None:
         repo_path = self.make_repo()
@@ -4251,6 +4931,7 @@ class TheoremFrontierTests(SupervisorTestCase):
     def full_worker_update(self, **overrides: object) -> dict:
         payload = {
             "phase": "proof_formalization",
+            "active_node_id": "ri.local.graph_pair",
             "active_node": self.full_node(),
             "requested_action": "CLOSE",
             "cone_scope": "Only the active graph-pair theorem and its immediate mechanical support lemmas.",
@@ -4262,6 +4943,8 @@ class TheoremFrontierTests(SupervisorTestCase):
             "structural_change_reason": "",
         }
         payload.update(overrides)
+        if "active_node" in overrides and "active_node_id" not in overrides and isinstance(payload.get("active_node"), dict):
+            payload["active_node_id"] = payload["active_node"]["node_id"]
         return payload
 
     def full_frontier_review(self, **overrides: object) -> dict:
@@ -4446,7 +5129,8 @@ class TheoremFrontierTests(SupervisorTestCase):
         )
 
         self.assertIn("authoritative theorem-frontier DAG", prompt)
-        self.assertIn('"active_node": {', prompt)
+        self.assertIn('"active_node_id": "stable theorem node id"', prompt)
+        self.assertIn('exact node object only if `active_node_id` is not already authoritative', prompt)
         self.assertIn('"allowed_edit_paths": ["repo-relative .lean files allowed inside that cone for this burst"]', prompt)
         self.assertIn('"proposed_nodes": [{ exact node objects, if any }]', prompt)
         self.assertIn("active cone", prompt)
@@ -4542,8 +5226,30 @@ class TheoremFrontierTests(SupervisorTestCase):
             supervisor.validate_theorem_frontier_worker_update_full(
                 "proof_formalization",
                 self.full_worker_update(
+                    active_node_id="ri.local.graph_pair",
                     active_node=self.full_node(lean_statement=""),
                 ),
+            )
+
+    def test_validate_full_worker_update_accepts_known_node_by_id_only(self) -> None:
+        result = supervisor.validate_theorem_frontier_worker_update_full(
+            "proof_formalization",
+            self.full_worker_update(active_node=None),
+        )
+        self.assertEqual(result["active_node_id"], "ri.local.graph_pair")
+        self.assertIsNone(result["active_node"])
+
+    def test_validate_full_worker_update_accepts_legacy_active_node_only_shape(self) -> None:
+        legacy = self.full_worker_update()
+        legacy.pop("active_node_id")
+        result = supervisor.validate_theorem_frontier_worker_update_full("proof_formalization", legacy)
+        self.assertEqual(result["active_node_id"], "ri.local.graph_pair")
+
+    def test_validate_full_worker_update_rejects_phase_mismatch(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "phase mismatch"):
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                self.full_worker_update(phase="planning"),
             )
 
     def test_validate_full_worker_update_requires_allowed_edit_paths(self) -> None:
@@ -4566,6 +5272,22 @@ class TheoremFrontierTests(SupervisorTestCase):
                 "proof_formalization",
                 self.paper_verifier_review(classification="wrapper_progress"),
             )
+
+    def test_validate_full_frontier_review_rejects_phase_mismatch(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "phase mismatch"):
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(phase="planning"),
+            )
+
+    def test_validate_full_frontier_review_accepts_id_only_shape(self) -> None:
+        review = self.full_frontier_review()
+        review.pop("active_theorem_nl_statement")
+        review.pop("active_theorem_lean_statement")
+        review.pop("active_theorem_anchor")
+        result = supervisor.validate_theorem_frontier_review_full("proof_formalization", review)
+        self.assertEqual(result["active_theorem_id"], "ri.local.graph_pair")
+        self.assertEqual(result["active_theorem_nl_statement"], "")
 
     def test_validate_full_worker_update_accepts_proposed_edges_referencing_existing_nodes(self) -> None:
         # Proposed edges may reference nodes already in the DAG (not just active/proposed).
@@ -4869,7 +5591,7 @@ class TheoremFrontierTests(SupervisorTestCase):
                 cycle=11,
             )
 
-    def test_update_theorem_frontier_full_state_rejects_mutating_existing_node(self) -> None:
+    def test_update_theorem_frontier_full_state_ignores_echo_drift_for_existing_node(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path, theorem_frontier_phase="full")
         supervisor.ensure_repo_files(config, "proof_formalization")
@@ -4897,27 +5619,32 @@ class TheoremFrontierTests(SupervisorTestCase):
             cycle=11,
         )
 
-        with self.assertRaisesRegex(supervisor.SupervisorError, "immutable"):
-            supervisor.update_theorem_frontier_full_state(
-                config,
-                state,
-                self.full_worker_update(
-                    active_node=self.full_node(
-                        "ri.local.graph_pair",
-                        lean_statement="theorem altered_statement : False := by trivial",
-                        natural_language_statement="Altered statement",
-                    ),
+        payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                active_node=self.full_node(
+                    "ri.local.graph_pair",
+                    lean_statement="theorem altered_statement : False := by trivial",
+                    natural_language_statement="Altered statement",
                 ),
-                supervisor.validate_theorem_frontier_review_full(
-                    "proof_formalization",
-                    self.full_frontier_review(
-                        active_theorem_lean_statement="theorem altered_statement : False := by trivial",
-                        active_theorem_nl_statement="Altered statement",
-                    ),
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    active_theorem_lean_statement="theorem altered_statement : False := by trivial",
+                    active_theorem_nl_statement="Altered statement",
                 ),
-                None,
-                cycle=12,
-            )
+            ),
+            None,
+            cycle=12,
+        )
+        self.assertEqual(
+            payload["nodes"]["ri.local.graph_pair"]["lean_statement"],
+            "theorem ri_local_graph_pair : True := by trivial",
+        )
+        warnings_text = (config.state_dir / "logs" / "supervisor_warnings.jsonl").read_text(encoding="utf-8")
+        self.assertIn("frontier_active_node_echo_drift", warnings_text)
 
     def test_update_theorem_frontier_full_state_rejects_closed_node_as_next_active(self) -> None:
         repo_path = self.make_repo()

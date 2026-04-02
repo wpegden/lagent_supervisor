@@ -220,8 +220,11 @@ Experimental theorem-frontier rollout:
 - In full mode, a node cannot enter the authoritative DAG without paper-verifier approval, and a node marked `CLOSED` cannot be reactivated in the same review step.
 - In full mode, `approved_node_ids` / `approved_edges` are enforced exactly: only the paper-verifier-approved subset of a proposed structural edit is admitted into the authoritative DAG.
 - In full mode, `theorem_stating` must also write `.agent-supervisor/paper_main_results.json`, a machine-readable manifest of the paper's main results. The `theorem_stating -> proof_formalization` transition validates that manifest and seeds the initial theorem-frontier DAG from it, so proof formalization starts with all main paper results already present as authoritative paper nodes.
+- When full-mode `theorem_stating` begins and the manifest is absent, the supervisor writes a JSON stub with the exact required top-level schema so the worker can edit a concrete template instead of reconstructing the format from prose.
+- During `theorem_stating`, validation enforces a statement-file cone for Lean edits: only `PaperDefinitions.lean` / `PaperTheorems.lean` files, including module-layout variants with those exact filenames, may change.
 - In full mode, branching artifacts are anchored to the current theorem-frontier active leaf via `frontier_anchor_node_id`.
 - In full mode, a new child branch inherits the authoritative DAG itself but resets local frontier-aging/escalation pressure (`active_leaf_age`, blocker age, failed-close streak, cone-purity streak, escalation, and last frontier artifacts), so fresh branches do not inherit parent stagnation pressure.
+- When a reviewer requests `ADVANCE_PHASE`/`DONE` but validation blocks the transition, the supervisor records `last_transition_error` in `state.json` and emits a `transition_blocked` warning before exiting, so restart/debug tooling can surface the real blocker directly.
 - Branch monitoring snapshots now include theorem-frontier summaries for each child branch: current active leaf, blocker cluster, open-hypothesis count, frontier ages, and escalation state.
 - Branching guidance changes under the theorem-frontier model: branch only when there are genuinely competing routes for the same anchored theorem node or its subtree, not merely multiple wrapper-building variants of the same blocker.
 - The detailed non-live rollout and testing plan is documented in [`theorem_frontier_testing_strategy.md`](theorem_frontier_testing_strategy.md).
@@ -382,6 +385,7 @@ The shipped example configs now default to the strongest documented settings for
 - **Claude Code**: `--model opus --effort max`
 - **Codex CLI**: `--model gpt-5.4 --config model_reasoning_effort="xhigh"`
 - **Gemini CLI**: `--model gemini-3.1-pro-preview`
+  - Optional: add `"fallback_model": "gemini-2.5-flash"` under `worker` and/or `reviewer` to have the supervisor retry the same burst immediately on Gemini `429`/rate-limit/capacity failures with the fallback model.
 
 For Gemini, the current Gemini 3 docs say the default thinking level is already `high`, so the package does not add a separate effort flag for Gemini 3.1 Pro.
 
@@ -443,7 +447,7 @@ On startup, the supervisor installs it to the current user's `~/.codex/skills/le
 
 ### Gemini CLI
 
-The supervisor uses `--prompt` for initial bursts and `--resume latest --prompt` for later bursts, with `--approval-mode=yolo`. The example configs pin Gemini to `gemini-3.1-pro-preview`; Gemini 3 models already default to high thinking, so no extra effort flag is added.
+The supervisor uses `--prompt` for initial bursts and `--resume latest --prompt` for later bursts, with `--approval-mode=yolo`. The example configs pin Gemini to `gemini-3.1-pro-preview`; Gemini 3 models already default to high thinking, so no extra effort flag is added. If a Gemini role config also sets `fallback_model`, the supervisor will retry that burst immediately with the fallback model when the primary Gemini burst exits on a `429`/rate-limit/capacity error.
 
 The repo now carries a packaged Gemini context file at `provider_context/gemini/GEMINI.md`.
 On startup, the supervisor installs it to the current user's `~/.gemini/GEMINI.md` and into each Gemini role scope as `GEMINI.md`.
