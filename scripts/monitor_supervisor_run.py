@@ -28,7 +28,7 @@ def tmux_has_session(name: str) -> bool:
 
 def tmux_pane_field(name: str, field: str) -> str:
     proc = subprocess.run(
-        ["tmux", "list-panes", "-t", f"{name}:supervisor", "-F", field],
+        ["tmux", "list-panes", "-t", name, "-F", field],
         text=True,
         capture_output=True,
         check=False,

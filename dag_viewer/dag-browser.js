@@ -58,6 +58,8 @@ var EDGE_COLORS = {
 };
 var DPR = window.devicePixelRatio || 1;
 var NODE_W = 180, NODE_H = 54;
+var EDGE_STUB_Y = 16;
+var EDGE_LANE_X = 10;
 
 // ========== Init ==========
 function init() {
@@ -160,6 +162,7 @@ function reconstructAtIndex(index) {
     return {
       nodes: state.frontier.nodes || {},
       edges: state.frontier.edges || [],
+      activeEdgeId: state.frontier.active_edge_id,
       activeLeafId: state.frontier.active_leaf_id,
       metrics: state.frontier.metrics || {},
       escalation: state.frontier.escalation || {},
@@ -173,6 +176,7 @@ function reconstructAtIndex(index) {
 
   var nodes = {};
   var edges = [];
+  var activeEdgeId = null;
   var activeLeafId = null;
   var metrics = {};
   var escalation = {};
@@ -186,6 +190,7 @@ function reconstructAtIndex(index) {
     if (entry.type === "seed") {
       nodes = deepCopy(entry.nodes || {});
       edges = deepCopy(entry.edges || []);
+      activeEdgeId = entry.active_edge_id;
       activeLeafId = entry.active_leaf_id;
       metrics = deepCopy(entry.metrics || {});
       escalation = {};
@@ -209,9 +214,11 @@ function reconstructAtIndex(index) {
       // Add edges
       if (entry.edges_added) {
         for (var ei = 0; ei < entry.edges_added.length; ei++) {
-          edges.push(deepCopy(entry.edges_added[ei]));
+          upsertEdge(edges, entry.edges_added[ei]);
         }
       }
+      applyEdgeStatuses(edges, entry.edge_statuses || {});
+      activeEdgeId = entry.active_edge_id;
       activeLeafId = entry.active_leaf_id;
       metrics = deepCopy(entry.metrics || metrics);
       escalation = deepCopy(entry.escalation || escalation);
@@ -240,14 +247,105 @@ function reconstructAtIndex(index) {
     }
     // Use frontier edges at latest
     if (state.frontier.edges) edges = deepCopy(state.frontier.edges);
+    activeEdgeId = state.frontier.active_edge_id || activeEdgeId;
     activeLeafId = state.frontier.active_leaf_id || activeLeafId;
     metrics = state.frontier.metrics || metrics;
     escalation = state.frontier.escalation || escalation;
   }
 
-  return { nodes: nodes, edges: edges, activeLeafId: activeLeafId,
+  applyEffectiveNodeStatuses(nodes, edges);
+
+  return { nodes: nodes, edges: edges, activeEdgeId: activeEdgeId, activeLeafId: activeLeafId,
            metrics: metrics, escalation: escalation,
            directive: directive, cycle: cycle, outcome: outcome };
+}
+
+function canonicalEdgeId(edge) {
+  if (!edge) return "";
+  if (edge.edge_id) return String(edge.edge_id);
+  if (!edge.parent || !edge.child || !edge.edge_type) return "";
+  return String(edge.parent) + "|" + String(edge.edge_type) + "|" + String(edge.child);
+}
+
+function upsertEdge(edges, edge) {
+  var copy = deepCopy(edge);
+  var edgeId = canonicalEdgeId(copy);
+  if (edgeId) copy.edge_id = edgeId;
+  for (var i = 0; i < edges.length; i++) {
+    if (canonicalEdgeId(edges[i]) === edgeId && edgeId) {
+      edges[i] = copy;
+      return;
+    }
+  }
+  edges.push(copy);
+}
+
+function applyEdgeStatuses(edges, edgeStatuses) {
+  if (!edgeStatuses) return;
+  for (var i = 0; i < edges.length; i++) {
+    var edgeId = canonicalEdgeId(edges[i]);
+    if (edgeId && Object.prototype.hasOwnProperty.call(edgeStatuses, edgeId)) {
+      edges[i].status = edgeStatuses[edgeId];
+    }
+  }
+}
+
+function outgoingDependencyEdges(nodes, edges, nodeId) {
+  var result = [];
+  for (var i = 0; i < edges.length; i++) {
+    var edge = edges[i];
+    if (!edge || edge.parent !== nodeId) continue;
+    if (edge.edge_type === "replacement" || edge.status === "replaced") continue;
+    if (!nodes[edge.child]) continue;
+    result.push(edge);
+  }
+  return result;
+}
+
+function effectiveNodeStatus(nodes, edges, nodeId, memo, visiting) {
+  if (!nodes[nodeId]) return "open";
+  if (Object.prototype.hasOwnProperty.call(memo, nodeId)) return memo[nodeId];
+  var raw = String(nodes[nodeId].status || "open");
+  if (raw === "refuted" || raw === "replaced") {
+    memo[nodeId] = raw;
+    return raw;
+  }
+  if (visiting[nodeId]) {
+    return raw === "active" || raw === "frozen" || raw === "proposed" ? raw : "open";
+  }
+  visiting[nodeId] = true;
+  var deps = outgoingDependencyEdges(nodes, edges, nodeId);
+  var closedDeps = [];
+  for (var i = 0; i < deps.length; i++) {
+    var edge = deps[i];
+    if (edge.status === "closed" && effectiveNodeStatus(nodes, edges, edge.child, memo, visiting) === "closed") {
+      closedDeps.push(edge);
+    }
+  }
+  var closureMode = nodes[nodeId].closure_mode;
+  var proved = false;
+  if (closureMode === "leaf") {
+    proved = deps.length === 0 && raw === "closed";
+  } else if (closureMode === "all_children" || closureMode === "all_cases") {
+    proved = deps.length > 0 && closedDeps.length === deps.length;
+  } else if (closureMode === "any_child") {
+    proved = closedDeps.length > 0;
+  }
+  delete visiting[nodeId];
+  var effective = proved ? "closed" : ((raw === "active" || raw === "frozen" || raw === "proposed") ? raw : "open");
+  memo[nodeId] = effective;
+  return effective;
+}
+
+function applyEffectiveNodeStatuses(nodes, edges) {
+  var memo = {};
+  var visiting = {};
+  var ids = Object.keys(nodes || {});
+  for (var i = 0; i < ids.length; i++) {
+    var node = nodes[ids[i]];
+    if (!node) continue;
+    node.effective_status = effectiveNodeStatus(nodes, edges, ids[i], memo, visiting);
+  }
 }
 
 function deepCopy(obj) {
@@ -355,9 +453,37 @@ function renderDAG() {
   $ctx.scale(z, z);
 
   var searchLower = state.searchQuery.toLowerCase();
+  var edges = dag.edges || [];
+  var outgoingOrder = {};
+  var incomingOrder = {};
+  var outgoingCount = {};
+  var incomingCount = {};
+
+  edges.forEach(function (edge) {
+    if (!edge || !edge.parent || !edge.child) return;
+    if (!outgoingOrder[edge.parent]) outgoingOrder[edge.parent] = [];
+    if (!incomingOrder[edge.child]) incomingOrder[edge.child] = [];
+    outgoingOrder[edge.parent].push(edge.child);
+    incomingOrder[edge.child].push(edge.parent);
+  });
+  Object.keys(outgoingOrder).forEach(function (parentId) {
+    outgoingOrder[parentId].sort(function (a, b) {
+      var ax = positions[a] ? positions[a].x : 0;
+      var bx = positions[b] ? positions[b].x : 0;
+      return ax - bx;
+    });
+    outgoingCount[parentId] = outgoingOrder[parentId].length;
+  });
+  Object.keys(incomingOrder).forEach(function (childId) {
+    incomingOrder[childId].sort(function (a, b) {
+      var ax = positions[a] ? positions[a].x : 0;
+      var bx = positions[b] ? positions[b].x : 0;
+      return ax - bx;
+    });
+    incomingCount[childId] = incomingOrder[childId].length;
+  });
 
   // Draw edges
-  var edges = dag.edges || [];
   for (var i = 0; i < edges.length; i++) {
     var edge = edges[i];
     var from = positions[edge.parent];
@@ -368,12 +494,22 @@ function renderDAG() {
     if (!parentNode || !childNode) continue;
     if (isNodeHidden(parentNode) && isNodeHidden(childNode)) continue;
 
-    var edgeColor = classifyEdgeColor(parentNode, childNode);
+    var edgeColor = classifyEdgeColor(edge, parentNode, childNode);
+    var outIdx = outgoingOrder[edge.parent] ? outgoingOrder[edge.parent].indexOf(edge.child) : 0;
+    var inIdx = incomingOrder[edge.child] ? incomingOrder[edge.child].indexOf(edge.parent) : 0;
+    var fromLane = centeredLaneOffset(outIdx, outgoingCount[edge.parent] || 1);
+    var toLane = centeredLaneOffset(inIdx, incomingCount[edge.child] || 1);
+    var startX = from.x + fromLane * EDGE_LANE_X;
+    var endX = to.x + toLane * EDGE_LANE_X;
+    var startY = from.y + NODE_H / 2;
+    var endY = to.y - NODE_H / 2;
+    var bendY = Math.max(startY + EDGE_STUB_Y, (startY + endY) / 2);
+
     $ctx.beginPath();
-    $ctx.moveTo(from.x, from.y + NODE_H / 2);
-    // Bezier curve for the edge
-    var midY = (from.y + NODE_H / 2 + to.y - NODE_H / 2) / 2;
-    $ctx.bezierCurveTo(from.x, midY, to.x, midY, to.x, to.y - NODE_H / 2);
+    $ctx.moveTo(startX, startY);
+    $ctx.lineTo(startX, bendY);
+    $ctx.lineTo(endX, bendY);
+    $ctx.lineTo(endX, endY);
     $ctx.strokeStyle = edgeColor;
     $ctx.lineWidth = edgeColor === EDGE_COLORS.proved ? 2.5 : 1.5;
     if (parentNode.status === "refuted" || parentNode.status === "replaced" ||
@@ -386,7 +522,7 @@ function renderDAG() {
     $ctx.setLineDash([]);
 
     // Arrow head
-    drawArrowHead($ctx, to.x, to.y - NODE_H / 2, edgeColor);
+    drawArrowHead($ctx, endX, endY, edgeColor);
   }
 
   // Draw nodes
@@ -397,7 +533,8 @@ function renderDAG() {
     var pos = positions[nid];
     if (!pos || isNodeHidden(node)) continue;
 
-    var colors = NODE_COLORS[node.status] || NODE_COLORS.open;
+    var displayStatus = nodeDisplayStatus(node);
+    var colors = NODE_COLORS[displayStatus] || NODE_COLORS.open;
     var bw = KIND_BORDER_WIDTH[node.kind] || 1.5;
     var isActive = nid === dag.activeLeafId;
     var isSelected = nid === state.selectedNodeId;
@@ -448,7 +585,7 @@ function renderDAG() {
     $ctx.fillText(kindLabel, pos.x, pos.y + 8);
 
     // Status dot
-    var dotColor = (NODE_COLORS[node.status] || NODE_COLORS.open).border;
+    var dotColor = (NODE_COLORS[displayStatus] || NODE_COLORS.open).border;
     $ctx.beginPath();
     $ctx.arc(x + NODE_W - 10, y + 10, 4, 0, Math.PI * 2);
     $ctx.fillStyle = dotColor;
@@ -460,19 +597,29 @@ function renderDAG() {
   $ctx.restore();
 }
 
-function classifyEdgeColor(parentNode, childNode) {
-  if (parentNode.status === "refuted" || parentNode.status === "replaced" ||
-      childNode.status === "refuted" || childNode.status === "replaced") {
+function centeredLaneOffset(index, count) {
+  if (!count || count <= 1) return 0;
+  return index - (count - 1) / 2;
+}
+
+function nodeDisplayStatus(node) {
+  return (node && (node.effective_status || node.status)) || "open";
+}
+
+function classifyEdgeColor(edge, parentNode, childNode) {
+  var edgeStatus = edge && edge.status ? String(edge.status) : "";
+  var parentStatus = nodeDisplayStatus(parentNode);
+  var childStatus = nodeDisplayStatus(childNode);
+  if (edgeStatus === "refuted" || edgeStatus === "replaced" ||
+      parentStatus === "refuted" || parentStatus === "replaced" ||
+      childStatus === "refuted" || childStatus === "replaced") {
     return EDGE_COLORS.dead;
   }
-  if (parentNode.status === "closed" && childNode.status === "closed") {
+  if (edgeStatus === "closed") {
     return EDGE_COLORS.proved;
   }
-  if (childNode.status === "active" || parentNode.status === "active") {
+  if (edgeStatus === "active" || childStatus === "active" || parentStatus === "active") {
     return EDGE_COLORS.active;
-  }
-  if (parentNode.status === "closed") {
-    return EDGE_COLORS.frontier;
   }
   return EDGE_COLORS.unresolved;
 }
@@ -502,7 +649,7 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 
 function isNodeHidden(node) {
-  return state.hiddenStatuses.has(node.status);
+  return state.hiddenStatuses.has(nodeDisplayStatus(node));
 }
 
 // ========== Minimap ==========
@@ -526,7 +673,7 @@ function renderMinimap() {
     var pos = positions[ids[i]];
     var node = dag.nodes[ids[i]];
     if (!pos || !node) continue;
-    var colors = NODE_COLORS[node.status] || NODE_COLORS.open;
+    var colors = NODE_COLORS[nodeDisplayStatus(node)] || NODE_COLORS.open;
     $miniCtx.fillStyle = colors.border;
     $miniCtx.fillRect(
       ox + pos.x * scale - 2,
@@ -765,9 +912,18 @@ function updateMetrics() {
   var closed = m.closed_nodes_count || 0;
   var total = dag.nodes ? Object.keys(dag.nodes).length : 0;
   chips.push(chip("proved", closed + "/" + total));
+  var closedEdges = m.closed_edges_count || 0;
+  var totalEdges = dag.edges ? dag.edges.length : 0;
+  chips.push(chip("edges", closedEdges + "/" + totalEdges));
 
   if (m.paper_nodes_closed != null) {
     chips.push(chip("paper", m.paper_nodes_closed + " paper"));
+  }
+  if (dag.activeEdgeId) {
+    chips.push(chip("active edge", dag.activeEdgeId));
+  }
+  if (m.active_edge_age != null) {
+    chips.push(chip("edge age", m.active_edge_age, m.active_edge_age >= 5 ? "warn" : ""));
   }
   if (m.active_leaf_age != null) {
     chips.push(chip("leaf age", m.active_leaf_age, m.active_leaf_age >= 5 ? "warn" : ""));
@@ -795,11 +951,15 @@ function showDetail(nodeId) {
   var dag = state.reconstructed;
   if (!dag || !dag.nodes[nodeId]) { hideDetail(); return; }
   var node = dag.nodes[nodeId];
+  var displayStatus = nodeDisplayStatus(node);
   var html = '';
   html += '<div class="detail-section">';
-  html += '<span class="detail-status-badge ' + (node.status || 'open') + '">' + (node.status || 'unknown') + '</span>';
+  html += '<span class="detail-status-badge ' + displayStatus + '">' + displayStatus + '</span>';
   html += ' <span style="color:#8b949e;font-size:11px">' + (node.kind || '').replace(/_/g, ' ') + '</span>';
   html += '</div>';
+  if (node.status && node.status !== displayStatus) {
+    html += section("Workflow Status", esc(node.status));
+  }
 
   if (node.display_label) {
     html += section("Label", '<b>' + esc(node.display_label) + '</b>');
@@ -830,6 +990,16 @@ function showDetail(nodeId) {
   }
   if (node.notes) {
     html += section("Notes", esc(node.notes));
+  }
+  var outgoing = [];
+  for (var i = 0; i < (dag.edges || []).length; i++) {
+    var edge = dag.edges[i];
+    if (edge && edge.parent === nodeId && edge.edge_type !== "replacement" && edge.status !== "replaced") {
+      outgoing.push((edge.status || "open") + " · " + (edge.edge_type || "?") + " · " + (edge.child || "?"));
+    }
+  }
+  if (outgoing.length > 0) {
+    html += section("Outgoing Edges", esc(outgoing.join("\n")));
   }
 
   // Show node history from history entries

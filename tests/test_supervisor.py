@@ -145,8 +145,8 @@ class CommandTests(SupervisorTestCase):
         prompt = supervisor.build_worker_prompt(config, {"phase": "theorem_stating"}, "theorem_stating", True)
 
         self.assertIn("paper_main_results.json", prompt)
-        self.assertIn("machine-readable main-results manifest", prompt)
-        self.assertIn("initial_active_node_id", prompt)
+        self.assertIn("machine-readable coarse paper-DAG manifest", prompt)
+        self.assertIn("initial_active_edge_id", prompt)
 
     def test_theorem_stating_reviewer_prompt_mentions_main_results_manifest(self) -> None:
         repo_path = self.make_repo()
@@ -163,8 +163,8 @@ class CommandTests(SupervisorTestCase):
         )
 
         self.assertIn("paper_main_results.json", prompt)
-        self.assertIn("includes all main paper results", prompt)
-        self.assertIn("excludes support-only statements", prompt)
+        self.assertIn("coarse paper-DAG manifest", prompt)
+        self.assertIn("initial active obligation edge", prompt)
 
     def test_sanitize_tmux_session_name_replaces_dots(self) -> None:
         self.assertEqual(
@@ -1163,6 +1163,7 @@ class PolicyTests(SupervisorTestCase):
         state = {
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "current": {
                     "blocker_cluster": "graph-pair local RI collapse",
@@ -1189,7 +1190,7 @@ class PolicyTests(SupervisorTestCase):
 
         question = supervisor.branch_selection_question_for_state(state)
 
-        self.assertIn("`ri.local.graph_pair`", question)
+        self.assertIn("`ri.local.graph_pair|direct_proof|ri.local.graph_pair`", question)
         self.assertIn("`Twobites.IndependentSets.ri_local_graph_pair`", question)
         self.assertIn("finish formalizing the whole paper", question)
 
@@ -1198,10 +1199,11 @@ class PolicyTests(SupervisorTestCase):
         config = self.make_config(repo_path, theorem_frontier_phase="full")
         state = {
             "review_log": [],
-            "theorem_frontier": {
-                **supervisor.default_theorem_frontier_payload("full"),
-                "active_leaf_id": "ri.local.graph_pair",
-                "nodes": {
+                "theorem_frontier": {
+                    **supervisor.default_theorem_frontier_payload("full"),
+                    "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
+                    "active_leaf_id": "ri.local.graph_pair",
+                    "nodes": {
                     "ri.local.graph_pair": {
                         "node_id": "ri.local.graph_pair",
                         "kind": "support",
@@ -1273,6 +1275,7 @@ class PolicyTests(SupervisorTestCase):
             "review_log": [],
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "nodes": {
                     "ri.local.graph_pair": {
@@ -1433,6 +1436,7 @@ class PolicyTests(SupervisorTestCase):
         state = {
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "nodes": {
                     "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
@@ -1491,6 +1495,7 @@ class PolicyTests(SupervisorTestCase):
         state = {
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "nodes": {
                     "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
@@ -2208,8 +2213,10 @@ class PolicyTests(SupervisorTestCase):
             "last_theorem_frontier_worker_update": {"phase": "proof_formalization"},
             "last_theorem_frontier_review": {"phase": "proof_formalization"},
             "last_theorem_frontier_paper_review": {"decision": "APPROVE"},
+            "last_theorem_frontier_nl_proof_review": {"decision": "APPROVE"},
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "current_action": "CLOSE",
                 "current": {
@@ -2280,6 +2287,7 @@ class PolicyTests(SupervisorTestCase):
         self.assertIsNone(child_state["last_theorem_frontier_worker_update"])
         self.assertIsNone(child_state["last_theorem_frontier_review"])
         self.assertIsNone(child_state["last_theorem_frontier_paper_review"])
+        self.assertIsNone(child_state["last_theorem_frontier_nl_proof_review"])
         self.assertEqual(child_state["theorem_frontier"]["metrics"]["active_leaf_age"], 0)
         self.assertEqual(child_state["theorem_frontier"]["metrics"]["blocker_cluster_age"], 0)
         self.assertEqual(child_state["theorem_frontier"]["metrics"]["failed_close_attempts"], 0)
@@ -2313,11 +2321,14 @@ class PolicyTests(SupervisorTestCase):
             },
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "current_action": "CLOSE",
                 "current": {
                     "cycle": 12,
+                    "reviewed_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                     "reviewed_node_id": "ri.local.graph_pair",
+                    "next_active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                     "next_active_leaf_id": "ri.local.graph_pair",
                     "requested_action": "CLOSE",
                     "assessed_action": "CLOSE",
@@ -2329,6 +2340,7 @@ class PolicyTests(SupervisorTestCase):
                     "updated_at": "2026-03-29T00:00:00-04:00",
                 },
                 "metrics": {
+                    "active_edge_age": 3,
                     "active_leaf_age": 3,
                     "blocker_cluster_age": 3,
                     "closed_nodes_count": 0,
@@ -2395,11 +2407,14 @@ class PolicyTests(SupervisorTestCase):
                 proposal,
             )
 
+        self.assertEqual(episode["frontier_anchor_edge_id"], "ri.local.graph_pair|direct_proof|ri.local.graph_pair")
         self.assertEqual(episode["frontier_anchor_node_id"], "ri.local.graph_pair")
         child_path = Path(episode["branches"][0]["worktree_path"]) / ".agent-supervisor" / "theorem_frontier.json"
         self.assertTrue(child_path.exists())
         child_payload = supervisor.JsonFile.load(child_path, {})
+        self.assertEqual(child_payload["active_edge_id"], "ri.local.graph_pair|direct_proof|ri.local.graph_pair")
         self.assertEqual(child_payload["active_leaf_id"], "ri.local.graph_pair")
+        self.assertEqual(child_payload["metrics"]["active_edge_age"], 0)
         self.assertEqual(child_payload["metrics"]["active_leaf_age"], 0)
         self.assertEqual(child_payload["metrics"]["blocker_cluster_age"], 0)
         self.assertEqual(child_payload["current"], None)
@@ -2423,11 +2438,14 @@ class PolicyTests(SupervisorTestCase):
                 "last_validation": {"git": {"head": "abc123"}},
                 "theorem_frontier": {
                     **supervisor.default_theorem_frontier_payload("full"),
+                    "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                     "active_leaf_id": "ri.local.graph_pair",
                     "current_action": "EXPAND",
                     "current": {
                         "cycle": 40,
+                        "reviewed_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                         "reviewed_node_id": "ri.local.graph_pair",
+                        "next_active_edge_id": "ri.local.child|direct_proof|ri.local.child",
                         "next_active_leaf_id": "ri.local.child",
                         "requested_action": "EXPAND",
                         "assessed_action": "EXPAND",
@@ -2439,6 +2457,7 @@ class PolicyTests(SupervisorTestCase):
                         "updated_at": "2026-03-29T00:00:00-04:00",
                     },
                     "metrics": {
+                        "active_edge_age": 1,
                         "active_leaf_age": 1,
                         "blocker_cluster_age": 3,
                         "closed_nodes_count": 0,
@@ -2488,6 +2507,7 @@ class PolicyTests(SupervisorTestCase):
         )
 
         self.assertEqual(snapshots[0]["frontier_anchor_node_id"], "ri.local.graph_pair")
+        self.assertEqual(snapshots[0]["theorem_frontier_active_edge_id"], "ri.local.graph_pair|direct_proof|ri.local.graph_pair")
         self.assertEqual(snapshots[0]["theorem_frontier_active_leaf_id"], "ri.local.graph_pair")
         self.assertEqual(snapshots[0]["theorem_frontier_open_hypotheses_count"], 2)
         self.assertEqual(snapshots[0]["theorem_frontier_blocker_cluster"], "graph-pair local RI collapse")
@@ -3136,6 +3156,108 @@ class BurstRetryTests(SupervisorTestCase):
             )
         )
 
+    def test_burst_hit_productive_local_failure_detects_lean_build_errors(self) -> None:
+        repo_path = self.make_repo()
+        log_path = repo_path / "lean-failed.log"
+        log_path.write_text(
+            "Building Twobites.IndependentSets\n"
+            "error: Twobites/IndependentSets.lean:494:6: Type mismatch\n",
+            encoding="utf-8",
+        )
+
+        self.assertTrue(
+            supervisor.burst_hit_productive_local_failure(
+                {
+                    "captured_output": "",
+                    "per_cycle_log": log_path,
+                    "exit_code": 1,
+                }
+            )
+        )
+
+    def test_productive_local_failure_does_not_count_as_budget_error(self) -> None:
+        repo_path = self.make_repo()
+        log_path = repo_path / "lean-failed.log"
+        log_path.write_text(
+            "Building Twobites.IndependentSets\n"
+            "error: Twobites/IndependentSets.lean:494:6: Type mismatch\n",
+            encoding="utf-8",
+        )
+
+        self.assertFalse(
+            supervisor.burst_hit_budget_error(
+                {
+                    "captured_output": "",
+                    "per_cycle_log": log_path,
+                    "exit_code": 1,
+                }
+            )
+        )
+
+    def test_launch_tmux_burst_with_retries_caps_delay_for_productive_local_failure(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        adapter = DummyAdapter(
+            supervisor.ProviderConfig(provider="codex", model="gpt-5.4", extra_args=[]),
+            "worker",
+            config,
+            {},
+            ["bash", "-lc", "exit 0"],
+        )
+        failed_log = repo_path / "lean-failed.log"
+        failed_log.write_text(
+            "Building Twobites.IndependentSets\n"
+            "error: Twobites/IndependentSets.lean:494:6: Type mismatch\n",
+            encoding="utf-8",
+        )
+        failed = {
+            "captured_output": "stream disconnected after local build failure",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": failed_log,
+            "exit_code": 1,
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+        succeeded = {
+            "captured_output": "ok",
+            "artifact_path": repo_path / "artifact.json",
+            "per_cycle_log": repo_path / "success.log",
+            "exit_code": 0,
+            "pane_id": "%2",
+            "window_id": "@2",
+        }
+        policy = supervisor.Policy(
+            stuck_recovery=supervisor.StuckRecoveryPolicy(),
+            branching=supervisor.BranchingPolicy(
+                evaluation_cycle_budget=config.branching.evaluation_cycle_budget,
+                poll_seconds=config.branching.poll_seconds,
+                proposal_cooldown_reviews=5,
+                replacement_min_confidence=0.8,
+            ),
+            timing=supervisor.TimingPolicy(
+                sleep_seconds=config.sleep_seconds,
+                agent_retry_delays_seconds=(3600.0, 7200.0),
+            ),
+            codex_budget_pause=supervisor.CodexBudgetPausePolicy(),
+            prompt_notes=supervisor.PromptNotesPolicy(),
+        )
+
+        with (
+            mock.patch.object(supervisor, "launch_tmux_burst", side_effect=[failed, succeeded]) as launch_mock,
+            mock.patch.object(supervisor.time, "sleep") as sleep_mock,
+        ):
+            run = supervisor.launch_tmux_burst_with_retries(
+                adapter,
+                12,
+                "prompt",
+                stage_label="worker burst",
+                policy=policy,
+            )
+
+        self.assertEqual(run, succeeded)
+        self.assertEqual(launch_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(supervisor.PRODUCTIVE_LOCAL_FAILURE_MAX_RETRY_DELAY_SECONDS)
+
     def test_budget_error_does_not_consume_normal_retry_budget(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path)
@@ -3372,7 +3494,7 @@ class WorkflowTests(SupervisorTestCase):
         config.state_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
             "phase": "theorem_stating",
-            "main_results": [
+            "nodes": [
                 {
                     "node_id": "paper.main",
                     "kind": "paper",
@@ -3398,15 +3520,23 @@ class WorkflowTests(SupervisorTestCase):
                     "notes": "Ramsey-number corollary.",
                 },
             ],
-            "dependency_edges": [
+            "edges": [
                 {
                     "parent": "paper.main2",
                     "child": "paper.main",
                     "edge_type": "reduction",
                     "justification": "The Ramsey corollary reduces to the main graph theorem.",
+                    "natural_language_proof": "The paper derives the Ramsey corollary from the main theorem plus the witness-to-Ramsey conversion.",
+                },
+                {
+                    "parent": "paper.main",
+                    "child": "paper.main",
+                    "edge_type": "direct_proof",
+                    "justification": "The main theorem itself is the first coarse obligation to attack.",
+                    "natural_language_proof": "The remaining proof of the main theorem is deferred to later proof-formalization steps starting from this explicit direct obligation.",
                 }
             ],
-            "initial_active_node_id": "paper.main",
+            "initial_active_edge_id": supervisor.theorem_frontier_edge_id("paper.main", "direct_proof", "paper.main"),
         }
         supervisor.paper_main_results_manifest_path(config).write_text(
             json.dumps(manifest),
@@ -3457,6 +3587,7 @@ class WorkflowTests(SupervisorTestCase):
         self.assertEqual(result, 0)
         self.assertEqual([entry["stage_label"] for entry in launches], ["worker burst", "reviewer burst"])
         self.assertEqual(state["phase"], "proof_formalization")
+        self.assertEqual(state["theorem_frontier"]["active_edge_id"], supervisor.theorem_frontier_edge_id("paper.main", "direct_proof", "paper.main"))
         self.assertEqual(state["theorem_frontier"]["active_leaf_id"], "paper.main")
         self.assertEqual(sorted(state["theorem_frontier"]["nodes"].keys()), ["paper.main", "paper.main2"])
         seed_events = [
@@ -3482,7 +3613,7 @@ class WorkflowTests(SupervisorTestCase):
             "awaiting_human_input": False,
         }
 
-        with self.assertRaisesRegex(supervisor.SupervisorError, "paper main-results manifest"):
+        with self.assertRaisesRegex(supervisor.SupervisorError, "paper coarse-DAG manifest"):
             self._run_main_with_mocked_bursts(
                 config,
                 state,
@@ -3602,6 +3733,7 @@ class WorkflowTests(SupervisorTestCase):
                     },
                     {
                         "phase": "planning",
+                        "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                         "active_node_id": "ri.local.graph_pair",
                         "active_node": {
                             "node_id": "ri.local.graph_pair",
@@ -3621,7 +3753,7 @@ class WorkflowTests(SupervisorTestCase):
                         "result_summary": "Stayed on the active theorem.",
                         "proposed_nodes": [],
                         "proposed_edges": [],
-                        "next_candidate_ids": ["ri.local.graph_pair"],
+                        "next_candidate_edge_ids": ["ri.local.graph_pair|direct_proof|ri.local.graph_pair"],
                         "structural_change_reason": "",
                     },
                 ],
@@ -3672,6 +3804,7 @@ class WorkflowTests(SupervisorTestCase):
             "awaiting_human_input": False,
             "theorem_frontier": {
                 **supervisor.default_theorem_frontier_payload("full"),
+                "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                 "active_leaf_id": "ri.local.graph_pair",
                 "nodes": {"ri.local.graph_pair": active_node},
             },
@@ -3692,6 +3825,7 @@ class WorkflowTests(SupervisorTestCase):
                     },
                     {
                         "phase": "proof_formalization",
+                        "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                         "active_node_id": "ri.local.graph_pair",
                         "active_node": {
                             "node_id": "ri.local.graph_pair",
@@ -3711,7 +3845,7 @@ class WorkflowTests(SupervisorTestCase):
                         "result_summary": "Stayed on the active theorem.",
                         "proposed_nodes": [],
                         "proposed_edges": [],
-                        "next_candidate_ids": ["ri.local.graph_pair"],
+                        "next_candidate_edge_ids": ["ri.local.graph_pair|direct_proof|ri.local.graph_pair"],
                         "structural_change_reason": "",
                     },
                     {
@@ -3723,6 +3857,7 @@ class WorkflowTests(SupervisorTestCase):
                     },
                     {
                         "phase": "planning",
+                        "active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                         "active_theorem_id": "ri.local.graph_pair",
                         "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
                         "active_theorem_lean_statement": "theorem graph_pair_bad_event_bound : True := by trivial",
@@ -3730,7 +3865,7 @@ class WorkflowTests(SupervisorTestCase):
                         "assessed_action": "CLOSE",
                         "blocker_cluster": "graph-pair local RI collapse",
                         "outcome": "STILL_OPEN",
-                        "next_active_theorem_id": "ri.local.graph_pair",
+                        "next_active_edge_id": "ri.local.graph_pair|direct_proof|ri.local.graph_pair",
                         "cone_purity": "HIGH",
                         "open_hypotheses": ["Close the local graph-pair theorem."],
                         "justification": "Still the main blocker.",
@@ -3868,11 +4003,13 @@ class WorkflowTests(SupervisorTestCase):
         }
         worker_frontier = {
             "phase": "proof_formalization",
+            "active_edge_id": supervisor.theorem_frontier_edge_id("paper.main", "direct_proof", "paper.main"),
             "active_node_id": "paper.main",
             "active_node": {
                 "node_id": "paper.main",
                 "kind": "paper",
                 "natural_language_statement": "The paper main theorem witness exists.",
+                "natural_language_proof": "This paper-facing theorem is discharged directly by the witness theorem established in the same cycle.",
                 "lean_statement": "theorem paper_main : True := by trivial",
                 "lean_anchor": "PaperTheorems.paper_main",
                 "paper_provenance": "Main theorem in the paper.",
@@ -3886,9 +4023,17 @@ class WorkflowTests(SupervisorTestCase):
             "allowed_edit_paths": ["PaperTheorems.lean"],
             "result_summary": "Closed the paper theorem shell.",
             "proposed_nodes": [],
-            "proposed_edges": [],
-            "next_candidate_ids": ["paper.main"],
-            "structural_change_reason": "",
+            "proposed_edges": [
+                {
+                    "parent": "paper.main",
+                    "child": "paper.main",
+                    "edge_type": "direct_proof",
+                    "justification": "At this coarse level, the public paper theorem is attacked directly.",
+                    "natural_language_proof": "The paper-facing theorem is introduced as a direct coarse obligation to be closed immediately in this cycle.",
+                }
+            ],
+            "next_candidate_edge_ids": [supervisor.theorem_frontier_edge_id("paper.main", "direct_proof", "paper.main")],
+            "structural_change_reason": "Create the initial direct-proof obligation edge for the public paper theorem.",
         }
         paper_review = {
             "phase": "proof_formalization",
@@ -3897,12 +4042,23 @@ class WorkflowTests(SupervisorTestCase):
             "decision": "APPROVE",
             "classification": "paper_exact",
             "approved_node_ids": ["paper.main"],
-            "approved_edges": [],
+            "approved_edges": [{"parent": "paper.main", "child": "paper.main", "edge_type": "direct_proof"}],
             "justification": "This is the paper theorem itself.",
+            "caveat": "",
+        }
+        nl_proof_review = {
+            "phase": "proof_formalization",
+            "parent_node_id": "paper.main",
+            "change_kind": "CREATE_ACTIVE",
+            "decision": "APPROVE",
+            "approved_node_ids": ["paper.main"],
+            "approved_edges": [{"parent": "paper.main", "child": "paper.main", "edge_type": "direct_proof"}],
+            "justification": "The leaf theorem's natural-language proof is complete and rigorous.",
             "caveat": "",
         }
         reviewer_frontier = {
             "phase": "proof_formalization",
+            "active_edge_id": supervisor.theorem_frontier_edge_id("paper.main", "direct_proof", "paper.main"),
             "active_theorem_id": "paper.main",
             "active_theorem_nl_statement": "The paper main theorem witness exists.",
             "active_theorem_lean_statement": "theorem paper_main : True := by trivial",
@@ -3910,7 +4066,7 @@ class WorkflowTests(SupervisorTestCase):
             "assessed_action": "CLOSE",
             "blocker_cluster": "final witness supply",
             "outcome": "CLOSED",
-            "next_active_theorem_id": "",
+            "next_active_edge_id": "",
             "cone_purity": "HIGH",
             "open_hypotheses": [],
             "justification": "The active paper theorem closed cleanly.",
@@ -3930,6 +4086,7 @@ class WorkflowTests(SupervisorTestCase):
                 },
                 worker_frontier,
                 paper_review,
+                nl_proof_review,
                 {
                     "phase": "proof_formalization",
                     "decision": "ADVANCE_PHASE",
@@ -3970,14 +4127,16 @@ class WorkflowTests(SupervisorTestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             [entry["stage_label"] for entry in launches],
-            ["worker burst", "paper-verifier burst", "reviewer burst", "worker burst"],
+            ["worker burst", "paper-verifier burst", "NL-proof-verifier burst", "reviewer burst", "worker burst"],
         )
         self.assertIn("paper-verifier", launches[1]["prompt"])
+        self.assertIn("NL-proof verifier", launches[2]["prompt"])
         self.assertEqual(state["theorem_frontier"]["active_leaf_id"], None)
         self.assertEqual(state["theorem_frontier"]["nodes"]["paper.main"]["status"], "closed")
         self.assertEqual(state["theorem_frontier"]["metrics"]["paper_nodes_closed"], 1)
         kinds = [call.kwargs.get("kind") for call in record_chat_event_mock.mock_calls]
         self.assertIn("theorem_frontier_paper_verifier_review", kinds)
+        self.assertIn("theorem_frontier_nl_proof_verifier_review", kinds)
         self.assertIn("theorem_frontier_review", kinds)
 
     def test_main_cleanup_invalid_worker_cycle_restores_and_stops_before_reviewer(self) -> None:
@@ -4304,9 +4463,11 @@ class WorkflowTests(SupervisorTestCase):
 
         manifest = json.loads(supervisor.paper_main_results_manifest_path(config).read_text(encoding="utf-8"))
         self.assertEqual(manifest["phase"], "theorem_stating")
-        self.assertEqual(manifest["initial_active_node_id"], "paper.main")
-        self.assertEqual(len(manifest["main_results"]), 1)
-        self.assertEqual(manifest["main_results"][0]["node_id"], "paper.main")
+        self.assertEqual(manifest["initial_active_edge_id"], "paper.main|all_of|paper.main_aux")
+        self.assertEqual(len(manifest["nodes"]), 2)
+        self.assertEqual(manifest["nodes"][0]["node_id"], "paper.main")
+        self.assertEqual(len(manifest["edges"]), 2)
+        self.assertEqual(manifest["edges"][1]["edge_type"], "direct_proof")
 
     def test_run_validation_flags_unapproved_axioms_and_disallowed_sorries(self) -> None:
         repo_path = self.make_repo()
@@ -4422,6 +4583,43 @@ class WorkflowTests(SupervisorTestCase):
 
         self.assertEqual(summary["git"]["previous_validation_head"], previous_head)
         self.assertEqual(summary["git"]["changed_lean_files"], ["A.lean", "B.lean"])
+
+    def test_run_validation_writes_compatibility_summary_fields(self) -> None:
+        repo_path = self.make_repo()
+        remote_url = "git@example.com:test/repo.git"
+        config = self.make_config(repo_path, git_remote_url=remote_url)
+        self.git(repo_path, "init", "-b", "main")
+        self.git(repo_path, "config", "user.name", "Test User")
+        self.git(repo_path, "config", "user.email", "test@example.com")
+        self.git(repo_path, "remote", "add", "origin", remote_url)
+        (repo_path / "lakefile.toml").write_text(
+            'name = "T"\nversion = "0.1.0"\ndefaultTargets = ["T"]\n\n[[lean_lib]]\nname = "T"\n',
+            encoding="utf-8",
+        )
+        (repo_path / "lean-toolchain").write_text("leanprover/lean4:v4.28.0\n", encoding="utf-8")
+        (repo_path / "T.lean").write_text("def t : Nat := 0\n", encoding="utf-8")
+        (repo_path / "PaperDefinitions.lean").write_text("def paperDef : Nat := 0\n", encoding="utf-8")
+        (repo_path / "PaperTheorems.lean").write_text("theorem paperStmt : True := by\n  trivial\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "init")
+
+        summary = supervisor.run_validation(config, "proof_formalization", 1)
+
+        self.assertEqual(summary["build_ok"], summary["build"]["ok"])
+        self.assertEqual(
+            summary["git_ok"],
+            bool(
+                summary["git"]["enabled"]
+                and summary["git"]["repo_ok"]
+                and summary["git"]["worktree_clean"]
+                and summary["git"]["remote_matches_config"]
+            ),
+        )
+        self.assertEqual(summary["head"], summary["git"]["head"])
+        written = supervisor.JsonFile.load(supervisor.validation_summary_path(config), {})
+        self.assertEqual(written["build_ok"], summary["build_ok"])
+        self.assertEqual(written["git_ok"], summary["git_ok"])
+        self.assertEqual(written["head"], summary["head"])
 
     def test_cleanup_phase_stuck_review_does_not_trigger_stuck_recovery(self) -> None:
         state = {
@@ -4873,7 +5071,7 @@ class TheoremFrontierTests(SupervisorTestCase):
     def paper_main_results_manifest(self, **overrides: object) -> dict:
         payload = {
             "phase": "theorem_stating",
-            "main_results": [
+            "nodes": [
                 self.full_node(
                     "paper.main",
                     kind="paper",
@@ -4899,15 +5097,40 @@ class TheoremFrontierTests(SupervisorTestCase):
                     notes="Ramsey-number corollary.",
                 ),
             ],
-            "dependency_edges": [
+            "edges": [
                 {
                     "parent": "paper.main2",
                     "child": "paper.main",
                     "edge_type": "reduction",
                     "justification": "The Ramsey corollary reduces to the main graph theorem.",
+                    "natural_language_proof": "The paper proves the Ramsey corollary by applying the main graph theorem and then translating the witness into the Ramsey-number statement.",
+                },
+                {
+                    "parent": "paper.main",
+                    "child": "paper.main",
+                    "edge_type": "direct_proof",
+                    "justification": "At the current coarse paper level, the main theorem is treated as a direct proof obligation.",
+                    "natural_language_proof": "The paper's remaining argument for the main theorem is deferred to later edge expansions or direct closure work on this coarse obligation.",
                 }
             ],
-            "initial_active_node_id": "paper.main",
+            "initial_active_edge_id": supervisor.theorem_frontier_edge_id("paper.main", "direct_proof", "paper.main"),
+        }
+        payload.update(overrides)
+        return payload
+
+    def direct_edge_id(self, node_id: str) -> str:
+        return supervisor.theorem_frontier_edge_id(node_id, "direct_proof", node_id)
+
+    def dependency_edge_id(self, parent: str, child: str, edge_type: str = "all_of") -> str:
+        return supervisor.theorem_frontier_edge_id(parent, edge_type, child)
+
+    def direct_proof_edge(self, node_id: str, **overrides: object) -> dict:
+        payload = {
+            "parent": node_id,
+            "child": node_id,
+            "edge_type": "direct_proof",
+            "justification": "This theorem is taken as a direct proof obligation at the current DAG granularity.",
+            "natural_language_proof": "At the current DAG granularity, this theorem is attacked directly rather than by further coarse decomposition.",
         }
         payload.update(overrides)
         return payload
@@ -4917,6 +5140,7 @@ class TheoremFrontierTests(SupervisorTestCase):
             "node_id": node_id,
             "kind": "support",
             "natural_language_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
+            "natural_language_proof": "By the paper's local conditioning argument, this obligation follows from the already established parent edge decomposition and the stated hypotheses.",
             "lean_statement": f"theorem {node_id.replace('.', '_')} : True := by trivial",
             "lean_anchor": f"Twobites.IndependentSets.{node_id.replace('.', '_')}",
             "paper_provenance": "Section 4 fixed-embedding RI collapse.",
@@ -4928,9 +5152,58 @@ class TheoremFrontierTests(SupervisorTestCase):
         payload.update(overrides)
         return payload
 
+    def full_edge(
+        self,
+        parent: str = "ri.local.graph_pair",
+        child: str = "ri.local.remaining",
+        **overrides: object,
+    ) -> dict:
+        payload = {
+            "parent": parent,
+            "child": child,
+            "edge_type": "all_of",
+            "justification": "This child obligation is required to discharge the parent theorem.",
+            "natural_language_proof": "The parent theorem reduces to this child obligation by the paper-faithful decomposition stated for this frontier step.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def create_active_worker_update(self, node_id: str = "ri.local.graph_pair", **overrides: object) -> dict:
+        payload = self.full_worker_update(
+            active_edge_id=self.direct_edge_id(node_id),
+            active_node_id=node_id,
+            active_node=self.full_node(node_id),
+            proposed_edges=[self.direct_proof_edge(node_id)],
+            next_candidate_edge_ids=[self.direct_edge_id(node_id)],
+            structural_change_reason="Create the initial direct-proof obligation edge for this active theorem.",
+        )
+        payload.update(overrides)
+        return payload
+
+    def create_active_paper_verifier_review(self, node_id: str = "ri.local.graph_pair", **overrides: object) -> dict:
+        payload = self.paper_verifier_review(
+            parent_node_id=node_id,
+            change_kind="CREATE_ACTIVE",
+            approved_node_ids=[node_id],
+            approved_edges=[{"parent": node_id, "child": node_id, "edge_type": "direct_proof"}],
+        )
+        payload.update(overrides)
+        return payload
+
+    def create_active_nl_proof_verifier_review(self, node_id: str = "ri.local.graph_pair", **overrides: object) -> dict:
+        payload = self.nl_proof_verifier_review(
+            parent_node_id=node_id,
+            change_kind="CREATE_ACTIVE",
+            approved_node_ids=[node_id],
+            approved_edges=[{"parent": node_id, "child": node_id, "edge_type": "direct_proof"}],
+        )
+        payload.update(overrides)
+        return payload
+
     def full_worker_update(self, **overrides: object) -> dict:
         payload = {
             "phase": "proof_formalization",
+            "active_edge_id": self.direct_edge_id("ri.local.graph_pair"),
             "active_node_id": "ri.local.graph_pair",
             "active_node": self.full_node(),
             "requested_action": "CLOSE",
@@ -4939,7 +5212,7 @@ class TheoremFrontierTests(SupervisorTestCase):
             "result_summary": "Stayed on the active theorem.",
             "proposed_nodes": [],
             "proposed_edges": [],
-            "next_candidate_ids": ["ri.local.graph_pair"],
+            "next_candidate_edge_ids": [self.direct_edge_id("ri.local.graph_pair")],
             "structural_change_reason": "",
         }
         payload.update(overrides)
@@ -4950,6 +5223,7 @@ class TheoremFrontierTests(SupervisorTestCase):
     def full_frontier_review(self, **overrides: object) -> dict:
         payload = {
             "phase": "proof_formalization",
+            "active_edge_id": self.direct_edge_id("ri.local.graph_pair"),
             "active_theorem_id": "ri.local.graph_pair",
             "active_theorem_nl_statement": "For one good graph pair, the bad-event mass is bounded by the RI target.",
             "active_theorem_lean_statement": "theorem ri_local_graph_pair : True := by trivial",
@@ -4957,12 +5231,14 @@ class TheoremFrontierTests(SupervisorTestCase):
             "assessed_action": "CLOSE",
             "blocker_cluster": "graph-pair local RI collapse",
             "outcome": "STILL_OPEN",
-            "next_active_theorem_id": "ri.local.graph_pair",
+            "next_active_edge_id": self.direct_edge_id("ri.local.graph_pair"),
             "cone_purity": "HIGH",
             "open_hypotheses": ["close the fixed graph-pair RI theorem"],
             "justification": "The active theorem remains the bottleneck.",
         }
         payload.update(overrides)
+        if "active_theorem_id" in overrides and "active_edge_id" not in overrides:
+            payload["active_edge_id"] = self.direct_edge_id(str(payload["active_theorem_id"]))
         return payload
 
     def paper_verifier_review(self, **overrides: object) -> dict:
@@ -4978,6 +5254,23 @@ class TheoremFrontierTests(SupervisorTestCase):
                 {"parent": "ri.local.graph_pair", "child": "ri.local.red_cap"},
             ],
             "justification": "This is the paper-faithful local split of the graph-pair RI obstruction.",
+            "caveat": "",
+        }
+        payload.update(overrides)
+        return payload
+
+    def nl_proof_verifier_review(self, **overrides: object) -> dict:
+        payload = {
+            "phase": "proof_formalization",
+            "parent_node_id": "ri.local.graph_pair",
+            "change_kind": "EXPAND",
+            "decision": "APPROVE",
+            "approved_node_ids": ["ri.local.remaining", "ri.local.red_cap"],
+            "approved_edges": [
+                {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                {"parent": "ri.local.graph_pair", "child": "ri.local.red_cap"},
+            ],
+            "justification": "The newly introduced edge and leaf proofs are complete and rigorous.",
             "caveat": "",
         }
         payload.update(overrides)
@@ -5013,6 +5306,53 @@ class TheoremFrontierTests(SupervisorTestCase):
         payload.update(overrides)
         return payload
 
+    def test_validate_theorem_frontier_edge_assigns_canonical_id_and_open_status(self) -> None:
+        edge = supervisor.validate_theorem_frontier_edge(
+            {
+                "parent": "paper.main",
+                "child": "support.lemma",
+                "edge_type": "reduction",
+                "justification": "Main theorem reduces to the support lemma.",
+            },
+            require_paper_status=False,
+        )
+        self.assertEqual(edge["edge_id"], "paper.main|reduction|support.lemma")
+        self.assertEqual(edge["status"], "open")
+
+    def test_sync_theorem_frontier_metrics_counts_effectively_closed_parent(self) -> None:
+        payload = supervisor.default_theorem_frontier_payload("full")
+        payload["nodes"] = {
+            "paper.main": supervisor.theorem_frontier_node_record(
+                self.full_node("paper.main", closure_mode="all_children", kind="paper"),
+                status="open",
+                parent_ids=[],
+                child_ids=["support.lemma"],
+            ),
+            "support.lemma": supervisor.theorem_frontier_node_record(
+                self.full_node("support.lemma"),
+                status="closed",
+                parent_ids=["paper.main"],
+                child_ids=[],
+            ),
+        }
+        payload["edges"] = [
+            supervisor.validate_theorem_frontier_edge(
+                {
+                    "parent": "paper.main",
+                    "child": "support.lemma",
+                    "edge_type": "reduction",
+                    "status": "closed",
+                    "justification": "Main theorem reduces to the support lemma.",
+                    "paper_verifier_status": "APPROVE",
+                },
+                require_paper_status=True,
+            )
+        ]
+        supervisor.sync_theorem_frontier_metrics(payload)
+        self.assertEqual(payload["metrics"]["closed_nodes_count"], 2)
+        self.assertEqual(payload["metrics"]["paper_nodes_closed"], 1)
+        self.assertEqual(payload["metrics"]["closed_edges_count"], 1)
+
     def test_ensure_repo_files_initializes_phase0_theorem_frontier_state(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path, theorem_frontier_phase="phase0")
@@ -5033,8 +5373,10 @@ class TheoremFrontierTests(SupervisorTestCase):
 
         payload = json.loads(supervisor.theorem_frontier_state_path(config).read_text(encoding="utf-8"))
         self.assertEqual(payload["mode"], "full")
+        self.assertIsNone(payload["active_edge_id"])
         self.assertEqual(payload["active_leaf_id"], None)
         self.assertEqual(payload["nodes"], {})
+        self.assertEqual(payload["metrics"]["active_edge_age"], 0)
         self.assertEqual(payload["metrics"]["active_leaf_age"], 0)
         self.assertEqual(payload["metrics"]["failed_close_attempts"], 0)
 
@@ -5044,13 +5386,13 @@ class TheoremFrontierTests(SupervisorTestCase):
             self.paper_main_results_manifest(),
         )
 
-        self.assertEqual(manifest["initial_active_node_id"], "paper.main")
-        self.assertEqual(len(manifest["main_results"]), 2)
-        self.assertEqual(manifest["dependency_edges"][0]["parent"], "paper.main2")
+        self.assertEqual(manifest["initial_active_edge_id"], self.direct_edge_id("paper.main"))
+        self.assertEqual(len(manifest["nodes"]), 2)
+        self.assertEqual(manifest["edges"][0]["parent"], "paper.main2")
 
     def test_validate_paper_main_results_manifest_rejects_support_node(self) -> None:
         manifest = self.paper_main_results_manifest()
-        manifest["main_results"][1]["kind"] = "support"
+        manifest["nodes"][1]["kind"] = "support"
 
         with self.assertRaises(supervisor.SupervisorError):
             supervisor.validate_paper_main_results_manifest("theorem_stating", manifest)
@@ -5068,12 +5410,20 @@ class TheoremFrontierTests(SupervisorTestCase):
             cycle=7,
         )
 
+        self.assertEqual(payload["active_edge_id"], self.direct_edge_id("paper.main"))
         self.assertEqual(payload["active_leaf_id"], "paper.main")
         self.assertEqual(sorted(payload["nodes"].keys()), ["paper.main", "paper.main2"])
         self.assertEqual(payload["nodes"]["paper.main"]["status"], "active")
         self.assertEqual(payload["nodes"]["paper.main2"]["status"], "open")
-        self.assertEqual(payload["edges"][0]["paper_verifier_status"], "APPROVE")
+        self.assertCountEqual(
+            [edge["edge_id"] for edge in payload["edges"]],
+            [
+                self.dependency_edge_id("paper.main2", "paper.main", "reduction"),
+                self.direct_edge_id("paper.main"),
+            ],
+        )
         saved_payload = json.loads(supervisor.theorem_frontier_state_path(config).read_text(encoding="utf-8"))
+        self.assertEqual(saved_payload["active_edge_id"], self.direct_edge_id("paper.main"))
         self.assertEqual(saved_payload["active_leaf_id"], "paper.main")
 
     def test_phase0_worker_prompt_includes_theorem_frontier_requirements(self) -> None:
@@ -5129,10 +5479,11 @@ class TheoremFrontierTests(SupervisorTestCase):
         )
 
         self.assertIn("authoritative theorem-frontier DAG", prompt)
+        self.assertIn('"active_edge_id": "stable obligation edge id"', prompt)
         self.assertIn('"active_node_id": "stable theorem node id"', prompt)
         self.assertIn('exact node object only if `active_node_id` is not already authoritative', prompt)
         self.assertIn('"allowed_edit_paths": ["repo-relative .lean files allowed inside that cone for this burst"]', prompt)
-        self.assertIn('"proposed_nodes": [{ exact node objects, if any }]', prompt)
+        self.assertIn('"proposed_nodes": [{ exact node objects, including `natural_language_proof` for any new leaf node }]', prompt)
         self.assertIn("active cone", prompt)
         self.assertIn("Any Lean file changed outside `allowed_edit_paths` will fail theorem-frontier cone validation", prompt)
 
@@ -5145,6 +5496,7 @@ class TheoremFrontierTests(SupervisorTestCase):
             "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
             "last_theorem_frontier_worker_update": self.full_worker_update(),
             "last_theorem_frontier_paper_review": self.paper_verifier_review(),
+            "last_theorem_frontier_nl_proof_review": self.nl_proof_verifier_review(),
         }
 
         prompt = supervisor.build_reviewer_prompt(
@@ -5158,6 +5510,7 @@ class TheoremFrontierTests(SupervisorTestCase):
         )
 
         self.assertIn("Paper-verifier structural review", prompt)
+        self.assertIn("NL-proof verifier review", prompt)
         self.assertIn('"classification": "paper_faithful_reformulation"', prompt)
         self.assertIn('"cone_purity": "HIGH" | "MEDIUM" | "LOW"', prompt)
 
@@ -5183,14 +5536,13 @@ class TheoremFrontierTests(SupervisorTestCase):
                     self.full_node("ri.local.red_cap"),
                 ],
                 proposed_edges=[
-                    {
-                        "parent": "ri.local.graph_pair",
-                        "child": "ri.local.remaining",
-                        "edge_type": "all_of",
-                        "justification": "Both local bounds are needed.",
-                    }
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.remaining",
+                        justification="Both local bounds are needed.",
+                    )
                 ],
-                next_candidate_ids=["ri.local.remaining"],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
                 structural_change_reason="Split the live blocker into local siblings.",
             ),
             False,
@@ -5199,6 +5551,39 @@ class TheoremFrontierTests(SupervisorTestCase):
         self.assertIn("paper-verifier for theorem-frontier structural edits", prompt)
         self.assertIn("paper-faithful reformulation", prompt)
         self.assertIn("theorem_frontier_paper_verifier.json", prompt)
+
+    def test_full_nl_proof_verifier_prompt_mentions_rigor_gate(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        state = {
+            "phase": "proof_formalization",
+            "review_log": [],
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        prompt = supervisor.build_theorem_frontier_nl_proof_verifier_prompt(
+            config,
+            state,
+            "proof_formalization",
+            "worker terminal output",
+            json.dumps({"status": "NOT_STUCK"}),
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[self.full_node("ri.local.remaining")],
+                proposed_edges=[self.full_edge("ri.local.graph_pair", "ri.local.remaining")],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
+                structural_change_reason="Split the blocker.",
+            ),
+            self.paper_verifier_review(
+                approved_node_ids=["ri.local.remaining"],
+                approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+            ),
+            False,
+        )
+
+        self.assertIn("NL-proof verifier", prompt)
+        self.assertIn("paper-approved newly admitted edges and newly admitted leaf nodes", prompt)
+        self.assertIn("theorem_frontier_nl_proof_verifier.json", prompt)
 
     def test_validate_theorem_frontier_worker_update_requires_exact_statements(self) -> None:
         with self.assertRaisesRegex(supervisor.SupervisorError, "active_theorem_lean_statement"):
@@ -5226,6 +5611,7 @@ class TheoremFrontierTests(SupervisorTestCase):
             supervisor.validate_theorem_frontier_worker_update_full(
                 "proof_formalization",
                 self.full_worker_update(
+                    active_edge_id=self.direct_edge_id("ri.local.graph_pair"),
                     active_node_id="ri.local.graph_pair",
                     active_node=self.full_node(lean_statement=""),
                 ),
@@ -5239,11 +5625,11 @@ class TheoremFrontierTests(SupervisorTestCase):
         self.assertEqual(result["active_node_id"], "ri.local.graph_pair")
         self.assertIsNone(result["active_node"])
 
-    def test_validate_full_worker_update_accepts_legacy_active_node_only_shape(self) -> None:
+    def test_validate_full_worker_update_rejects_missing_active_edge_id(self) -> None:
         legacy = self.full_worker_update()
-        legacy.pop("active_node_id")
-        result = supervisor.validate_theorem_frontier_worker_update_full("proof_formalization", legacy)
-        self.assertEqual(result["active_node_id"], "ri.local.graph_pair")
+        legacy.pop("active_edge_id")
+        with self.assertRaisesRegex(supervisor.SupervisorError, "active_edge_id"):
+            supervisor.validate_theorem_frontier_worker_update_full("proof_formalization", legacy)
 
     def test_validate_full_worker_update_rejects_phase_mismatch(self) -> None:
         with self.assertRaisesRegex(supervisor.SupervisorError, "phase mismatch"):
@@ -5273,6 +5659,13 @@ class TheoremFrontierTests(SupervisorTestCase):
                 self.paper_verifier_review(classification="wrapper_progress"),
             )
 
+    def test_validate_full_nl_proof_verifier_review_rejects_phase_mismatch(self) -> None:
+        with self.assertRaisesRegex(supervisor.SupervisorError, "phase mismatch"):
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.nl_proof_verifier_review(phase="planning"),
+            )
+
     def test_validate_full_frontier_review_rejects_phase_mismatch(self) -> None:
         with self.assertRaisesRegex(supervisor.SupervisorError, "phase mismatch"):
             supervisor.validate_theorem_frontier_review_full(
@@ -5298,14 +5691,13 @@ class TheoremFrontierTests(SupervisorTestCase):
                 requested_action="EXPAND",
                 proposed_nodes=[self.full_node("ri.local.remaining")],
                 proposed_edges=[
-                    {
-                        "parent": "paper.main",
-                        "child": "ri.local.remaining",
-                        "edge_type": "all_of",
-                        "justification": "Attach to existing DAG node.",
-                    }
+                    self.full_edge(
+                        "paper.main",
+                        "ri.local.remaining",
+                        justification="Attach to existing DAG node.",
+                    )
                 ],
-                next_candidate_ids=["ri.local.remaining"],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
                 structural_change_reason="Expand with edge to existing node.",
             ),
         )
@@ -5448,22 +5840,24 @@ class TheoremFrontierTests(SupervisorTestCase):
         active_payload = supervisor.update_theorem_frontier_full_state(
             config,
             state,
-            self.full_worker_update(),
+            self.create_active_worker_update(),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
                 self.full_frontier_review(),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(
-                    change_kind="CREATE_ACTIVE",
-                    approved_node_ids=["ri.local.graph_pair"],
-                    approved_edges=[],
-                ),
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
             ),
             cycle=11,
         )
+        self.assertEqual(active_payload["active_edge_id"], self.direct_edge_id("ri.local.graph_pair"))
         self.assertEqual(active_payload["active_leaf_id"], "ri.local.graph_pair")
+        self.assertEqual(active_payload["metrics"]["active_edge_age"], 1)
         self.assertEqual(active_payload["metrics"]["active_leaf_age"], 1)
         self.assertEqual(active_payload["metrics"]["failed_close_attempts"], 1)
 
@@ -5477,20 +5871,23 @@ class TheoremFrontierTests(SupervisorTestCase):
                     self.full_node("ri.local.red_cap"),
                 ],
                 proposed_edges=[
-                    {
-                        "parent": "ri.local.graph_pair",
-                        "child": "ri.local.remaining",
-                        "edge_type": "all_of",
-                        "justification": "The remaining-pairs lower bound is needed.",
-                    },
-                    {
-                        "parent": "ri.local.graph_pair",
-                        "child": "ri.local.red_cap",
-                        "edge_type": "all_of",
-                        "justification": "The red cap is also needed.",
-                    },
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.remaining",
+                        justification="The remaining-pairs lower bound is needed.",
+                    ),
+                    self.direct_proof_edge("ri.local.remaining"),
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.red_cap",
+                        justification="The red cap is also needed.",
+                    ),
+                    self.direct_proof_edge("ri.local.red_cap"),
                 ],
-                next_candidate_ids=["ri.local.remaining", "ri.local.red_cap"],
+                next_candidate_edge_ids=[
+                    self.direct_edge_id("ri.local.remaining"),
+                    self.direct_edge_id("ri.local.red_cap"),
+                ],
                 structural_change_reason="Split the live blocker into local siblings.",
             ),
             supervisor.validate_theorem_frontier_review_full(
@@ -5498,28 +5895,56 @@ class TheoremFrontierTests(SupervisorTestCase):
                 self.full_frontier_review(
                     assessed_action="EXPAND",
                     outcome="EXPANDED",
-                    next_active_theorem_id="ri.local.remaining",
+                    next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                     open_hypotheses=["close the remaining-pairs lower bound child"],
                 ),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(),
+                self.paper_verifier_review(
+                    approved_edges=[
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                        {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.red_cap"},
+                        {"parent": "ri.local.red_cap", "child": "ri.local.red_cap", "edge_type": "direct_proof"},
+                    ],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.nl_proof_verifier_review(
+                    approved_edges=[
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                        {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.red_cap"},
+                        {"parent": "ri.local.red_cap", "child": "ri.local.red_cap", "edge_type": "direct_proof"},
+                    ],
+                ),
             ),
             cycle=12,
         )
+        self.assertEqual(expanded_payload["active_edge_id"], self.direct_edge_id("ri.local.remaining"))
         self.assertEqual(expanded_payload["active_leaf_id"], "ri.local.remaining")
         self.assertIn("ri.local.red_cap", expanded_payload["nodes"])
         self.assertEqual(expanded_payload["nodes"]["ri.local.graph_pair"]["status"], "open")
         self.assertEqual(expanded_payload["nodes"]["ri.local.remaining"]["status"], "active")
-        self.assertEqual(len(expanded_payload["edges"]), 2)
+        dependency_edges = [edge for edge in expanded_payload["edges"] if edge["edge_type"] != "direct_proof"]
+        self.assertEqual(len(dependency_edges), 2)
+        self.assertEqual(
+            sorted((edge["parent"], edge["child"]) for edge in dependency_edges),
+            [
+                ("ri.local.graph_pair", "ri.local.red_cap"),
+                ("ri.local.graph_pair", "ri.local.remaining"),
+            ],
+        )
 
         low_purity_payload = supervisor.update_theorem_frontier_full_state(
             config,
             state,
             self.full_worker_update(
+                active_edge_id=self.direct_edge_id("ri.local.remaining"),
                 active_node=self.full_node("ri.local.remaining"),
-                next_candidate_ids=["ri.local.remaining"],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
             ),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
@@ -5528,7 +5953,7 @@ class TheoremFrontierTests(SupervisorTestCase):
                     active_theorem_lean_statement="theorem ri_local_remaining : True := by trivial",
                     active_theorem_anchor="Twobites.IndependentSets.ri_local_remaining",
                     outcome="NO_FRONTIER_PROGRESS",
-                    next_active_theorem_id="ri.local.remaining",
+                    next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                     cone_purity="LOW",
                     open_hypotheses=["still missing the remaining-pairs lower bound"],
                 ),
@@ -5540,8 +5965,9 @@ class TheoremFrontierTests(SupervisorTestCase):
             config,
             state,
             self.full_worker_update(
+                active_edge_id=self.direct_edge_id("ri.local.remaining"),
                 active_node=self.full_node("ri.local.remaining"),
-                next_candidate_ids=["ri.local.remaining"],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
             ),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
@@ -5550,7 +5976,7 @@ class TheoremFrontierTests(SupervisorTestCase):
                     active_theorem_lean_statement="theorem ri_local_remaining : True := by trivial",
                     active_theorem_anchor="Twobites.IndependentSets.ri_local_remaining",
                     outcome="NO_FRONTIER_PROGRESS",
-                    next_active_theorem_id="ri.local.remaining",
+                    next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                     cone_purity="LOW",
                     open_hypotheses=["still missing the remaining-pairs lower bound"],
                 ),
@@ -5574,16 +6000,22 @@ class TheoremFrontierTests(SupervisorTestCase):
             supervisor.update_theorem_frontier_full_state(
                 config,
                 state,
-                self.full_worker_update(),
+                self.create_active_worker_update(),
                 supervisor.validate_theorem_frontier_review_full(
                     "proof_formalization",
                     self.full_frontier_review(),
                 ),
                 supervisor.validate_theorem_frontier_paper_verifier_review(
                     "proof_formalization",
-                    self.paper_verifier_review(
-                        change_kind="CREATE_ACTIVE",
+                    self.create_active_paper_verifier_review(
                         decision="REJECT",
+                        approved_node_ids=[],
+                        approved_edges=[],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                    "proof_formalization",
+                    self.create_active_nl_proof_verifier_review(
                         approved_node_ids=[],
                         approved_edges=[],
                     ),
@@ -5603,18 +6035,18 @@ class TheoremFrontierTests(SupervisorTestCase):
         supervisor.update_theorem_frontier_full_state(
             config,
             state,
-            self.full_worker_update(),
+            self.create_active_worker_update(),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
                 self.full_frontier_review(),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(
-                    change_kind="CREATE_ACTIVE",
-                    approved_node_ids=["ri.local.graph_pair"],
-                    approved_edges=[],
-                ),
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
             ),
             cycle=11,
         )
@@ -5623,6 +6055,7 @@ class TheoremFrontierTests(SupervisorTestCase):
             config,
             state,
             self.full_worker_update(
+                active_edge_id=self.direct_edge_id("ri.local.graph_pair"),
                 active_node=self.full_node(
                     "ri.local.graph_pair",
                     lean_statement="theorem altered_statement : False := by trivial",
@@ -5655,29 +6088,125 @@ class TheoremFrontierTests(SupervisorTestCase):
             "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
         }
 
-        with self.assertRaisesRegex(supervisor.SupervisorError, "cannot be both CLOSED and the next active leaf"):
+        with self.assertRaisesRegex(supervisor.SupervisorError, "cannot be both CLOSED and the next active"):
             supervisor.update_theorem_frontier_full_state(
                 config,
                 state,
-                self.full_worker_update(),
+                self.create_active_worker_update(),
                 supervisor.validate_theorem_frontier_review_full(
                     "proof_formalization",
                     self.full_frontier_review(
                         outcome="CLOSED",
-                        next_active_theorem_id="ri.local.graph_pair",
+                        next_active_edge_id=self.direct_edge_id("ri.local.graph_pair"),
                         open_hypotheses=[],
                     ),
                 ),
                 supervisor.validate_theorem_frontier_paper_verifier_review(
                     "proof_formalization",
-                    self.paper_verifier_review(
-                        change_kind="CREATE_ACTIVE",
-                        approved_node_ids=["ri.local.graph_pair"],
-                        approved_edges=[],
-                    ),
+                    self.create_active_paper_verifier_review(),
+                ),
+                supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                    "proof_formalization",
+                    self.create_active_nl_proof_verifier_review(),
                 ),
                 cycle=11,
             )
+
+    def test_update_theorem_frontier_full_state_rejects_closing_leaf_node_with_dependency_children(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.create_active_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
+            ),
+            cycle=11,
+        )
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(
+                requested_action="EXPAND",
+                proposed_nodes=[self.full_node("ri.local.remaining")],
+                proposed_edges=[
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.remaining",
+                        justification="The remaining-pairs child is needed.",
+                    ),
+                    self.direct_proof_edge("ri.local.remaining"),
+                ],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.graph_pair")],
+                structural_change_reason="Split the blocker but keep the parent active.",
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    assessed_action="EXPAND",
+                    outcome="EXPANDED",
+                    next_active_edge_id=self.direct_edge_id("ri.local.graph_pair"),
+                    open_hypotheses=["close the remaining-pairs child"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.paper_verifier_review(
+                    approved_node_ids=["ri.local.remaining"],
+                    approved_edges=[
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                        {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                    ],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.nl_proof_verifier_review(
+                    approved_node_ids=["ri.local.remaining"],
+                    approved_edges=[
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                        {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                    ],
+                ),
+            ),
+            cycle=12,
+        )
+
+        payload = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.full_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(
+                    outcome="CLOSED",
+                    next_active_edge_id="",
+                    open_hypotheses=[],
+                ),
+            ),
+            None,
+            cycle=13,
+        )
+        self.assertEqual(payload["nodes"]["ri.local.graph_pair"]["status"], "open")
+        self.assertEqual(payload["edges"][0]["edge_type"], "direct_proof")
+        self.assertEqual(payload["edges"][0]["status"], "closed")
 
     def test_update_theorem_frontier_full_state_only_admits_paper_approved_subset(self) -> None:
         repo_path = self.make_repo()
@@ -5691,18 +6220,18 @@ class TheoremFrontierTests(SupervisorTestCase):
         supervisor.update_theorem_frontier_full_state(
             config,
             state,
-            self.full_worker_update(),
+            self.create_active_worker_update(),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
                 self.full_frontier_review(),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(
-                    change_kind="CREATE_ACTIVE",
-                    approved_node_ids=["ri.local.graph_pair"],
-                    approved_edges=[],
-                ),
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
             ),
             cycle=11,
         )
@@ -5717,20 +6246,19 @@ class TheoremFrontierTests(SupervisorTestCase):
                     self.full_node("ri.local.red_cap"),
                 ],
                 proposed_edges=[
-                    {
-                        "parent": "ri.local.graph_pair",
-                        "child": "ri.local.remaining",
-                        "edge_type": "all_of",
-                        "justification": "The remaining-pairs child is needed.",
-                    },
-                    {
-                        "parent": "ri.local.graph_pair",
-                        "child": "ri.local.red_cap",
-                        "edge_type": "all_of",
-                        "justification": "The red-cap child is proposed too.",
-                    },
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.remaining",
+                        justification="The remaining-pairs child is needed.",
+                    ),
+                    self.direct_proof_edge("ri.local.remaining"),
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.red_cap",
+                        justification="The red-cap child is proposed too.",
+                    ),
                 ],
-                next_candidate_ids=["ri.local.remaining"],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
                 structural_change_reason="Split the blocker in two.",
             ),
             supervisor.validate_theorem_frontier_review_full(
@@ -5738,7 +6266,7 @@ class TheoremFrontierTests(SupervisorTestCase):
                 self.full_frontier_review(
                     assessed_action="EXPAND",
                     outcome="EXPANDED",
-                    next_active_theorem_id="ri.local.remaining",
+                    next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                     open_hypotheses=["close the remaining-pairs child"],
                 ),
             ),
@@ -5746,15 +6274,29 @@ class TheoremFrontierTests(SupervisorTestCase):
                 "proof_formalization",
                 self.paper_verifier_review(
                     approved_node_ids=["ri.local.remaining"],
-                    approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                    approved_edges=[
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                        {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                    ],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.nl_proof_verifier_review(
+                    approved_node_ids=["ri.local.remaining"],
+                    approved_edges=[
+                        {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                        {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                    ],
                 ),
             ),
             cycle=12,
         )
         self.assertIn("ri.local.remaining", payload["nodes"])
         self.assertNotIn("ri.local.red_cap", payload["nodes"])
+        dependency_edges = [edge for edge in payload["edges"] if edge["edge_type"] != "direct_proof"]
         self.assertEqual(
-            [(edge["parent"], edge["child"]) for edge in payload["edges"]],
+            [(edge["parent"], edge["child"]) for edge in dependency_edges],
             [("ri.local.graph_pair", "ri.local.remaining")],
         )
 
@@ -5770,38 +6312,38 @@ class TheoremFrontierTests(SupervisorTestCase):
         supervisor.update_theorem_frontier_full_state(
             config,
             state,
-            self.full_worker_update(),
+            self.create_active_worker_update(),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
                 self.full_frontier_review(),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(
-                    change_kind="CREATE_ACTIVE",
-                    approved_node_ids=["ri.local.graph_pair"],
-                    approved_edges=[],
-                ),
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
             ),
             cycle=11,
         )
 
-        with self.assertRaisesRegex(supervisor.SupervisorError, "Next active theorem id"):
+        with self.assertRaisesRegex(supervisor.SupervisorError, "Next active edge id"):
             supervisor.update_theorem_frontier_full_state(
                 config,
                 state,
                 self.full_worker_update(
                     requested_action="EXPAND",
                     proposed_nodes=[self.full_node("ri.local.remaining")],
-                    proposed_edges=[
-                        {
-                            "parent": "ri.local.graph_pair",
-                            "child": "ri.local.remaining",
-                            "edge_type": "all_of",
-                            "justification": "The remaining-pairs child is proposed.",
-                        }
-                    ],
-                    next_candidate_ids=["ri.local.remaining"],
+                proposed_edges=[
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.remaining",
+                        justification="The remaining-pairs child is proposed.",
+                    ),
+                    self.direct_proof_edge("ri.local.remaining"),
+                ],
+                    next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
                     structural_change_reason="Split the blocker.",
                 ),
                 supervisor.validate_theorem_frontier_review_full(
@@ -5809,13 +6351,20 @@ class TheoremFrontierTests(SupervisorTestCase):
                     self.full_frontier_review(
                         assessed_action="EXPAND",
                         outcome="EXPANDED",
-                        next_active_theorem_id="ri.local.remaining",
+                        next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                         open_hypotheses=["close the remaining-pairs child"],
                     ),
                 ),
                 supervisor.validate_theorem_frontier_paper_verifier_review(
                     "proof_formalization",
                     self.paper_verifier_review(
+                        approved_node_ids=[],
+                        approved_edges=[],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                    "proof_formalization",
+                    self.nl_proof_verifier_review(
                         approved_node_ids=[],
                         approved_edges=[],
                     ),
@@ -5835,18 +6384,18 @@ class TheoremFrontierTests(SupervisorTestCase):
         supervisor.update_theorem_frontier_full_state(
             config,
             state,
-            self.full_worker_update(),
+            self.create_active_worker_update(),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
                 self.full_frontier_review(),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(
-                    change_kind="CREATE_ACTIVE",
-                    approved_node_ids=["ri.local.graph_pair"],
-                    approved_edges=[],
-                ),
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
             ),
             cycle=11,
         )
@@ -5859,14 +6408,13 @@ class TheoremFrontierTests(SupervisorTestCase):
                     requested_action="EXPAND",
                     proposed_nodes=[self.full_node("ri.local.remaining")],
                     proposed_edges=[
-                        {
-                            "parent": "ri.local.graph_pair",
-                            "child": "ri.local.remaining",
-                            "edge_type": "all_of",
-                            "justification": "The remaining-pairs child is proposed.",
-                        }
+                        self.full_edge(
+                            "ri.local.graph_pair",
+                            "ri.local.remaining",
+                            justification="The remaining-pairs child is proposed.",
+                        )
                     ],
-                    next_candidate_ids=["ri.local.remaining"],
+                    next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
                     structural_change_reason="Split the blocker.",
                 ),
                 supervisor.validate_theorem_frontier_review_full(
@@ -5874,7 +6422,7 @@ class TheoremFrontierTests(SupervisorTestCase):
                     self.full_frontier_review(
                         assessed_action="EXPAND",
                         outcome="EXPANDED",
-                        next_active_theorem_id="ri.local.graph_pair",
+                        next_active_edge_id=self.direct_edge_id("ri.local.graph_pair"),
                         open_hypotheses=["close the remaining-pairs child"],
                     ),
                 ),
@@ -5883,6 +6431,156 @@ class TheoremFrontierTests(SupervisorTestCase):
                     self.paper_verifier_review(
                         approved_node_ids=[],
                         approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                    ),
+                ),
+                cycle=12,
+            )
+
+    def test_update_theorem_frontier_full_state_rejects_new_leaf_without_natural_language_proof(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.create_active_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
+            ),
+            cycle=11,
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "newly admitted leaf nodes"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(
+                    requested_action="EXPAND",
+                    proposed_nodes=[self.full_node("ri.local.remaining", natural_language_proof="")],
+                    proposed_edges=[
+                        self.full_edge(
+                            "ri.local.graph_pair",
+                            "ri.local.remaining",
+                            justification="The remaining-pairs child is needed.",
+                        )
+                    ],
+                    next_candidate_edge_ids=[self.direct_edge_id("ri.local.graph_pair")],
+                    structural_change_reason="Introduce the remaining-pairs child but keep the parent obligation active.",
+                ),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(
+                        assessed_action="EXPAND",
+                        outcome="EXPANDED",
+                        next_active_edge_id=self.direct_edge_id("ri.local.graph_pair"),
+                        open_hypotheses=["close the remaining-pairs child"],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        approved_node_ids=["ri.local.remaining"],
+                        approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                    "proof_formalization",
+                    self.nl_proof_verifier_review(
+                        approved_node_ids=["ri.local.remaining"],
+                        approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                    ),
+                ),
+                cycle=12,
+            )
+
+    def test_update_theorem_frontier_full_state_rejects_new_edge_without_natural_language_proof(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        supervisor.ensure_repo_files(config, "proof_formalization")
+        state: dict = {
+            "phase": "proof_formalization",
+            "theorem_frontier": supervisor.default_theorem_frontier_payload("full"),
+        }
+
+        supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            self.create_active_worker_update(),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                self.full_frontier_review(),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
+            ),
+            cycle=11,
+        )
+
+        with self.assertRaisesRegex(supervisor.SupervisorError, "newly admitted edges"):
+            supervisor.update_theorem_frontier_full_state(
+                config,
+                state,
+                self.full_worker_update(
+                    requested_action="EXPAND",
+                    proposed_nodes=[self.full_node("ri.local.remaining")],
+                    proposed_edges=[
+                        self.full_edge(
+                            "ri.local.graph_pair",
+                            "ri.local.remaining",
+                            natural_language_proof="",
+                            justification="The remaining-pairs child is needed.",
+                        ),
+                        self.direct_proof_edge("ri.local.remaining"),
+                    ],
+                    next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
+                    structural_change_reason="Split to the remaining-pairs child.",
+                ),
+                supervisor.validate_theorem_frontier_review_full(
+                    "proof_formalization",
+                    self.full_frontier_review(
+                        assessed_action="EXPAND",
+                        outcome="EXPANDED",
+                        next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
+                        open_hypotheses=["close the remaining-pairs child"],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        approved_node_ids=["ri.local.remaining"],
+                        approved_edges=[
+                            {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                            {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                        ],
+                    ),
+                ),
+                supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                    "proof_formalization",
+                    self.nl_proof_verifier_review(
+                        approved_node_ids=["ri.local.remaining"],
+                        approved_edges=[
+                            {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                            {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                        ],
                     ),
                 ),
                 cycle=12,
@@ -5900,18 +6598,18 @@ class TheoremFrontierTests(SupervisorTestCase):
         supervisor.update_theorem_frontier_full_state(
             config,
             state,
-            self.full_worker_update(),
+            self.create_active_worker_update(),
             supervisor.validate_theorem_frontier_review_full(
                 "proof_formalization",
                 self.full_frontier_review(),
             ),
             supervisor.validate_theorem_frontier_paper_verifier_review(
                 "proof_formalization",
-                self.paper_verifier_review(
-                    change_kind="CREATE_ACTIVE",
-                    approved_node_ids=["ri.local.graph_pair"],
-                    approved_edges=[],
-                ),
+                self.create_active_paper_verifier_review(),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                self.create_active_nl_proof_verifier_review(),
             ),
             cycle=11,
         )
@@ -5922,14 +6620,14 @@ class TheoremFrontierTests(SupervisorTestCase):
                 requested_action="EXPAND",
                 proposed_nodes=[self.full_node("ri.local.remaining")],
                 proposed_edges=[
-                    {
-                        "parent": "ri.local.graph_pair",
-                        "child": "ri.local.remaining",
-                        "edge_type": "all_of",
-                        "justification": "The remaining-pairs child is needed.",
-                    }
+                    self.full_edge(
+                        "ri.local.graph_pair",
+                        "ri.local.remaining",
+                        justification="The remaining-pairs child is needed.",
+                    ),
+                    self.direct_proof_edge("ri.local.remaining"),
                 ],
-                next_candidate_ids=["ri.local.remaining"],
+                next_candidate_edge_ids=[self.direct_edge_id("ri.local.remaining")],
                 structural_change_reason="Split to the remaining-pairs child.",
             ),
             supervisor.validate_theorem_frontier_review_full(
@@ -5937,25 +6635,39 @@ class TheoremFrontierTests(SupervisorTestCase):
                 self.full_frontier_review(
                     assessed_action="EXPAND",
                     outcome="EXPANDED",
-                    next_active_theorem_id="ri.local.remaining",
+                    next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                     open_hypotheses=["close the remaining-pairs child"],
                 ),
             ),
-            supervisor.validate_theorem_frontier_paper_verifier_review(
-                "proof_formalization",
-                self.paper_verifier_review(
-                    approved_node_ids=["ri.local.remaining"],
-                    approved_edges=[{"parent": "ri.local.graph_pair", "child": "ri.local.remaining"}],
+                supervisor.validate_theorem_frontier_paper_verifier_review(
+                    "proof_formalization",
+                    self.paper_verifier_review(
+                        approved_node_ids=["ri.local.remaining"],
+                        approved_edges=[
+                            {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                            {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                        ],
+                    ),
                 ),
-            ),
-            cycle=12,
-        )
+                supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                    "proof_formalization",
+                    self.nl_proof_verifier_review(
+                        approved_node_ids=["ri.local.remaining"],
+                        approved_edges=[
+                            {"parent": "ri.local.graph_pair", "child": "ri.local.remaining"},
+                            {"parent": "ri.local.remaining", "child": "ri.local.remaining", "edge_type": "direct_proof"},
+                        ],
+                    ),
+                ),
+                cycle=12,
+            )
         self.assertEqual(expanded["metrics"]["failed_close_attempts"], 0)
 
         next_payload = supervisor.update_theorem_frontier_full_state(
             config,
             state,
             self.full_worker_update(
+                active_edge_id=self.direct_edge_id("ri.local.remaining"),
                 active_node=self.full_node("ri.local.remaining"),
             ),
             supervisor.validate_theorem_frontier_review_full(
@@ -5968,7 +6680,7 @@ class TheoremFrontierTests(SupervisorTestCase):
                     blocker_cluster="graph-pair local RI collapse",
                     assessed_action="CLOSE",
                     outcome="NO_FRONTIER_PROGRESS",
-                    next_active_theorem_id="ri.local.remaining",
+                    next_active_edge_id=self.direct_edge_id("ri.local.remaining"),
                 ),
             ),
             None,
@@ -6006,7 +6718,21 @@ class TheoremFrontierTests(SupervisorTestCase):
         config = self.make_config(repo_path, theorem_frontier_phase="full")
         config.state_dir.mkdir(parents=True, exist_ok=True)
         payload = supervisor.default_theorem_frontier_payload("full")
+        payload["active_edge_id"] = self.direct_edge_id("ri.local.graph_pair")
         payload["active_leaf_id"] = "ri.local.graph_pair"
+        payload["edges"] = [
+            supervisor.validate_theorem_frontier_edge(
+                {
+                    "parent": "ri.local.graph_pair",
+                    "child": "ri.local.graph_pair",
+                    "edge_type": "direct_proof",
+                    "status": "active",
+                    "justification": "Direct proof obligation.",
+                    "paper_verifier_status": "APPROVE",
+                },
+                require_paper_status=True,
+            )
+        ]
         payload["nodes"] = {
             "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
                 self.full_node("ri.local.graph_pair"),
@@ -6031,6 +6757,107 @@ class TheoremFrontierTests(SupervisorTestCase):
 
         with self.assertRaisesRegex(supervisor.SupervisorError, "exactly one active node"):
             supervisor.load_state(config)
+
+    def test_load_state_repairs_closed_leaf_node_with_open_dependency_child(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        payload = supervisor.default_theorem_frontier_payload("full")
+        payload["nodes"] = {
+            "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.graph_pair"),
+                status="closed",
+                parent_ids=[],
+                child_ids=["ri.local.remaining"],
+            ),
+            "ri.local.remaining": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.remaining"),
+                status="open",
+                parent_ids=["ri.local.graph_pair"],
+                child_ids=[],
+            ),
+        }
+        payload["edges"] = [
+            supervisor.validate_theorem_frontier_edge(
+                {
+                    "parent": "ri.local.graph_pair",
+                    "child": "ri.local.remaining",
+                    "edge_type": "all_of",
+                    "justification": "The child is required.",
+                    "paper_verifier_status": "APPROVE",
+                },
+                require_paper_status=True,
+            )
+        ]
+        supervisor.JsonFile.dump(
+            config.state_dir / "state.json",
+            {
+                "phase": "proof_formalization",
+                "theorem_frontier": payload,
+            },
+        )
+
+        loaded = supervisor.load_state(config)
+        self.assertEqual(loaded["theorem_frontier"]["nodes"]["ri.local.graph_pair"]["status"], "open")
+
+    def test_load_state_keeps_any_child_node_closed_when_one_dependency_child_is_closed(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        payload = supervisor.default_theorem_frontier_payload("full")
+        payload["nodes"] = {
+            "ri.local.graph_pair": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.graph_pair", closure_mode="any_child"),
+                status="closed",
+                parent_ids=[],
+                child_ids=["ri.local.remaining", "ri.local.red_cap"],
+            ),
+            "ri.local.remaining": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.remaining"),
+                status="closed",
+                parent_ids=["ri.local.graph_pair"],
+                child_ids=[],
+            ),
+            "ri.local.red_cap": supervisor.theorem_frontier_node_record(
+                self.full_node("ri.local.red_cap"),
+                status="open",
+                parent_ids=["ri.local.graph_pair"],
+                child_ids=[],
+            ),
+        }
+        payload["edges"] = [
+            supervisor.validate_theorem_frontier_edge(
+                {
+                    "parent": "ri.local.graph_pair",
+                    "child": "ri.local.remaining",
+                    "edge_type": "any_of",
+                    "status": "closed",
+                    "justification": "Either child route suffices.",
+                    "paper_verifier_status": "APPROVE",
+                },
+                require_paper_status=True,
+            ),
+            supervisor.validate_theorem_frontier_edge(
+                {
+                    "parent": "ri.local.graph_pair",
+                    "child": "ri.local.red_cap",
+                    "edge_type": "any_of",
+                    "justification": "Either child route suffices.",
+                    "paper_verifier_status": "APPROVE",
+                },
+                require_paper_status=True,
+            ),
+        ]
+        supervisor.JsonFile.dump(
+            config.state_dir / "state.json",
+            {
+                "phase": "proof_formalization",
+                "theorem_frontier": payload,
+            },
+        )
+
+        loaded = supervisor.load_state(config)
+        self.assertEqual(loaded["theorem_frontier"]["nodes"]["ri.local.graph_pair"]["status"], "closed")
 
     def test_recover_interrupted_worker_state_restores_phase0_frontier_artifact(self) -> None:
         repo_path = self.make_repo()
@@ -6489,6 +7316,7 @@ class DagExportTests(SupervisorTestCase):
         return {
             "theorem_frontier": {
                 "mode": "full",
+                "active_edge_id": "main_thm|reduction|lemma_a",
                 "active_leaf_id": "main_thm",
                 "current_action": "CLOSE",
                 "nodes": {
@@ -6524,12 +7352,21 @@ class DagExportTests(SupervisorTestCase):
                     },
                 },
                 "edges": [
-                    {"parent": "main_thm", "child": "lemma_a", "edge_type": "reduction", "justification": "main reduces to lemma"},
+                    {
+                        "edge_id": "main_thm|reduction|lemma_a",
+                        "parent": "main_thm",
+                        "child": "lemma_a",
+                        "edge_type": "reduction",
+                        "status": "active",
+                        "justification": "main reduces to lemma",
+                    },
                 ],
                 "metrics": {
+                    "active_edge_age": 3,
                     "active_leaf_age": 3,
                     "blocker_cluster_age": 2,
                     "closed_nodes_count": 0,
+                    "closed_edges_count": 0,
                     "refuted_nodes_count": 0,
                     "paper_nodes_closed": 0,
                     "failed_close_attempts": 0,
@@ -6614,11 +7451,18 @@ class DagExportTests(SupervisorTestCase):
             "child_ids": [],
         }
         state["theorem_frontier"]["edges"].append(
-            {"parent": "main_thm", "child": "lemma_b", "edge_type": "reduction", "justification": "expand"}
+            {
+                "edge_id": "main_thm|reduction|lemma_b",
+                "parent": "main_thm",
+                "child": "lemma_b",
+                "edge_type": "reduction",
+                "status": "open",
+                "justification": "expand",
+            }
         )
         payload = state["theorem_frontier"]
         supervisor.export_dag_frontier_cycle(
-            config, state, before_ids, payload,
+            config, state, before_ids, {"main_thm|reduction|lemma_a"}, payload,
             cycle=11, outcome="EXPANDED", reviewed_node_id="main_thm",
             worker_directive="Expand main_thm",
         )
@@ -6635,6 +7479,8 @@ class DagExportTests(SupervisorTestCase):
         self.assertEqual(entry["node_statuses"]["main_thm"], "active")
         self.assertEqual(entry["worker_directive"], "Expand main_thm")
         self.assertIn("edges_added", entry)
+        self.assertEqual(entry["edges_added"][0]["edge_id"], "main_thm|reduction|lemma_b")
+        self.assertEqual(entry["edge_statuses"]["main_thm|reduction|lemma_a"], "active")
 
     def test_worker_directive_summary_extracts_review_prompt(self) -> None:
         state = {

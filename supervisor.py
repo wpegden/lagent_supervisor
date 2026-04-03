@@ -87,6 +87,7 @@ THEOREM_FRONTIER_CLOSURE_MODES: Tuple[str, ...] = (
     "any_child",
 )
 THEOREM_FRONTIER_EDGE_TYPES: Tuple[str, ...] = (
+    "direct_proof",
     "reduction",
     "case_split",
     "all_of",
@@ -94,6 +95,13 @@ THEOREM_FRONTIER_EDGE_TYPES: Tuple[str, ...] = (
     "replacement",
     "equivalence",
     "strengthening",
+)
+THEOREM_FRONTIER_EDGE_STATUSES: Tuple[str, ...] = (
+    "open",
+    "active",
+    "closed",
+    "refuted",
+    "replaced",
 )
 THEOREM_FRONTIER_PAPER_DECISIONS: Tuple[str, ...] = ("APPROVE", "APPROVE_WITH_CAVEAT", "REJECT")
 THEOREM_FRONTIER_PAPER_CLASSIFICATIONS: Tuple[str, ...] = (
@@ -1111,6 +1119,10 @@ def theorem_frontier_paper_verifier_path(config: Config) -> Path:
     return config.state_dir / "theorem_frontier_paper_verifier.json"
 
 
+def theorem_frontier_nl_proof_verifier_path(config: Config) -> Path:
+    return config.state_dir / "theorem_frontier_nl_proof_verifier.json"
+
+
 def paper_main_results_manifest_path(config: Config) -> Path:
     return config.state_dir / "paper_main_results.json"
 
@@ -1165,7 +1177,7 @@ def ensure_approved_axioms_file(config: Config) -> None:
 def paper_main_results_manifest_stub(config: Config) -> Dict[str, Any]:
     return {
         "phase": "theorem_stating",
-        "main_results": [
+        "nodes": [
             {
                 "node_id": "paper.main",
                 "kind": "paper",
@@ -1177,10 +1189,37 @@ def paper_main_results_manifest_stub(config: Config) -> Dict[str, Any]:
                 "blocker_cluster": "REPLACE_ME main-result blocker cluster",
                 "acceptance_evidence": "REPLACE_ME: what must be proved for this node to close.",
                 "notes": "Replace every REPLACE_ME field before advancing to proof_formalization.",
-            }
+            },
+            {
+                "node_id": "paper.main_aux",
+                "kind": "paper_faithful_reformulation",
+                "natural_language_statement": "REPLACE_ME: exact auxiliary paper lemma/case statement used on the proof spine.",
+                "lean_statement": "def REPLACE_ME_main_aux_statement : Prop := False",
+                "lean_anchor": "PaperTheorems.REPLACE_ME_main_aux_statement",
+                "paper_provenance": "REPLACE_ME: exact paper lemma/proposition/case label.",
+                "closure_mode": "leaf",
+                "blocker_cluster": "REPLACE_ME auxiliary blocker cluster",
+                "acceptance_evidence": "REPLACE_ME: what must be proved for this auxiliary node to close.",
+                "notes": "Use `paper` for exact paper statements and `paper_faithful_reformulation` only when Lean needs a faithful reformulation.",
+            },
         ],
-        "dependency_edges": [],
-        "initial_active_node_id": "paper.main",
+        "edges": [
+            {
+                "parent": "paper.main",
+                "child": "paper.main_aux",
+                "edge_type": "all_of",
+                "justification": "REPLACE_ME: why the main paper theorem reduces to this auxiliary paper obligation.",
+                "natural_language_proof": "REPLACE_ME: rigorous paper-derived NL proof of this reduction edge.",
+            },
+            {
+                "parent": "paper.main_aux",
+                "child": "paper.main_aux",
+                "edge_type": "direct_proof",
+                "justification": "REPLACE_ME: this auxiliary paper node is intended to be proved directly at the current coarse level.",
+                "natural_language_proof": "REPLACE_ME: rigorous paper-derived NL proof for the direct coarse leaf obligation.",
+            },
+        ],
+        "initial_active_edge_id": "paper.main|all_of|paper.main_aux",
     }
 
 
@@ -1339,22 +1378,26 @@ def supervisor_phase_tasks(config: Config, phase: str) -> List[str]:
     if theorem_frontier_phase(config) == "full" and theorem_frontier_state_path(config).exists():
         payload = JsonFile.load(theorem_frontier_state_path(config), {})
         if isinstance(payload, dict) and payload.get("mode") == "full":
-            active_leaf_id = normalize_frontier_text(payload.get("active_leaf_id"))
+            active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
+            active_leaf_id = theorem_frontier_edge_parent_node_id(payload, active_edge_id) or normalize_frontier_text(
+                payload.get("active_leaf_id")
+            )
             nodes = payload.get("nodes") if isinstance(payload.get("nodes"), dict) else {}
             active_node = nodes.get(active_leaf_id) if active_leaf_id else None
             metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
             escalation = payload.get("escalation") if isinstance(payload.get("escalation"), dict) else {}
             tasks.insert(0, "- [ ] The theorem-frontier DAG is authoritative for proof-formalization work.")
             if isinstance(active_node, dict):
-                tasks.insert(1, f"- [ ] Active leaf: `{active_leaf_id}` at `{active_node.get('lean_anchor')}`.")
-                tasks.insert(2, f"- [ ] Blocker cluster: {active_node.get('blocker_cluster')}.")
-                tasks.insert(3, f"- [ ] Current action: `{payload.get('current_action') or '(unset)'}`.")
+                tasks.insert(1, f"- [ ] Active obligation edge: `{active_edge_id or '(none)'}`.")
+                tasks.insert(2, f"- [ ] Active theorem node: `{active_leaf_id}` at `{active_node.get('lean_anchor')}`.")
+                tasks.insert(3, f"- [ ] Blocker cluster: {active_node.get('blocker_cluster')}.")
+                tasks.insert(4, f"- [ ] Current action: `{payload.get('current_action') or '(unset)'}`.")
                 children = active_node.get("child_ids") if isinstance(active_node.get("child_ids"), list) else []
-                tasks.insert(4, f"- [ ] Immediate children: {', '.join(children) if children else '(none)'}")
-                tasks.insert(5, f"- [ ] Active-leaf age: {int(metrics.get('active_leaf_age', 0) or 0)}; blocker age: {int(metrics.get('blocker_cluster_age', 0) or 0)}.")
+                tasks.insert(5, f"- [ ] Immediate children: {', '.join(children) if children else '(none)'}")
+                tasks.insert(6, f"- [ ] Active-edge age: {int(metrics.get('active_edge_age', 0) or 0)}; blocker age: {int(metrics.get('blocker_cluster_age', 0) or 0)}.")
             if escalation.get("required"):
                 reasons = escalation.get("reasons") if isinstance(escalation.get("reasons"), list) else []
-                tasks.insert(6, f"- [ ] Escalation required: {', '.join(str(reason) for reason in reasons) if reasons else 'yes'}.")
+                tasks.insert(7, f"- [ ] Escalation required: {', '.join(str(reason) for reason in reasons) if reasons else 'yes'}.")
     return tasks
 
 
@@ -1881,25 +1924,40 @@ def frontier_summary_for_meta(state: Dict[str, Any]) -> Optional[Dict[str, Any]]
     nodes = payload.get("nodes") or {}
     if not isinstance(nodes, dict):
         return None
+    edges = payload.get("edges") or []
+    if not isinstance(edges, list):
+        return None
     status_counts: Dict[str, int] = {}
-    for node in nodes.values():
+    for node_id, node in nodes.items():
         if isinstance(node, dict):
-            s = str(node.get("status", "unknown"))
+            s = theorem_frontier_effective_node_status(nodes, edges, node_id)
             status_counts[s] = status_counts.get(s, 0) + 1
+    edge_status_counts: Dict[str, int] = {}
+    for edge in edges:
+        if isinstance(edge, dict):
+            s = str(edge.get("status", "unknown"))
+            edge_status_counts[s] = edge_status_counts.get(s, 0) + 1
     metrics = payload.get("metrics") or {}
     escalation = payload.get("escalation") or {}
-    active_leaf_id = normalize_frontier_text(payload.get("active_leaf_id"))
+    active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
+    active_leaf_id = theorem_frontier_edge_parent_node_id(payload, active_edge_id) or normalize_frontier_text(
+        payload.get("active_leaf_id")
+    )
     active_node = nodes.get(active_leaf_id) if active_leaf_id else None
     return {
         "mode": "full",
         "has_frontier": True,
         "total_nodes": len(nodes),
+        "total_edges": len(edges),
         "status_counts": status_counts,
+        "edge_status_counts": edge_status_counts,
+        "active_edge_id": active_edge_id or None,
         "active_leaf_id": active_leaf_id or None,
         "active_leaf_anchor": active_node.get("lean_anchor") if isinstance(active_node, dict) else None,
         "escalation_required": bool(escalation.get("required")),
         "cone_purity": metrics.get("cone_purity"),
         "paper_nodes_closed": int(metrics.get("paper_nodes_closed", 0) or 0),
+        "closed_edges_count": int(metrics.get("closed_edges_count", 0) or 0),
     }
 
 
@@ -1921,11 +1979,23 @@ def _compact_frontier_node(node: Dict[str, Any]) -> Dict[str, Any]:
         for k in (
             "node_id", "kind", "status", "display_label",
             "natural_language_statement",
+            "natural_language_proof",
             "lean_statement", "lean_anchor", "paper_provenance",
             "closure_mode", "blocker_cluster", "acceptance_evidence",
             "notes", "parent_ids", "child_ids",
         )
         if k in node
+    }
+
+
+def _compact_frontier_edge(edge: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        k: edge[k]
+        for k in (
+            "edge_id", "parent", "child", "edge_type", "status",
+            "justification", "natural_language_proof", "paper_verifier_status",
+        )
+        if k in edge
     }
 
 
@@ -1939,6 +2009,7 @@ def export_dag_frontier_seed(
     entry = {
         "cycle": cycle,
         "type": "seed",
+        "active_edge_id": payload.get("active_edge_id"),
         "active_leaf_id": payload.get("active_leaf_id"),
         "nodes": {
             nid: _compact_frontier_node(n)
@@ -1946,7 +2017,7 @@ def export_dag_frontier_seed(
             if isinstance(n, dict)
         },
         "edges": [
-            {k: e[k] for k in ("parent", "child", "edge_type", "justification") if k in e}
+            _compact_frontier_edge(e)
             for e in (payload.get("edges") or [])
             if isinstance(e, dict)
         ],
@@ -1960,6 +2031,7 @@ def export_dag_frontier_cycle(
     config: Config,
     state: Dict[str, Any],
     before_node_ids: Set[str],
+    before_edge_ids: Set[str],
     payload: Dict[str, Any],
     *,
     cycle: int,
@@ -1968,12 +2040,18 @@ def export_dag_frontier_cycle(
     worker_directive: str,
 ) -> None:
     nodes = payload.get("nodes") or {}
-    new_node_ids = set(nodes.keys()) - before_node_ids
     edges = payload.get("edges") or []
+    new_node_ids = set(nodes.keys()) - before_node_ids
+    new_edge_ids = {
+        str(edge.get("edge_id"))
+        for edge in edges
+        if isinstance(edge, dict) and edge.get("edge_id") and str(edge.get("edge_id")) not in before_edge_ids
+    }
     entry: Dict[str, Any] = {
         "cycle": cycle,
         "type": "review",
         "outcome": outcome,
+        "active_edge_id": payload.get("active_edge_id"),
         "reviewed_node_id": reviewed_node_id,
         "active_leaf_id": payload.get("active_leaf_id"),
         "worker_directive": worker_directive,
@@ -1987,15 +2065,20 @@ def export_dag_frontier_cycle(
             for nid, n in nodes.items()
             if isinstance(n, dict)
         },
+        "edge_statuses": {
+            str(e.get("edge_id", "")): str(e.get("status", ""))
+            for e in edges
+            if isinstance(e, dict) and e.get("edge_id")
+        },
         "metrics": dict(payload.get("metrics") or {}),
         "escalation": dict(payload.get("escalation") or {}),
         "timestamp": timestamp_now(),
     }
-    if new_node_ids:
+    if new_edge_ids:
         entry["edges_added"] = [
-            {k: e[k] for k in ("parent", "child", "edge_type", "justification") if k in e}
+            _compact_frontier_edge(e)
             for e in edges
-            if isinstance(e, dict) and (e.get("parent") in new_node_ids or e.get("child") in new_node_ids)
+            if isinstance(e, dict) and e.get("edge_id") in new_edge_ids
         ]
     append_jsonl(dag_frontier_history_path(config), entry)
 
@@ -2725,6 +2808,7 @@ GEMINI_RATE_LIMIT_OR_CAPACITY_PATTERNS: Tuple[str, ...] = (
 )
 
 BUDGET_ERROR_RETRY_DELAY_SECONDS = 15 * 60
+PRODUCTIVE_LOCAL_FAILURE_MAX_RETRY_DELAY_SECONDS = 5 * 60
 
 BUDGET_ERROR_PATTERNS: Tuple[str, ...] = (
     "model_capacity_exhausted",
@@ -2745,6 +2829,32 @@ BUDGET_ERROR_PATTERNS: Tuple[str, ...] = (
     "hit your limit",
 )
 
+PRODUCTIVE_LOCAL_FAILURE_PATTERNS: Tuple[str, ...] = (
+    "type mismatch",
+    "unsolved goals",
+    "application type mismatch",
+    "declaration has type",
+    "tactic `",
+    "tactic '",
+    "building twobites.",
+    "error: twobites/",
+    "error: repo/",
+    "lake build",
+)
+
+
+def burst_log_text(run: Dict[str, Any]) -> str:
+    log_text = ""
+    per_cycle_log = run.get("per_cycle_log")
+    if isinstance(per_cycle_log, Path):
+        log_text += read_text(per_cycle_log)
+    elif per_cycle_log:
+        log_text += read_text(Path(str(per_cycle_log)))
+    captured = run.get("captured_output")
+    if isinstance(captured, str):
+        log_text += "\n" + captured
+    return log_text
+
 
 def gemini_should_fallback_on_run(adapter: ProviderAdapter, run: Dict[str, Any]) -> bool:
     if adapter.cfg.provider != "gemini":
@@ -2755,33 +2865,24 @@ def gemini_should_fallback_on_run(adapter: ProviderAdapter, run: Dict[str, Any])
         return False
     if int(run.get("exit_code", 0) or 0) == 0:
         return False
-    log_text = ""
-    per_cycle_log = run.get("per_cycle_log")
-    if isinstance(per_cycle_log, Path):
-        log_text += read_text(per_cycle_log)
-    elif per_cycle_log:
-        log_text += read_text(Path(str(per_cycle_log)))
-    captured = run.get("captured_output")
-    if isinstance(captured, str):
-        log_text += "\n" + captured
-    lowered = log_text.lower()
+    lowered = burst_log_text(run).lower()
     return any(pattern.lower() in lowered for pattern in GEMINI_RATE_LIMIT_OR_CAPACITY_PATTERNS)
 
 
 def burst_hit_budget_error(run: Dict[str, Any]) -> bool:
     if int(run.get("exit_code", 0) or 0) == 0:
         return False
-    log_text = ""
-    per_cycle_log = run.get("per_cycle_log")
-    if isinstance(per_cycle_log, Path):
-        log_text += read_text(per_cycle_log)
-    elif per_cycle_log:
-        log_text += read_text(Path(str(per_cycle_log)))
-    captured = run.get("captured_output")
-    if isinstance(captured, str):
-        log_text += "\n" + captured
-    lowered = log_text.lower()
+    lowered = burst_log_text(run).lower()
     return any(pattern in lowered for pattern in BUDGET_ERROR_PATTERNS)
+
+
+def burst_hit_productive_local_failure(run: Dict[str, Any]) -> bool:
+    if int(run.get("exit_code", 0) or 0) == 0:
+        return False
+    if burst_hit_budget_error(run):
+        return False
+    lowered = burst_log_text(run).lower()
+    return any(pattern in lowered for pattern in PRODUCTIVE_LOCAL_FAILURE_PATTERNS)
 
 
 def gemini_fallback_adapter(adapter: ProviderAdapter) -> GeminiAdapter:
@@ -2838,10 +2939,12 @@ def load_state(config: Config) -> Dict[str, Any]:
     state.setdefault("last_theorem_frontier_worker_update", None)
     state.setdefault("last_theorem_frontier_review", None)
     state.setdefault("last_theorem_frontier_paper_review", None)
+    state.setdefault("last_theorem_frontier_nl_proof_review", None)
     if state["theorem_frontier"] is None and theorem_frontier_state_path(config).exists():
-        state["theorem_frontier"] = validate_loaded_theorem_frontier_payload(
-            JsonFile.load(theorem_frontier_state_path(config), None)
-        )
+        raw_frontier = JsonFile.load(theorem_frontier_state_path(config), None)
+        state["theorem_frontier"] = validate_loaded_theorem_frontier_payload(raw_frontier)
+        if state["theorem_frontier"] != raw_frontier:
+            JsonFile.dump(theorem_frontier_state_path(config), state["theorem_frontier"])
     elif state["theorem_frontier"] is not None:
         state["theorem_frontier"] = validate_loaded_theorem_frontier_payload(state["theorem_frontier"])
     current_phase(config, state)
@@ -2893,11 +2996,17 @@ def theorem_frontier_context_text(config: Config, state: Dict[str, Any], provide
         return ""
     if theorem_frontier_full_enabled(config, phase):
         payload = theorem_frontier_payload(state) or default_theorem_frontier_payload("full")
-        active_leaf_id = normalize_frontier_text(payload.get("active_leaf_id"))
+        active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
+        active_leaf_id = theorem_frontier_edge_parent_node_id(payload, active_edge_id) or normalize_frontier_text(
+            payload.get("active_leaf_id")
+        )
         nodes = payload.get("nodes") if isinstance(payload.get("nodes"), dict) else {}
+        edge_map = theorem_frontier_edge_map(payload)
+        active_edge = edge_map.get(active_edge_id) if active_edge_id else None
         active_node = nodes.get(active_leaf_id) if active_leaf_id else None
         worker_artifact = supervisor_prompt_label(config, provider, theorem_frontier_worker_update_path(config))
         paper_artifact = supervisor_prompt_label(config, provider, theorem_frontier_paper_verifier_path(config))
+        nl_proof_artifact = supervisor_prompt_label(config, provider, theorem_frontier_nl_proof_verifier_path(config))
         review_artifact = supervisor_prompt_label(config, provider, theorem_frontier_review_path(config))
         metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
         escalation = payload.get("escalation") if isinstance(payload.get("escalation"), dict) else {}
@@ -2905,25 +3014,44 @@ def theorem_frontier_context_text(config: Config, state: Dict[str, Any], provide
             "Theorem-frontier DAG discipline:",
             "- Proof formalization is controlled by an authoritative theorem-frontier DAG.",
             f"- The worker must write the theorem-frontier worker artifact to `{worker_artifact}`.",
-            f"- Structural DAG edits are reviewed through `{paper_artifact}` before they enter the DAG.",
+            f"- Structural DAG edits are reviewed through `{paper_artifact}` and `{nl_proof_artifact}` before they enter the DAG.",
             f"- The reviewer must write the theorem-frontier review artifact to `{review_artifact}`.",
-            "- Each burst must act on one active theorem node via `CLOSE`, `EXPAND`, or `REFUTE_REPLACE`.",
+            "- Each burst must act on one active obligation edge via `CLOSE`, `EXPAND`, or `REFUTE_REPLACE`.",
             "- Work outside the active cone does not count as theorem-frontier progress.",
         ]
         if isinstance(active_node, dict):
             children = active_node.get("child_ids") if isinstance(active_node.get("child_ids"), list) else []
+            active_outgoing_edges = [
+                edge
+                for edge in (payload.get("edges") or [])
+                if isinstance(edge, dict) and edge.get("parent") == active_leaf_id and edge.get("edge_type") != "replacement"
+            ]
+            edge_summary = (
+                "; ".join(
+                    f"{edge.get('edge_id')} [{edge.get('status')}] -> {edge.get('child')}"
+                    for edge in active_outgoing_edges
+                )
+                if active_outgoing_edges
+                else "(none)"
+            )
             lines.extend(
                 [
                     "Current authoritative frontier state:",
-                    f"- Active leaf id: {active_leaf_id}",
+                    f"- Active obligation edge: {active_edge_id or '(none)'}",
+                    f"- Active theorem node: {active_leaf_id}",
                     f"- Kind: {active_node.get('kind') or '(none)'}",
                     f"- Anchor: {active_node.get('lean_anchor') or '(none)'}",
                     f"- Closure mode: {active_node.get('closure_mode') or '(none)'}",
+                    f"- Active edge type: {active_edge.get('edge_type') if isinstance(active_edge, dict) else '(none)'}",
+                    f"- Active edge target: {active_edge.get('child') if isinstance(active_edge, dict) else '(none)'}",
                     f"- Blocker cluster: {active_node.get('blocker_cluster') or '(none)'}",
                     f"- Immediate children: {', '.join(children) if children else '(none)'}",
+                    f"- Outgoing dependency edges: {edge_summary}",
+                    f"- Active-edge age: {int(metrics.get('active_edge_age', 0) or 0)}",
                     f"- Active-leaf age: {int(metrics.get('active_leaf_age', 0) or 0)}",
                     f"- Blocker-cluster age: {int(metrics.get('blocker_cluster_age', 0) or 0)}",
                     f"- Failed close attempts on this blocker: {int(metrics.get('failed_close_attempts', 0) or 0)}",
+                    f"- Closed edges: {int(metrics.get('closed_edges_count', 0) or 0)}",
                     f"- Latest cone purity: {metrics.get('cone_purity') or '(none)'}",
                 ]
             )
@@ -3048,14 +3176,17 @@ def default_theorem_frontier_payload(mode: str) -> Dict[str, Any]:
         }
     return {
         "mode": "full",
+        "active_edge_id": None,
         "active_leaf_id": None,
         "current_action": None,
         "nodes": {},
         "edges": [],
         "metrics": {
+            "active_edge_age": 0,
             "active_leaf_age": 0,
             "blocker_cluster_age": 0,
             "closed_nodes_count": 0,
+            "closed_edges_count": 0,
             "refuted_nodes_count": 0,
             "paper_nodes_closed": 0,
             "failed_close_attempts": 0,
@@ -3068,6 +3199,7 @@ def default_theorem_frontier_payload(mode: str) -> Dict[str, Any]:
             "reasons": [],
         },
         "paper_verifier_history": [],
+        "nl_proof_verifier_history": [],
         "current": None,
     }
 
@@ -3079,10 +3211,33 @@ def theorem_frontier_payload(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def theorem_frontier_edge_parent_node_id(payload: Dict[str, Any], edge_id: Any) -> str:
+    edge_id_text = normalize_frontier_text(edge_id)
+    if not edge_id_text:
+        return ""
+    edge_map = theorem_frontier_edge_map(payload)
+    edge = edge_map.get(edge_id_text)
+    if not isinstance(edge, dict):
+        return ""
+    return normalize_frontier_text(edge.get("parent"))
+
+
+def theorem_frontier_active_edge_id(state: Dict[str, Any]) -> str:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return ""
+    return normalize_frontier_text(payload.get("active_edge_id"))
+
+
 def theorem_frontier_active_leaf_id(state: Dict[str, Any]) -> str:
     payload = theorem_frontier_payload(state)
     if not isinstance(payload, dict):
         return ""
+    active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
+    if active_edge_id:
+        parent_id = theorem_frontier_edge_parent_node_id(payload, active_edge_id)
+        if parent_id:
+            return parent_id
     return normalize_frontier_text(payload.get("active_leaf_id"))
 
 
@@ -3090,8 +3245,11 @@ def theorem_frontier_branch_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     payload = theorem_frontier_payload(state)
     if not isinstance(payload, dict) or normalize_frontier_text(payload.get("mode")).lower() != "full":
         return {}
-    active_leaf_id = normalize_frontier_text(payload.get("active_leaf_id"))
+    active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
+    active_leaf_id = theorem_frontier_active_leaf_id(state)
     nodes = payload.get("nodes") if isinstance(payload.get("nodes"), dict) else {}
+    edge_map = theorem_frontier_edge_map(payload)
+    active_edge = edge_map.get(active_edge_id) if active_edge_id else None
     active_node = nodes.get(active_leaf_id) if active_leaf_id else None
     current = payload.get("current") if isinstance(payload.get("current"), dict) else {}
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
@@ -3103,6 +3261,11 @@ def theorem_frontier_branch_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         if str(item).strip()
     ] if isinstance(raw_open_hypotheses, list) else []
     return {
+        "active_edge_id": active_edge_id or None,
+        "active_edge_type": active_edge.get("edge_type") if isinstance(active_edge, dict) else None,
+        "active_edge_status": active_edge.get("status") if isinstance(active_edge, dict) else None,
+        "active_edge_child_id": active_edge.get("child") if isinstance(active_edge, dict) else None,
+        "active_edge_justification": active_edge.get("justification") if isinstance(active_edge, dict) else None,
         "active_leaf_id": active_leaf_id or None,
         "active_leaf_kind": active_node.get("kind") if isinstance(active_node, dict) else None,
         "active_leaf_anchor": active_node.get("lean_anchor") if isinstance(active_node, dict) else None,
@@ -3117,6 +3280,7 @@ def theorem_frontier_branch_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         "assessed_action": normalize_frontier_text(current.get("assessed_action")) or None,
         "open_hypotheses": open_hypotheses,
         "open_hypotheses_count": len(open_hypotheses),
+        "active_edge_age": int(metrics.get("active_edge_age", 0) or 0),
         "active_leaf_age": int(metrics.get("active_leaf_age", 0) or 0),
         "blocker_cluster_age": int(metrics.get("blocker_cluster_age", 0) or 0),
         "failed_close_attempts": int(metrics.get("failed_close_attempts", 0) or 0),
@@ -3132,8 +3296,9 @@ def theorem_frontier_branch_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def branch_selection_question_for_state(state: Dict[str, Any]) -> str:
     summary = theorem_frontier_branch_summary(state)
+    active_edge_id = str(summary.get("active_edge_id") or "").strip()
     active_leaf_id = str(summary.get("active_leaf_id") or "").strip()
-    if not active_leaf_id:
+    if not active_edge_id and not active_leaf_id:
         return "Which branch seems more likely to eventually succeed at formalizing the whole paper?"
     anchor = str(summary.get("active_leaf_anchor") or "").strip()
     blocker = str(summary.get("blocker_cluster") or "").strip()
@@ -3144,7 +3309,7 @@ def branch_selection_question_for_state(state: Dict[str, Any]) -> str:
         detail_bits.append(f"(current blocker cluster: {blocker})")
     detail_suffix = f" {' '.join(detail_bits)}" if detail_bits else ""
     return (
-        f"Which branch seems more likely to close theorem-frontier node `{active_leaf_id}`{detail_suffix} "
+        f"Which branch seems more likely to close theorem-frontier obligation `{active_edge_id or active_leaf_id}`{detail_suffix} "
         "and then finish formalizing the whole paper?"
     )
 
@@ -3162,6 +3327,7 @@ def reset_child_branch_theorem_frontier_runtime_state(state: Dict[str, Any]) -> 
         payload["current"] = None
     elif mode == "full":
         metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        metrics["active_edge_age"] = 0
         metrics["active_leaf_age"] = 0
         metrics["blocker_cluster_age"] = 0
         metrics["failed_close_attempts"] = 0
@@ -3175,6 +3341,7 @@ def reset_child_branch_theorem_frontier_runtime_state(state: Dict[str, Any]) -> 
     state["last_theorem_frontier_worker_update"] = None
     state["last_theorem_frontier_review"] = None
     state["last_theorem_frontier_paper_review"] = None
+    state["last_theorem_frontier_nl_proof_review"] = None
 
 
 def write_theorem_frontier_state_file_if_present(state_dir: Path, state: Dict[str, Any]) -> None:
@@ -3273,6 +3440,7 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(raw_edges, list):
         raise SupervisorError("Full theorem-frontier payload edges must be a list.")
     edges: List[Dict[str, Any]] = []
+    seen_edge_ids: Set[str] = set()
     for raw_edge in raw_edges:
         if not isinstance(raw_edge, dict):
             raise SupervisorError("Theorem-frontier edges must be objects.")
@@ -3282,6 +3450,9 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
                 "Theorem-frontier edge references a missing node: "
                 f"{validated_edge['parent']!r} -> {validated_edge['child']!r}"
             )
+        if validated_edge["edge_id"] in seen_edge_ids:
+            raise SupervisorError(f"Duplicate theorem-frontier edge id {validated_edge['edge_id']!r}.")
+        seen_edge_ids.add(validated_edge["edge_id"])
         edges.append(validated_edge)
 
     for node in nodes.values():
@@ -3292,7 +3463,30 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
             if child_id not in nodes:
                 raise SupervisorError(f"Theorem-frontier node {node['node_id']!r} references missing child {child_id!r}.")
 
+    repair_theorem_frontier_closed_nodes(nodes, edges)
+
+    active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
     active_leaf_id = normalize_frontier_text(payload.get("active_leaf_id"))
+    if active_edge_id:
+        edge_map = theorem_frontier_edge_map({"edges": edges})
+        if active_edge_id not in edge_map:
+            raise SupervisorError(f"Theorem-frontier active_edge_id {active_edge_id!r} is not present in edges.")
+        if edge_map[active_edge_id]["status"] not in {"open", "active"}:
+            raise SupervisorError(
+                f"Theorem-frontier active_edge_id {active_edge_id!r} must name an open/active edge, "
+                f"not {edge_map[active_edge_id]['status']!r}."
+            )
+        derived_active_leaf_id = normalize_frontier_text(edge_map[active_edge_id].get("parent"))
+        if active_leaf_id and active_leaf_id != derived_active_leaf_id:
+            raise SupervisorError(
+                "Theorem-frontier active_leaf_id must match the parent of active_edge_id; "
+                f"got active_leaf_id={active_leaf_id!r}, active_edge_id={active_edge_id!r}."
+            )
+        active_leaf_id = derived_active_leaf_id
+    elif active_leaf_id:
+        raise SupervisorError(
+            "Full theorem-frontier payload cannot set active_leaf_id without an explicit active_edge_id."
+        )
     if active_leaf_id:
         if active_leaf_id not in nodes:
             raise SupervisorError(f"Theorem-frontier active_leaf_id {active_leaf_id!r} is not present in nodes.")
@@ -3302,10 +3496,22 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
                 f"not {nodes[active_leaf_id]['status']!r}."
             )
     active_nodes = sorted(node_id for node_id, node in nodes.items() if node.get("status") == "active")
-    if active_leaf_id:
-        if active_nodes != [active_leaf_id]:
+    active_edges = sorted(edge["edge_id"] for edge in edges if edge.get("status") == "active")
+    if active_edge_id:
+        if active_edges != [active_edge_id]:
             raise SupervisorError(
-                "Full theorem-frontier payload must have exactly one active node matching active_leaf_id; "
+                "Full theorem-frontier payload must have exactly one active edge matching active_edge_id; "
+                f"found active edges {active_edges!r} with active_edge_id={active_edge_id!r}."
+            )
+    elif active_edges:
+        raise SupervisorError(
+            "Full theorem-frontier payload has active edges but no active_edge_id: "
+            f"{active_edges!r}."
+        )
+    if active_leaf_id:
+        if active_nodes not in ([active_leaf_id], []):
+            raise SupervisorError(
+                "Full theorem-frontier payload must have exactly one active node matching active_leaf_id when any node is marked active; "
                 f"found active nodes {active_nodes!r} with active_leaf_id={active_leaf_id!r}."
             )
     elif active_nodes:
@@ -3318,9 +3524,11 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(raw_metrics, dict):
         raise SupervisorError("Full theorem-frontier metrics must be a mapping.")
     metrics = {
+        "active_edge_age": int(raw_metrics.get("active_edge_age", 0) or 0),
         "active_leaf_age": int(raw_metrics.get("active_leaf_age", 0) or 0),
         "blocker_cluster_age": int(raw_metrics.get("blocker_cluster_age", 0) or 0),
         "closed_nodes_count": int(raw_metrics.get("closed_nodes_count", 0) or 0),
+        "closed_edges_count": int(raw_metrics.get("closed_edges_count", 0) or 0),
         "refuted_nodes_count": int(raw_metrics.get("refuted_nodes_count", 0) or 0),
         "paper_nodes_closed": int(raw_metrics.get("paper_nodes_closed", 0) or 0),
         "failed_close_attempts": int(raw_metrics.get("failed_close_attempts", 0) or 0),
@@ -3358,13 +3566,24 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
         normalized_history.append(
             validate_theorem_frontier_paper_verifier_review("proof_formalization", item)
         )
+    nl_history = payload.get("nl_proof_verifier_history", [])
+    if not isinstance(nl_history, list):
+        raise SupervisorError("Full theorem-frontier nl_proof_verifier_history must be a list.")
+    normalized_nl_history: List[Dict[str, Any]] = []
+    for item in nl_history:
+        if not isinstance(item, dict):
+            raise SupervisorError("nl_proof_verifier_history entries must be objects.")
+        normalized_nl_history.append(
+            validate_theorem_frontier_nl_proof_verifier_review("proof_formalization", item)
+        )
 
     current = payload.get("current")
     if current is not None and not isinstance(current, dict):
         raise SupervisorError("Full theorem-frontier current payload must be an object or null.")
 
-    return {
+    result = {
         "mode": "full",
+        "active_edge_id": active_edge_id or None,
         "active_leaf_id": active_leaf_id or None,
         "current_action": normalized_current_action,
         "nodes": nodes,
@@ -3372,8 +3591,253 @@ def validate_loaded_theorem_frontier_payload(payload: Any) -> Dict[str, Any]:
         "metrics": metrics,
         "escalation": escalation,
         "paper_verifier_history": normalized_history,
+        "nl_proof_verifier_history": normalized_nl_history,
         "current": dict(current) if isinstance(current, dict) else None,
     }
+    sync_theorem_frontier_metrics(result)
+    return result
+
+
+def theorem_frontier_outgoing_dependency_edges(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+) -> List[Dict[str, Any]]:
+    if node_id not in nodes:
+        return []
+    return [
+        edge
+        for edge in edges
+        if isinstance(edge, dict)
+        and edge.get("parent") == node_id
+        and edge.get("child") in nodes
+        and edge.get("edge_type") != "replacement"
+        and edge.get("status") != "replaced"
+    ]
+
+
+def theorem_frontier_edge_satisfied(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    edge: Dict[str, Any],
+    memo: Optional[Dict[str, str]] = None,
+    visiting: Optional[Set[str]] = None,
+) -> bool:
+    if str(edge.get("status", "")) != "closed":
+        return False
+    if str(edge.get("edge_type", "")) == "direct_proof":
+        return True
+    child_id = normalize_frontier_text(edge.get("child"))
+    if not child_id:
+        return False
+    return theorem_frontier_effective_node_status(nodes, edges, child_id, memo, visiting) == "closed"
+
+
+def theorem_frontier_effective_node_status(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+    memo: Optional[Dict[str, str]] = None,
+    visiting: Optional[Set[str]] = None,
+) -> str:
+    if memo is None:
+        memo = {}
+    if visiting is None:
+        visiting = set()
+    if node_id in memo:
+        return memo[node_id]
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        raise SupervisorError(f"Unknown theorem-frontier node {node_id!r}.")
+    raw_status = str(node.get("status", "open"))
+    if raw_status in {"refuted", "replaced"}:
+        memo[node_id] = raw_status
+        return raw_status
+    if node_id in visiting:
+        return raw_status if raw_status in {"active", "frozen", "proposed"} else "open"
+    visiting.add(node_id)
+    dependency_edges = theorem_frontier_outgoing_dependency_edges(nodes, edges, node_id)
+    closure_mode = node.get("closure_mode")
+    closed_dependency_edges = [
+        edge
+        for edge in dependency_edges
+        if theorem_frontier_edge_satisfied(nodes, edges, edge, memo, visiting)
+    ]
+    proved = False
+    if closure_mode == "leaf" and not dependency_edges:
+        proved = raw_status == "closed"
+    elif closure_mode in {"leaf", "all_children", "all_cases"}:
+        proved = bool(dependency_edges) and len(closed_dependency_edges) == len(dependency_edges)
+    elif closure_mode == "any_child":
+        proved = bool(closed_dependency_edges)
+    else:
+        raise SupervisorError(f"Unhandled theorem-frontier closure_mode {closure_mode!r} for node {node_id!r}.")
+    visiting.remove(node_id)
+    effective = "closed" if proved else (raw_status if raw_status in {"active", "frozen", "proposed"} else "open")
+    memo[node_id] = effective
+    return effective
+
+
+def theorem_frontier_node_closure_check(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+) -> Tuple[bool, str]:
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        raise SupervisorError(f"Unknown theorem-frontier node {node_id!r}.")
+    dependency_edges = theorem_frontier_outgoing_dependency_edges(nodes, edges, node_id)
+    closure_mode = node.get("closure_mode")
+    edge_child_statuses = {
+        edge["edge_id"]: {
+            "child_id": edge["child"],
+            "edge_type": edge.get("edge_type"),
+            "edge_status": str(edge.get("status", "")),
+            "child_status": (
+                "closed"
+                if str(edge.get("edge_type", "")) == "direct_proof"
+                else theorem_frontier_effective_node_status(nodes, edges, str(edge["child"]))
+            ),
+            "satisfied": theorem_frontier_edge_satisfied(nodes, edges, edge),
+        }
+        for edge in dependency_edges
+    }
+    unresolved_edges = sorted(
+        edge_id
+        for edge_id, status in edge_child_statuses.items()
+        if not status["satisfied"]
+    )
+    closed_edges = sorted(
+        edge_id
+        for edge_id, status in edge_child_statuses.items()
+        if status["satisfied"]
+    )
+
+    if closure_mode == "leaf" and not dependency_edges:
+        return (node.get("status") == "closed"), ("it is a leaf with no direct proof edge or closed raw status")
+    if closure_mode in {"leaf", "all_children", "all_cases"}:
+        if not dependency_edges:
+            return False, "it has no dependency/proof edges"
+        if unresolved_edges:
+            return (
+                False,
+                "required dependency edges or child theorems are not closed: "
+                f"{unresolved_edges!r}",
+            )
+        return True, ""
+    if closure_mode == "any_child":
+        if not dependency_edges:
+            return False, "its closure_mode is 'any_child' but it has no dependency children"
+        if closed_edges:
+            return True, ""
+        return (
+            False,
+            "its closure_mode is 'any_child' but none of its dependency edges lead to a closed child theorem: "
+            f"{sorted(edge_child_statuses)!r}",
+        )
+    raise SupervisorError(f"Unhandled theorem-frontier closure_mode {closure_mode!r} for node {node_id!r}.")
+
+
+def repair_theorem_frontier_closed_nodes(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+) -> List[str]:
+    reopened: List[str] = []
+    while True:
+        changed = False
+        for node_id, node in nodes.items():
+            if not isinstance(node, dict) or node.get("status") != "closed":
+                continue
+            closable, _reason = theorem_frontier_node_closure_check(nodes, edges, node_id)
+            if closable:
+                continue
+            node["status"] = "open"
+            node["updated_at"] = timestamp_now()
+            reopened.append(node_id)
+            changed = True
+        if not changed:
+            break
+    return reopened
+
+
+def theorem_frontier_is_leaf_node(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+) -> bool:
+    return not theorem_frontier_outgoing_dependency_edges(nodes, edges, node_id)
+
+
+def require_natural_language_proofs_for_structural_admission(
+    *,
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    approved_node_ids: Set[str],
+    approved_edge_ids: Set[str],
+) -> None:
+    missing_leaf_proofs = sorted(
+        node_id
+        for node_id in approved_node_ids
+        if node_id in nodes
+        and theorem_frontier_is_leaf_node(nodes, edges, node_id)
+        and not normalize_frontier_text(nodes[node_id].get("natural_language_proof"))
+    )
+    if missing_leaf_proofs:
+        raise SupervisorError(
+            "Successful structural admission requires complete natural-language proofs for all newly admitted leaf nodes: "
+            f"{missing_leaf_proofs!r}."
+        )
+    edge_map = {
+        str(edge.get("edge_id")): edge
+        for edge in edges
+        if isinstance(edge, dict) and edge.get("edge_id")
+    }
+    missing_edge_proofs = sorted(
+        edge_id
+        for edge_id in approved_edge_ids
+        if edge_id in edge_map
+        and str(edge_map[edge_id].get("edge_type", "")) != "direct_proof"
+        and not normalize_frontier_text(edge_map[edge_id].get("natural_language_proof"))
+    )
+    if missing_edge_proofs:
+        raise SupervisorError(
+            "Successful structural admission requires complete natural-language proofs for all newly admitted edges: "
+            f"{missing_edge_proofs!r}."
+        )
+
+
+def sync_theorem_frontier_metrics(payload: Dict[str, Any]) -> None:
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        return
+    edges = payload.get("edges")
+    if not isinstance(edges, list):
+        return
+    metrics = payload.setdefault("metrics", {})
+    if not isinstance(metrics, dict):
+        return
+    effective_statuses = {
+        node_id: theorem_frontier_effective_node_status(nodes, edges, node_id)
+        for node_id in nodes
+    }
+    metrics["closed_nodes_count"] = sum(
+        1 for node_id in nodes if effective_statuses.get(node_id) == "closed"
+    )
+    metrics["closed_edges_count"] = sum(
+        1 for edge in edges if isinstance(edge, dict) and edge.get("status") == "closed"
+    )
+    metrics["refuted_nodes_count"] = sum(
+        1
+        for node in nodes.values()
+        if isinstance(node, dict) and node.get("status") in {"refuted", "replaced"}
+    )
+    metrics["paper_nodes_closed"] = sum(
+        1
+        for node_id, node in nodes.items()
+        if isinstance(node, dict)
+        and effective_statuses.get(node_id) == "closed"
+        and node.get("kind") in {"paper", "paper_faithful_reformulation"}
+    )
 
 
 def theorem_frontier_node_kind(value: Any) -> str:
@@ -3389,6 +3853,9 @@ def theorem_frontier_closure_mode(value: Any) -> str:
 
 
 THEOREM_FRONTIER_EDGE_TYPE_ALIASES: Dict[str, str] = {
+    "proof": "direct_proof",
+    "prove": "direct_proof",
+    "direct": "direct_proof",
     "depends_on": "reduction",
     "dependency": "reduction",
     "requires": "reduction",
@@ -3408,6 +3875,19 @@ def theorem_frontier_edge_type(value: Any) -> str:
     if normalized in THEOREM_FRONTIER_EDGE_TYPE_ALIASES:
         normalized = THEOREM_FRONTIER_EDGE_TYPE_ALIASES[normalized]
     return normalize_frontier_enum(normalized, THEOREM_FRONTIER_EDGE_TYPES, label="theorem frontier edge type")
+
+
+def theorem_frontier_edge_status(value: Any) -> str:
+    return normalize_frontier_enum(value, THEOREM_FRONTIER_EDGE_STATUSES, label="theorem frontier edge status")
+
+
+def theorem_frontier_edge_id(parent: Any, edge_type: Any, child: Any) -> str:
+    parent_text = normalize_frontier_text(parent)
+    edge_type_text = theorem_frontier_edge_type(edge_type)
+    child_text = normalize_frontier_text(child)
+    if not parent_text or not child_text:
+        raise SupervisorError("Theorem-frontier edge ids require non-empty parent and child ids.")
+    return f"{parent_text}|{edge_type_text}|{child_text}"
 
 
 def theorem_frontier_paper_decision(value: Any) -> str:
@@ -3451,6 +3931,7 @@ def validate_theorem_frontier_node(
     validated["node_id"] = normalize_frontier_text(validated.get("node_id"))
     validated["kind"] = theorem_frontier_node_kind(validated.get("kind"))
     validated["natural_language_statement"] = normalize_frontier_text(validated.get("natural_language_statement"))
+    validated["natural_language_proof"] = normalize_frontier_text(validated.get("natural_language_proof"))
     validated["lean_statement"] = normalize_frontier_text(validated.get("lean_statement"))
     validated["lean_anchor"] = normalize_frontier_text(validated.get("lean_anchor"))
     validated["paper_provenance"] = normalize_frontier_text(validated.get("paper_provenance"))
@@ -3472,7 +3953,7 @@ def validate_theorem_frontier_node(
     ):
         if not validated[key]:
             raise SupervisorError(f"Theorem-frontier node field {key} must be non-empty.")
-    for key in ("blocker_cluster", "acceptance_evidence", "notes"):
+    for key in ("blocker_cluster", "acceptance_evidence", "notes", "natural_language_proof"):
         if key not in validated or validated[key] is None:
             validated[key] = ""
     return validated
@@ -3489,67 +3970,98 @@ def validate_theorem_frontier_edge(edge: Dict[str, Any], *, require_paper_status
     validated["parent"] = normalize_frontier_text(validated.get("parent"))
     validated["child"] = normalize_frontier_text(validated.get("child"))
     validated["edge_type"] = theorem_frontier_edge_type(validated.get("edge_type"))
+    validated["edge_id"] = normalize_frontier_text(validated.get("edge_id")) or theorem_frontier_edge_id(
+        validated["parent"],
+        validated["edge_type"],
+        validated["child"],
+    )
+    expected_edge_id = theorem_frontier_edge_id(validated["parent"], validated["edge_type"], validated["child"])
+    if validated["edge_id"] != expected_edge_id:
+        raise SupervisorError(
+            f"Theorem-frontier edge_id {validated['edge_id']!r} does not match "
+            f"the canonical id {expected_edge_id!r} for {validated['parent']!r} -> {validated['child']!r}."
+        )
+    validated["status"] = theorem_frontier_edge_status(validated.get("status") or "open")
     validated["justification"] = normalize_frontier_text(validated.get("justification"))
+    validated["natural_language_proof"] = normalize_frontier_text(validated.get("natural_language_proof"))
     if require_paper_status:
         validated["paper_verifier_status"] = theorem_frontier_paper_decision(validated.get("paper_verifier_status"))
-    if not validated["parent"] or not validated["child"] or not validated["justification"]:
-        raise SupervisorError("Theorem-frontier edge fields parent, child, and justification must be non-empty.")
+    if not validated["parent"] or not validated["child"] or not validated["justification"] or not validated["edge_id"]:
+        raise SupervisorError("Theorem-frontier edge fields parent, child, edge_id, and justification must be non-empty.")
+    if validated["edge_type"] == "direct_proof" and validated["parent"] != validated["child"]:
+        raise SupervisorError("Theorem-frontier direct_proof edges must be self-edges with parent == child.")
     return validated
 
 
 def validate_paper_main_results_manifest(phase: str, manifest: Any) -> Dict[str, Any]:
     if not isinstance(manifest, dict):
-        raise SupervisorError("Paper main-results manifest must be a JSON object.")
-    required_keys = {"phase", "main_results", "dependency_edges", "initial_active_node_id"}
+        raise SupervisorError("Paper coarse-DAG manifest must be a JSON object.")
+    required_keys = {"phase", "nodes", "edges", "initial_active_edge_id"}
     missing = required_keys.difference(manifest)
     if missing:
-        raise SupervisorError(f"Paper main-results manifest missing keys: {sorted(missing)}")
+        raise SupervisorError(f"Paper coarse-DAG manifest missing keys: {sorted(missing)}")
     validated = dict(manifest)
     if str(validated.get("phase")).strip().lower() != phase:
         raise SupervisorError(
-            f"Paper main-results manifest phase mismatch: expected {phase}, got {validated.get('phase')}"
+            f"Paper coarse-DAG manifest phase mismatch: expected {phase}, got {validated.get('phase')}"
         )
-    raw_results = validated.get("main_results")
-    if not isinstance(raw_results, list) or not raw_results:
-        raise SupervisorError("Paper main-results manifest must contain a non-empty `main_results` list.")
-    raw_edges = validated.get("dependency_edges")
+    raw_nodes = validated.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise SupervisorError("Paper coarse-DAG manifest must contain a non-empty `nodes` list.")
+    raw_edges = validated.get("edges")
     if not isinstance(raw_edges, list):
-        raise SupervisorError("Paper main-results manifest field `dependency_edges` must be a list.")
-    results: List[Dict[str, Any]] = []
+        raise SupervisorError("Paper coarse-DAG manifest field `edges` must be a list.")
+    if not raw_edges:
+        raise SupervisorError("Paper coarse-DAG manifest must contain at least one explicit edge.")
+    nodes: List[Dict[str, Any]] = []
     node_ids: Set[str] = set()
-    for raw_node in raw_results:
+    for raw_node in raw_nodes:
         if not isinstance(raw_node, dict):
-            raise SupervisorError("Every entry in `main_results` must be a JSON object.")
+            raise SupervisorError("Every entry in `nodes` must be a JSON object.")
         node = validate_theorem_frontier_node(raw_node, require_relationships=False, require_status=False)
         if node["kind"] not in {"paper", "paper_faithful_reformulation"}:
             raise SupervisorError(
-                "Paper main-results manifest may only contain `paper` or `paper_faithful_reformulation` nodes, "
+                "Paper coarse-DAG manifest may only contain `paper` or `paper_faithful_reformulation` nodes, "
                 f"got {node['kind']!r} for {node['node_id']!r}."
             )
         if node["node_id"] in node_ids:
-            raise SupervisorError(f"Duplicate paper main-result node id: {node['node_id']!r}")
+            raise SupervisorError(f"Duplicate paper coarse-DAG node id: {node['node_id']!r}")
         node_ids.add(node["node_id"])
-        results.append(node)
+        nodes.append(node)
     edges: List[Dict[str, Any]] = []
+    edge_ids: Set[str] = set()
     for raw_edge in raw_edges:
         if not isinstance(raw_edge, dict):
-            raise SupervisorError("Every entry in `dependency_edges` must be a JSON object.")
+            raise SupervisorError("Every entry in `edges` must be a JSON object.")
         edge = validate_theorem_frontier_edge(raw_edge, require_paper_status=False)
         if edge["parent"] not in node_ids or edge["child"] not in node_ids:
             raise SupervisorError(
-                "Paper main-results dependency edges must stay within the declared main-result node set: "
+                "Paper coarse-DAG edges must stay within the declared node set: "
                 f"{edge['parent']!r} -> {edge['child']!r}."
             )
+        if edge["edge_id"] in edge_ids:
+            raise SupervisorError(f"Duplicate paper coarse-DAG edge id: {edge['edge_id']!r}")
+        if edge["status"] != "open":
+            raise SupervisorError(
+                f"Paper coarse-DAG edges must start open, but {edge['edge_id']!r} has status {edge['status']!r}."
+            )
+        if edge["edge_type"] == "replacement":
+            raise SupervisorError("Paper coarse-DAG manifest may not seed replacement edges.")
+        if not edge["natural_language_proof"]:
+            raise SupervisorError(
+                f"Paper coarse-DAG edge {edge['edge_id']!r} must include a non-empty natural_language_proof."
+            )
+        edge_ids.add(edge["edge_id"])
         edges.append(edge)
-    validated["main_results"] = results
-    validated["dependency_edges"] = edges
-    validated["initial_active_node_id"] = normalize_frontier_text(validated.get("initial_active_node_id"))
-    if not validated["initial_active_node_id"]:
-        raise SupervisorError("Paper main-results manifest field `initial_active_node_id` must be non-empty.")
-    if validated["initial_active_node_id"] not in node_ids:
+    validated["nodes"] = nodes
+    validated["edges"] = edges
+    validated["initial_active_edge_id"] = normalize_frontier_text(validated.get("initial_active_edge_id"))
+    if not validated["initial_active_edge_id"]:
+        raise SupervisorError("Paper coarse-DAG manifest field `initial_active_edge_id` must be non-empty.")
+    if validated["initial_active_edge_id"] not in edge_ids:
         raise SupervisorError(
-            "Paper main-results manifest `initial_active_node_id` must name one of the declared main results, "
-            f"got {validated['initial_active_node_id']!r}."
+            "Paper coarse-DAG manifest `initial_active_edge_id` must name one of the declared edges, "
+            f"got {validated['initial_active_edge_id']!r}."
         )
     return validated
 
@@ -3558,7 +4070,7 @@ def load_validated_paper_main_results_manifest(config: Config) -> Dict[str, Any]
     path = paper_main_results_manifest_path(config)
     if not path.exists():
         raise SupervisorError(
-            "Cannot enter proof_formalization without a paper main-results manifest at "
+            "Cannot enter proof_formalization without a paper coarse-DAG manifest at "
             f"{path}."
         )
     return validate_paper_main_results_manifest("theorem_stating", JsonFile.load(path, None))
@@ -3567,13 +4079,14 @@ def load_validated_paper_main_results_manifest(config: Config) -> Dict[str, Any]
 def validate_theorem_frontier_worker_update_full(phase: str, update: Dict[str, Any]) -> Dict[str, Any]:
     required_keys = {
         "phase",
+        "active_edge_id",
         "requested_action",
         "cone_scope",
         "allowed_edit_paths",
         "result_summary",
         "proposed_nodes",
         "proposed_edges",
-        "next_candidate_ids",
+        "next_candidate_edge_ids",
         "structural_change_reason",
     }
     missing = required_keys.difference(update)
@@ -3584,7 +4097,10 @@ def validate_theorem_frontier_worker_update_full(phase: str, update: Dict[str, A
             f"Theorem-frontier worker update phase mismatch: expected {phase}, got {update.get('phase')}"
         )
     validated = dict(update)
+    validated["active_edge_id"] = normalize_frontier_text(validated.get("active_edge_id"))
     validated["active_node_id"] = normalize_frontier_text(validated.get("active_node_id"))
+    if not validated["active_edge_id"]:
+        raise SupervisorError("Theorem-frontier worker update field active_edge_id must be non-empty.")
     raw_active_node = validated.get("active_node")
     if raw_active_node in ("", None):
         validated["active_node"] = None
@@ -3602,6 +4118,16 @@ def validate_theorem_frontier_worker_update_full(phase: str, update: Dict[str, A
             )
     if not validated["active_node_id"] and isinstance(validated["active_node"], dict):
         validated["active_node_id"] = validated["active_node"]["node_id"]
+    if not validated["active_node_id"] and validated["active_edge_id"]:
+        parts = validated["active_edge_id"].split("|", 2)
+        if len(parts) == 3:
+            validated["active_node_id"] = normalize_frontier_text(parts[0])
+    if validated["active_node_id"]:
+        parts = validated["active_edge_id"].split("|", 2)
+        if len(parts) == 3 and validated["active_node_id"] != normalize_frontier_text(parts[0]):
+            raise SupervisorError(
+                "Theorem-frontier worker update active_node_id must match the parent theorem of active_edge_id."
+            )
     if not validated["active_node_id"]:
         raise SupervisorError(
             "Theorem-frontier worker update must include active_node_id, or a full active_node object from which "
@@ -3626,10 +4152,19 @@ def validate_theorem_frontier_worker_update_full(phase: str, update: Dict[str, A
         validate_theorem_frontier_edge(dict(edge), require_paper_status=False)
         for edge in validated.get("proposed_edges", [])
     ]
-    validated["next_candidate_ids"] = normalize_frontier_text_list(
-        validated.get("next_candidate_ids"),
-        label="theorem_frontier.next_candidate_ids",
+    next_candidates_value = validated.get("next_candidate_edge_ids")
+    if next_candidates_value in (None, ""):
+        next_candidates_value = []
+    validated["next_candidate_edge_ids"] = normalize_frontier_text_list(
+        next_candidates_value,
+        label="theorem_frontier.next_candidate_edge_ids",
+        allow_empty=True,
     )
+    validated["claimed_closed_edge_ids"] = normalize_frontier_text_list(
+        validated.get("claimed_closed_edge_ids"),
+        label="theorem_frontier.claimed_closed_edge_ids",
+    )
+    validated["expanded_edge_id"] = normalize_frontier_text(validated.get("expanded_edge_id"))
     validated["structural_change_reason"] = normalize_frontier_text(validated.get("structural_change_reason"))
     if not validated["cone_scope"] or not validated["result_summary"]:
         raise SupervisorError("Theorem-frontier worker update fields cone_scope and result_summary must be non-empty.")
@@ -3639,7 +4174,7 @@ def validate_theorem_frontier_worker_update_full(phase: str, update: Dict[str, A
     # proposed_edges are validated against the authoritative DAG later in
     # update_theorem_frontier_full_state; at this stage we only validate
     # their individual field schemas (done above).
-    # next_candidate_ids are suggestions; they will be validated against the
+    # next_candidate_edge_ids are suggestions; they will be validated against the
     # authoritative DAG later in update_theorem_frontier_full_state.  At this
     # stage we only require them to be non-empty strings.
     return validated
@@ -3648,11 +4183,12 @@ def validate_theorem_frontier_worker_update_full(phase: str, update: Dict[str, A
 def validate_theorem_frontier_review_full(phase: str, review: Dict[str, Any]) -> Dict[str, Any]:
     required_keys = {
         "phase",
+        "active_edge_id",
         "active_theorem_id",
         "assessed_action",
         "blocker_cluster",
         "outcome",
-        "next_active_theorem_id",
+        "next_active_edge_id",
         "cone_purity",
         "open_hypotheses",
         "justification",
@@ -3664,6 +4200,9 @@ def validate_theorem_frontier_review_full(phase: str, review: Dict[str, Any]) ->
         raise SupervisorError(f"Theorem-frontier review phase mismatch: expected {phase}, got {review.get('phase')}")
     validated = dict(review)
     validated["phase"] = phase
+    validated["active_edge_id"] = normalize_frontier_text(validated.get("active_edge_id"))
+    if not validated["active_edge_id"]:
+        raise SupervisorError("Theorem-frontier review field active_edge_id must be non-empty.")
     validated["active_theorem_id"] = normalize_frontier_text(validated.get("active_theorem_id"))
     validated["active_theorem_nl_statement"] = normalize_frontier_text(validated.get("active_theorem_nl_statement"))
     validated["active_theorem_lean_statement"] = normalize_frontier_text(validated.get("active_theorem_lean_statement"))
@@ -3671,12 +4210,17 @@ def validate_theorem_frontier_review_full(phase: str, review: Dict[str, Any]) ->
     validated["assessed_action"] = validate_theorem_frontier_action(validated.get("assessed_action"))
     validated["blocker_cluster"] = normalize_frontier_text(validated.get("blocker_cluster"))
     validated["outcome"] = validate_theorem_frontier_outcome(validated.get("outcome"))
-    validated["next_active_theorem_id"] = normalize_frontier_text(validated.get("next_active_theorem_id"))
+    validated["next_active_edge_id"] = normalize_frontier_text(validated.get("next_active_edge_id"))
     validated["cone_purity"] = theorem_frontier_cone_purity(validated.get("cone_purity"))
     validated["open_hypotheses"] = normalize_frontier_text_list(
         validated.get("open_hypotheses"),
         label="theorem_frontier.open_hypotheses",
     )
+    validated["closed_edge_ids"] = normalize_frontier_text_list(
+        validated.get("closed_edge_ids"),
+        label="theorem_frontier.closed_edge_ids",
+    )
+    validated["expanded_edge_id"] = normalize_frontier_text(validated.get("expanded_edge_id"))
     validated["justification"] = normalize_frontier_text(validated.get("justification"))
     for key in (
         "active_theorem_id",
@@ -3687,6 +4231,59 @@ def validate_theorem_frontier_review_full(phase: str, review: Dict[str, Any]) ->
     if not validated.get("blocker_cluster"):
         validated["blocker_cluster"] = ""
     return validated
+
+
+def validate_theorem_frontier_approved_edge_refs(
+    entries: Any,
+    *,
+    label: str,
+) -> List[Dict[str, str]]:
+    if not isinstance(entries, list):
+        raise SupervisorError(f"{label} must be a list.")
+    approved_edges: List[Dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SupervisorError(f"{label} entries must be objects.")
+        parent = normalize_frontier_text(entry.get("parent"))
+        child = normalize_frontier_text(entry.get("child"))
+        edge_type = normalize_frontier_text(entry.get("edge_type"))
+        edge_id = normalize_frontier_text(entry.get("edge_id"))
+        if edge_id:
+            parts = edge_id.split("|", 2)
+            if len(parts) != 3:
+                raise SupervisorError(
+                    f"{label} edge id {edge_id!r} must have canonical form parent|edge_type|child."
+                )
+            canonical_parent = normalize_frontier_text(parts[0])
+            canonical_edge_type = theorem_frontier_edge_type(parts[1])
+            canonical_child = normalize_frontier_text(parts[2])
+            if parent and parent != canonical_parent:
+                raise SupervisorError(f"{label} parent does not match edge_id.")
+            if child and child != canonical_child:
+                raise SupervisorError(f"{label} child does not match edge_id.")
+            if edge_type and theorem_frontier_edge_type(edge_type) != canonical_edge_type:
+                raise SupervisorError(f"{label} edge_type does not match edge_id.")
+            parent = canonical_parent
+            child = canonical_child
+            edge_type = canonical_edge_type
+            edge_id = theorem_frontier_edge_id(parent, edge_type, child)
+        else:
+            if not parent or not child:
+                raise SupervisorError(
+                    f"{label} entries must include parent and child when edge_id is omitted."
+                )
+            if edge_type:
+                edge_type = theorem_frontier_edge_type(edge_type)
+                edge_id = theorem_frontier_edge_id(parent, edge_type, child)
+        approved_edges.append(
+            {
+                "edge_id": edge_id,
+                "parent": parent,
+                "child": child,
+                "edge_type": edge_type,
+            }
+        )
+    return approved_edges
 
 
 def validate_theorem_frontier_paper_verifier_review(phase: str, review: Dict[str, Any]) -> Dict[str, Any]:
@@ -3721,23 +4318,55 @@ def validate_theorem_frontier_paper_verifier_review(phase: str, review: Dict[str
         validated.get("approved_node_ids"),
         label="paper_verifier.approved_node_ids",
     )
-    if not isinstance(validated.get("approved_edges"), list):
-        raise SupervisorError("paper_verifier.approved_edges must be a list.")
-    approved_edges: List[Dict[str, str]] = []
-    for entry in validated.get("approved_edges", []):
-        if not isinstance(entry, dict):
-            raise SupervisorError("paper_verifier.approved_edges entries must be objects.")
-        approved_edges.append(
-            {
-                "parent": normalize_frontier_text(entry.get("parent")),
-                "child": normalize_frontier_text(entry.get("child")),
-            }
-        )
-    validated["approved_edges"] = approved_edges
+    validated["approved_edges"] = validate_theorem_frontier_approved_edge_refs(
+        validated.get("approved_edges"),
+        label="paper_verifier.approved_edges",
+    )
     validated["justification"] = normalize_frontier_text(validated.get("justification"))
     validated["caveat"] = normalize_frontier_text(validated.get("caveat"))
     if not validated["parent_node_id"] or not validated["justification"]:
         raise SupervisorError("paper_verifier.parent_node_id and paper_verifier.justification must be non-empty.")
+    return validated
+
+
+def validate_theorem_frontier_nl_proof_verifier_review(phase: str, review: Dict[str, Any]) -> Dict[str, Any]:
+    required_keys = {
+        "phase",
+        "parent_node_id",
+        "change_kind",
+        "decision",
+        "approved_node_ids",
+        "approved_edges",
+        "justification",
+        "caveat",
+    }
+    missing = required_keys.difference(review)
+    if missing:
+        raise SupervisorError(f"Theorem-frontier NL-proof verifier review missing keys: {sorted(missing)}")
+    if str(review.get("phase")).strip().lower() != phase:
+        raise SupervisorError(
+            f"Theorem-frontier NL-proof verifier phase mismatch: expected {phase}, got {review.get('phase')}"
+        )
+    validated = dict(review)
+    validated["parent_node_id"] = normalize_frontier_text(validated.get("parent_node_id"))
+    validated["change_kind"] = normalize_frontier_enum(
+        validated.get("change_kind"),
+        ("CREATE_ACTIVE", "EXPAND", "REFUTE_REPLACE"),
+        label="NL-proof verifier change kind",
+    )
+    validated["decision"] = theorem_frontier_paper_decision(validated.get("decision"))
+    validated["approved_node_ids"] = normalize_frontier_text_list(
+        validated.get("approved_node_ids"),
+        label="nl_proof_verifier.approved_node_ids",
+    )
+    validated["approved_edges"] = validate_theorem_frontier_approved_edge_refs(
+        validated.get("approved_edges"),
+        label="nl_proof_verifier.approved_edges",
+    )
+    validated["justification"] = normalize_frontier_text(validated.get("justification"))
+    validated["caveat"] = normalize_frontier_text(validated.get("caveat"))
+    if not validated["parent_node_id"] or not validated["justification"]:
+        raise SupervisorError("nl_proof_verifier.parent_node_id and nl_proof_verifier.justification must be non-empty.")
     return validated
 
 
@@ -3968,22 +4597,98 @@ def add_theorem_frontier_edge(
             item
             for item in edges
             if isinstance(item, dict)
-            and item.get("parent") == edge_record["parent"]
-            and item.get("child") == edge_record["child"]
-            and item.get("edge_type") == edge_record["edge_type"]
+            and item.get("edge_id") == edge_record["edge_id"]
         ),
         None,
     )
     if existing is None:
         edges.append(edge_record)
     else:
+        edge_record["status"] = str(existing.get("status") or "open")
         existing.update(edge_record)
     parent = nodes.get(edge_record["parent"])
     child = nodes.get(edge_record["child"])
-    if isinstance(parent, dict):
+    if isinstance(parent, dict) and not (
+        edge_record["edge_type"] == "direct_proof"
+        and edge_record["parent"] == edge_record["child"]
+    ):
         parent["child_ids"] = list(dict.fromkeys([*parent.get("child_ids", []), edge_record["child"]]))
-    if isinstance(child, dict):
+    if isinstance(child, dict) and not (
+        edge_record["edge_type"] == "direct_proof"
+        and edge_record["parent"] == edge_record["child"]
+    ):
         child["parent_ids"] = list(dict.fromkeys([*child.get("parent_ids", []), edge_record["parent"]]))
+
+
+def theorem_frontier_direct_proof_edge(node_id: str) -> Dict[str, Any]:
+    node_id = normalize_frontier_text(node_id)
+    if not node_id:
+        raise SupervisorError("Cannot create a direct-proof edge for an empty theorem-frontier node id.")
+    return {
+        "parent": node_id,
+        "child": node_id,
+        "edge_type": "direct_proof",
+        "justification": "Direct-proof obligation edge for proving this theorem directly.",
+        "natural_language_proof": "",
+    }
+
+
+def theorem_frontier_resolve_edge_reference(payload: Dict[str, Any], ref: Any) -> str:
+    text = normalize_frontier_text(ref)
+    if not text:
+        return ""
+    edge_map = theorem_frontier_edge_map(payload)
+    if text in edge_map:
+        return text
+    return text
+
+
+def set_theorem_frontier_active_edge(payload: Dict[str, Any], active_edge_id: str) -> Optional[Dict[str, Any]]:
+    active_edge_id = normalize_frontier_text(active_edge_id)
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        raise SupervisorError("Theorem-frontier payload nodes must be a mapping.")
+    edge_map = theorem_frontier_edge_map(payload)
+    for edge in edge_map.values():
+        if isinstance(edge, dict) and edge.get("status") == "active":
+            edge["status"] = "open"
+    for node in nodes.values():
+        if isinstance(node, dict) and node.get("status") == "active":
+            node["status"] = "open"
+    if not active_edge_id:
+        payload["active_edge_id"] = None
+        payload["active_leaf_id"] = None
+        return None
+    if active_edge_id not in edge_map:
+        raise SupervisorError(f"Theorem-frontier active_edge_id {active_edge_id!r} is not present in edges.")
+    edge = edge_map[active_edge_id]
+    if edge.get("status") not in {"open", "active"}:
+        raise SupervisorError(
+            f"Theorem-frontier active_edge_id {active_edge_id!r} must name an open/active edge, "
+            f"not {edge.get('status')!r}."
+        )
+    edge["status"] = "active"
+    parent_id = normalize_frontier_text(edge.get("parent"))
+    if parent_id:
+        parent = nodes.get(parent_id)
+        if isinstance(parent, dict) and parent.get("status") not in {"closed", "refuted", "replaced"}:
+            parent["status"] = "active"
+        payload["active_leaf_id"] = parent_id or None
+    else:
+        payload["active_leaf_id"] = None
+    payload["active_edge_id"] = active_edge_id
+    return edge
+
+
+def theorem_frontier_edge_map(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    edges = payload.get("edges")
+    if not isinstance(edges, list):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for edge in edges:
+        if isinstance(edge, dict) and edge.get("edge_id"):
+            result[str(edge["edge_id"])] = edge
+    return result
 
 
 def seed_theorem_frontier_from_main_results_manifest(
@@ -3995,22 +4700,24 @@ def seed_theorem_frontier_from_main_results_manifest(
 ) -> Dict[str, Any]:
     payload = default_theorem_frontier_payload("full")
     nodes: Dict[str, Dict[str, Any]] = {}
-    initial_active_node_id = manifest["initial_active_node_id"]
-    for node in manifest["main_results"]:
-        status = "active" if node["node_id"] == initial_active_node_id else "open"
+    for node in manifest["nodes"]:
+        status = "open"
         nodes[node["node_id"]] = theorem_frontier_node_record(node, status=status)
     payload["nodes"] = nodes
-    payload["active_leaf_id"] = initial_active_node_id
     payload["current_action"] = None
     payload["current"] = None
     payload["paper_verifier_history"] = []
-    for edge in manifest["dependency_edges"]:
+    payload["nl_proof_verifier_history"] = []
+    for edge in manifest["edges"]:
         add_theorem_frontier_edge(payload, edge, paper_status="APPROVE")
+    initial_active_edge_id = manifest["initial_active_edge_id"]
+    set_theorem_frontier_active_edge(payload, initial_active_edge_id)
     validated_payload = validate_loaded_theorem_frontier_payload(payload)
     state["theorem_frontier"] = validated_payload
     state["last_theorem_frontier_worker_update"] = None
     state["last_theorem_frontier_review"] = None
     state["last_theorem_frontier_paper_review"] = None
+    state["last_theorem_frontier_nl_proof_review"] = None
     JsonFile.dump(theorem_frontier_state_path(config), validated_payload)
     append_jsonl(
         theorem_frontier_history_path(config),
@@ -4018,9 +4725,10 @@ def seed_theorem_frontier_from_main_results_manifest(
             "cycle": cycle,
             "mode": "full",
             "event": "seed",
-            "active_leaf_id": initial_active_node_id,
-            "main_result_node_ids": [node["node_id"] for node in manifest["main_results"]],
-            "dependency_edge_count": len(manifest["dependency_edges"]),
+            "active_edge_id": validated_payload.get("active_edge_id"),
+            "active_leaf_id": validated_payload.get("active_leaf_id"),
+            "seed_node_ids": [node["node_id"] for node in manifest["nodes"]],
+            "seed_edge_count": len(manifest["edges"]),
             "updated_at": timestamp_now(),
         },
     )
@@ -4033,6 +4741,7 @@ def update_theorem_frontier_full_state(
     worker_update: Dict[str, Any],
     review: Dict[str, Any],
     paper_review: Optional[Dict[str, Any]],
+    nl_proof_review: Optional[Dict[str, Any]] = None,
     *,
     cycle: int,
 ) -> Dict[str, Any]:
@@ -4049,18 +4758,34 @@ def update_theorem_frontier_full_state(
     if not isinstance(escalation, dict):
         raise SupervisorError("Theorem-frontier payload escalation must be a mapping.")
     payload.setdefault("paper_verifier_history", [])
+    payload.setdefault("nl_proof_verifier_history", [])
 
-    previous_active_leaf_id = normalize_frontier_text(payload.get("active_leaf_id"))
+    edge_map = theorem_frontier_edge_map(payload)
+    previous_active_edge_id = normalize_frontier_text(payload.get("active_edge_id"))
+    previous_active_leaf_id = theorem_frontier_edge_parent_node_id(payload, previous_active_edge_id) or normalize_frontier_text(
+        payload.get("active_leaf_id")
+    )
     previous_active = nodes.get(previous_active_leaf_id) if previous_active_leaf_id else None
     previous_blocker = (
         normalize_frontier_text(previous_active.get("blocker_cluster"))
         if isinstance(previous_active, dict)
         else ""
     )
-    active_node_id = normalize_frontier_text(worker_update.get("active_node_id"))
+
+    active_edge_id = normalize_frontier_text(worker_update.get("active_edge_id"))
     raw_active_node = worker_update.get("active_node")
+    active_node_id = ""
+    active_edge = edge_map.get(active_edge_id) if active_edge_id else None
+    if isinstance(active_edge, dict):
+        active_node_id = normalize_frontier_text(active_edge.get("parent"))
+    if not active_node_id:
+        active_node_id = normalize_frontier_text(worker_update.get("active_node_id"))
     if not active_node_id and isinstance(raw_active_node, dict):
         active_node_id = normalize_frontier_text(raw_active_node.get("node_id"))
+    if not active_node_id and active_edge_id:
+        parts = active_edge_id.split("|", 2)
+        if len(parts) == 3:
+            active_node_id = normalize_frontier_text(parts[0])
     active_node_known = active_node_id in nodes
     if active_node_known:
         authoritative_active_node = nodes[active_node_id]
@@ -4097,24 +4822,54 @@ def update_theorem_frontier_full_state(
             raise SupervisorError(
                 "Theorem-frontier worker update active_node_id must match active_node.node_id for a new node."
             )
+
     requested_action = worker_update["requested_action"]
     outcome = review["outcome"]
     paper_decision = paper_review.get("decision") if isinstance(paper_review, dict) else None
+    nl_proof_decision = nl_proof_review.get("decision") if isinstance(nl_proof_review, dict) else None
     requires_paper_verifier = theorem_frontier_requires_paper_verifier({"theorem_frontier": payload}, worker_update)
     proposed_nodes = list(worker_update.get("proposed_nodes", []))
-    proposed_edges = list(worker_update.get("proposed_edges", []))
+    proposed_edges = [
+        edge
+        if isinstance(edge, dict) and edge.get("edge_id")
+        else validate_theorem_frontier_edge(dict(edge), require_paper_status=False)
+        for edge in (worker_update.get("proposed_edges", []) or [])
+    ]
     proposed_node_ids = {node["node_id"] for node in proposed_nodes}
-    proposed_edge_pairs = {(edge["parent"], edge["child"]) for edge in proposed_edges}
-    approved_node_ids: set[str] = set()
-    approved_edge_pairs: set[Tuple[str, str]] = set()
+    proposed_edge_ids = {edge["edge_id"] for edge in proposed_edges}
+    claimed_closed_edge_ids = set(worker_update.get("claimed_closed_edge_ids", []) or [])
+    paper_approved_node_ids: set[str] = set()
+    paper_approved_edge_ids: set[str] = set()
+    nl_proof_approved_node_ids: set[str] = set()
+    nl_proof_approved_edge_ids: set[str] = set()
+    admitted_node_ids: set[str] = set()
+    admitted_edge_ids: set[str] = set()
 
     if isinstance(paper_review, dict):
-        approved_node_ids = set(paper_review.get("approved_node_ids", []) or [])
-        approved_edge_pairs = {
-            (entry.get("parent", ""), entry.get("child", ""))
+        paper_approved_node_ids = set(paper_review.get("approved_node_ids", []) or [])
+        approved_edge_entries = [
+            entry
             for entry in (paper_review.get("approved_edges", []) or [])
             if isinstance(entry, dict)
-        }
+        ]
+        for entry in approved_edge_entries:
+            approved_edge_id = normalize_frontier_text(entry.get("edge_id"))
+            if approved_edge_id:
+                paper_approved_edge_ids.add(approved_edge_id)
+                continue
+            matches = [
+                edge["edge_id"]
+                for edge in proposed_edges
+                if edge.get("parent") == entry.get("parent")
+                and edge.get("child") == entry.get("child")
+                and (not entry.get("edge_type") or edge.get("edge_type") == entry.get("edge_type"))
+            ]
+            if len(matches) != 1:
+                raise SupervisorError(
+                    "Paper-verifier approved_edges must identify worker-proposed edges uniquely. "
+                    f"Could not resolve approved edge {entry!r}."
+                )
+            paper_approved_edge_ids.add(matches[0])
         expected_change_kind = (
             "CREATE_ACTIVE"
             if not active_node_known
@@ -4126,46 +4881,106 @@ def update_theorem_frontier_full_state(
                 f"expected {expected_change_kind!r}, got {paper_review.get('change_kind')!r}."
             )
         allowed_approved_node_ids = {active_node_id} | proposed_node_ids
-        if not approved_node_ids.issubset(allowed_approved_node_ids):
+        if not paper_approved_node_ids.issubset(allowed_approved_node_ids):
             raise SupervisorError(
                 "Paper-verifier approved_node_ids must refer only to the active node being created or worker-proposed nodes."
             )
-        if not approved_edge_pairs.issubset(proposed_edge_pairs):
+        if not paper_approved_edge_ids.issubset(proposed_edge_ids):
             raise SupervisorError(
                 "Paper-verifier approved_edges must be a subset of the worker-proposed theorem-frontier edges."
             )
-        for parent_id, child_id in approved_edge_pairs:
-            if parent_id not in approved_node_ids and parent_id != active_node_id and parent_id not in nodes:
+        proposed_edge_map = {edge["edge_id"]: edge for edge in proposed_edges}
+        for edge_id in paper_approved_edge_ids:
+            edge = proposed_edge_map[edge_id]
+            parent_id = edge["parent"]
+            child_id = edge["child"]
+            if parent_id not in paper_approved_node_ids and parent_id != active_node_id and parent_id not in nodes:
                 raise SupervisorError(
                     "Paper-verifier approved_edges may only reference nodes that are already authoritative or explicitly approved."
                 )
-            if child_id not in approved_node_ids and child_id not in nodes:
+            if child_id not in paper_approved_node_ids and child_id not in nodes:
                 raise SupervisorError(
                     "Paper-verifier approved_edges may only reference nodes that are already authoritative or explicitly approved."
                 )
+
+    if isinstance(nl_proof_review, dict):
+        nl_proof_approved_node_ids = set(nl_proof_review.get("approved_node_ids", []) or [])
+        nl_approved_edge_entries = [
+            entry
+            for entry in (nl_proof_review.get("approved_edges", []) or [])
+            if isinstance(entry, dict)
+        ]
+        for entry in nl_approved_edge_entries:
+            approved_edge_id = normalize_frontier_text(entry.get("edge_id"))
+            if approved_edge_id:
+                nl_proof_approved_edge_ids.add(approved_edge_id)
+                continue
+            matches = [
+                edge["edge_id"]
+                for edge in proposed_edges
+                if edge.get("parent") == entry.get("parent")
+                and edge.get("child") == entry.get("child")
+                and (not entry.get("edge_type") or edge.get("edge_type") == entry.get("edge_type"))
+            ]
+            if len(matches) != 1:
+                raise SupervisorError(
+                    "NL-proof verifier approved_edges must identify worker-proposed edges uniquely. "
+                    f"Could not resolve approved edge {entry!r}."
+                )
+            nl_proof_approved_edge_ids.add(matches[0])
+        expected_change_kind = (
+            "CREATE_ACTIVE"
+            if not active_node_known
+            else ("REFUTE_REPLACE" if requested_action == "REFUTE_REPLACE" else "EXPAND")
+        )
+        if requires_paper_verifier and nl_proof_review.get("change_kind") != expected_change_kind:
+            raise SupervisorError(
+                "NL-proof verifier change_kind does not match the structural theorem-frontier action being applied: "
+                f"expected {expected_change_kind!r}, got {nl_proof_review.get('change_kind')!r}."
+            )
+        if not nl_proof_approved_node_ids.issubset(paper_approved_node_ids):
+            raise SupervisorError(
+                "NL-proof verifier approved_node_ids must be a subset of the paper-verifier-approved node ids."
+            )
+        if not nl_proof_approved_edge_ids.issubset(paper_approved_edge_ids):
+            raise SupervisorError(
+                "NL-proof verifier approved_edges must be a subset of the paper-verifier-approved edges."
+            )
+
+    admitted_node_ids = set(nl_proof_approved_node_ids) if isinstance(nl_proof_review, dict) else set()
+    admitted_edge_ids = set(nl_proof_approved_edge_ids) if isinstance(nl_proof_review, dict) else set()
 
     if not active_node_known and paper_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
         raise SupervisorError(
             "Cannot create or activate a theorem-frontier node that is not already in the authoritative DAG "
             "without paper-verifier approval."
         )
-    if not active_node_known and active_node_id not in approved_node_ids:
+    if not active_node_known and active_node_id not in paper_approved_node_ids:
         raise SupervisorError(
             "Paper-verifier approval for CREATE_ACTIVE must explicitly include the active node id in approved_node_ids."
         )
+    if not active_node_known and nl_proof_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
+        raise SupervisorError(
+            "Cannot create or activate a theorem-frontier node that is not already in the authoritative DAG "
+            "without NL-proof-verifier approval."
+        )
+    if not active_node_known and active_node_id not in admitted_node_ids:
+        raise SupervisorError(
+            "NL-proof verifier approval for CREATE_ACTIVE must explicitly include the active node id in approved_node_ids."
+        )
     if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and paper_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
         raise SupervisorError("Cannot accept a structural theorem-frontier outcome without paper-verifier approval.")
+    if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and nl_proof_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
+        raise SupervisorError("Cannot accept a structural theorem-frontier outcome without NL-proof-verifier approval.")
 
     if paper_decision == "REJECT" and outcome in {"EXPANDED", "REFUTED_REPLACED"}:
         raise SupervisorError("Paper-verifier rejected the structural change, so the structural outcome cannot be accepted.")
-
-    if isinstance(previous_active, dict) and previous_active.get("status") == "active":
-        previous_active["status"] = "open"
-        previous_active["updated_at"] = timestamp_now()
+    if nl_proof_decision == "REJECT" and outcome in {"EXPANDED", "REFUTED_REPLACED"}:
+        raise SupervisorError("NL-proof verifier rejected the structural change, so the structural outcome cannot be accepted.")
 
     active_record = upsert_theorem_frontier_node(nodes, active_node, default_status="open")
     assert_theorem_frontier_review_matches_node(review, active_record)
-    active_record["status"] = "active"
+    active_record["status"] = "open"
     active_record["updated_at"] = timestamp_now()
     nodes[active_node_id] = active_record
 
@@ -4173,57 +4988,148 @@ def update_theorem_frontier_full_state(
         history = payload.get("paper_verifier_history")
         if isinstance(history, list):
             history.append(dict(paper_review))
+    if isinstance(nl_proof_review, dict):
+        history = payload.get("nl_proof_verifier_history")
+        if isinstance(history, list):
+            history.append(dict(nl_proof_review))
 
-    if paper_decision in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
+    if (
+        paper_decision in {"APPROVE", "APPROVE_WITH_CAVEAT"}
+        and nl_proof_decision in {"APPROVE", "APPROVE_WITH_CAVEAT"}
+    ):
         for node in proposed_nodes:
-            if node["node_id"] not in approved_node_ids:
+            if node["node_id"] not in admitted_node_ids:
                 continue
             upsert_theorem_frontier_node(nodes, node, default_status="open")
         for edge in proposed_edges:
-            if (edge["parent"], edge["child"]) not in approved_edge_pairs:
+            if edge["edge_id"] not in admitted_edge_ids:
                 continue
             add_theorem_frontier_edge(payload, edge, paper_status=paper_decision)
-
-    next_active_leaf_id = review["next_active_theorem_id"] or active_node_id
-    if outcome == "CLOSED":
-        active_record["status"] = "closed"
-        next_active_leaf_id = review["next_active_theorem_id"] or ""
-    elif outcome == "REFUTED_REPLACED":
-        active_record["status"] = "replaced" if worker_update.get("proposed_nodes") else "refuted"
-        if not next_active_leaf_id and worker_update.get("next_candidate_ids"):
-            next_active_leaf_id = worker_update["next_candidate_ids"][0]
-    elif outcome == "EXPANDED":
-        active_record["status"] = "open"
-        if not next_active_leaf_id and worker_update.get("next_candidate_ids"):
-            next_active_leaf_id = worker_update["next_candidate_ids"][0]
-    elif outcome in {"STILL_OPEN", "NO_FRONTIER_PROGRESS"}:
-        next_active_leaf_id = review["next_active_theorem_id"] or active_node_id
-
-    if outcome == "CLOSED" and next_active_leaf_id == active_node_id:
-        raise SupervisorError("A theorem-frontier node cannot be both CLOSED and the next active leaf in the same review.")
-    if next_active_leaf_id:
-        if next_active_leaf_id not in nodes:
-            raise SupervisorError(f"Next active theorem id {next_active_leaf_id!r} is not present in the theorem-frontier DAG.")
-        if nodes[next_active_leaf_id].get("status") in {"closed", "refuted", "replaced"}:
-            raise SupervisorError(
-                f"Next active theorem id {next_active_leaf_id!r} refers to a non-open node with status "
-                f"{nodes[next_active_leaf_id].get('status')!r}."
+        repair_theorem_frontier_closed_nodes(nodes, payload.get("edges", []))
+        if outcome in {"EXPANDED", "REFUTED_REPLACED"} or not active_node_known:
+            require_natural_language_proofs_for_structural_admission(
+                nodes=nodes,
+                edges=payload.get("edges", []),
+                approved_node_ids=admitted_node_ids,
+                approved_edge_ids=admitted_edge_ids,
             )
-        nodes[next_active_leaf_id]["status"] = "active"
-        nodes[next_active_leaf_id]["updated_at"] = timestamp_now()
-        payload["active_leaf_id"] = next_active_leaf_id
-        current_node = nodes[next_active_leaf_id]
+    repair_theorem_frontier_closed_nodes(nodes, payload.get("edges", []))
+
+    edge_map = theorem_frontier_edge_map(payload)
+    if not active_edge_id or active_edge_id not in edge_map:
+        raise SupervisorError(
+            "Theorem-frontier worker update must identify an active obligation edge already present in the "
+            f"authoritative/proposed DAG for {active_node_id!r}."
+        )
+    review_active_edge_id = theorem_frontier_resolve_edge_reference(payload, review.get("active_edge_id")) or active_edge_id
+    if review_active_edge_id != active_edge_id:
+        raise SupervisorError(
+            "Theorem-frontier review active_edge_id must match the worker's active obligation edge "
+            f"{active_edge_id!r}."
+        )
+    review_closed_edge_ids = {
+        theorem_frontier_resolve_edge_reference(payload, edge_id)
+        for edge_id in normalize_frontier_text_list(
+            review.get("closed_edge_ids"),
+            label="theorem_frontier.closed_edge_ids",
+            allow_empty=True,
+        )
+    }
+    review_closed_edge_ids.discard("")
+    if claimed_closed_edge_ids and not claimed_closed_edge_ids.issubset(set(edge_map)):
+        missing_claimed = sorted(claimed_closed_edge_ids.difference(set(edge_map)))
+        raise SupervisorError(
+            "Theorem-frontier worker update claimed_closed_edge_ids must refer to authoritative edges: "
+            f"{missing_claimed!r}."
+        )
+    if requested_action == "CLOSE" and review["outcome"] == "CLOSED" and active_edge_id:
+        review_closed_edge_ids.add(active_edge_id)
+    if requested_action == "CLOSE" and review["outcome"] == "CLOSED" and active_edge_id not in review_closed_edge_ids:
+        raise SupervisorError(
+            f"Theorem-frontier CLOSE outcome must close the active edge {active_edge_id!r}."
+        )
+    if review_closed_edge_ids and not review_closed_edge_ids.issubset(set(edge_map)):
+        missing_review = sorted(review_closed_edge_ids.difference(set(edge_map)))
+        raise SupervisorError(
+            "Theorem-frontier review closed_edge_ids must refer to authoritative edges: "
+            f"{missing_review!r}."
+        )
+    expanded_edge_id = normalize_frontier_text(review.get("expanded_edge_id"))
+    if expanded_edge_id and expanded_edge_id not in edge_map:
+        raise SupervisorError(
+            f"Theorem-frontier review expanded_edge_id {expanded_edge_id!r} is not present in the authoritative DAG."
+        )
+    if expanded_edge_id and review["outcome"] not in {"EXPANDED", "REFUTED_REPLACED"}:
+        raise SupervisorError("Theorem-frontier review may only set expanded_edge_id when outcome is EXPANDED or REFUTED_REPLACED.")
+    if review["outcome"] in {"EXPANDED", "REFUTED_REPLACED"} and expanded_edge_id and expanded_edge_id != active_edge_id:
+        raise SupervisorError(
+            f"Theorem-frontier {review['outcome']} outcome must target the active edge {active_edge_id!r}, "
+            f"not {expanded_edge_id!r}."
+        )
+    if review["outcome"] == "EXPANDED" and not expanded_edge_id and review_closed_edge_ids:
+        raise SupervisorError(
+            "Theorem-frontier review should not report closed_edge_ids on an EXPANDED cycle without naming the expanded_edge_id."
+        )
+    for edge_id in review_closed_edge_ids:
+        edge_record = edge_map[edge_id]
+        if edge_record.get("status") in {"refuted", "replaced"}:
+            raise SupervisorError(
+                f"Theorem-frontier review cannot close edge {edge_id!r} because it is already {edge_record.get('status')!r}."
+            )
+        edge_record["status"] = "closed"
+    if expanded_edge_id:
+        edge_map[expanded_edge_id]["status"] = "replaced"
+
+    raw_next_active_ref = normalize_frontier_text(review.get("next_active_edge_id"))
+    next_active_edge_id = theorem_frontier_resolve_edge_reference(payload, raw_next_active_ref) or ""
+    if outcome in {"EXPANDED", "REFUTED_REPLACED"} and not next_active_edge_id and worker_update.get("next_candidate_edge_ids"):
+        for candidate in worker_update["next_candidate_edge_ids"]:
+            next_active_edge_id = theorem_frontier_resolve_edge_reference(payload, candidate)
+            if next_active_edge_id:
+                break
+    elif outcome in {"STILL_OPEN", "NO_FRONTIER_PROGRESS"} and not next_active_edge_id:
+        next_active_edge_id = active_edge_id
+    if outcome == "CLOSED" and next_active_edge_id == active_edge_id:
+        raise SupervisorError(
+            "A theorem-frontier edge cannot be both CLOSED and the next active edge in the same review "
+            "(legacy wording: a node cannot be both CLOSED and the next active leaf)."
+        )
+
+    active_record["status"] = "open"
+    if outcome == "REFUTED_REPLACED" and not worker_update.get("proposed_nodes") and str(edge_map[active_edge_id].get("edge_type")) == "direct_proof":
+        active_record["status"] = "refuted"
+    elif outcome == "CLOSED":
+        closable, _reason = theorem_frontier_node_closure_check(nodes, payload.get("edges", []), active_node_id)
+        if closable:
+            active_record["status"] = "closed"
+
+    current_edge = None
+    if next_active_edge_id:
+        if next_active_edge_id not in edge_map:
+            raise SupervisorError(
+                f"Next active edge id {next_active_edge_id!r} is not present in the theorem-frontier DAG "
+                "for this review."
+            )
+        if edge_map[next_active_edge_id].get("status") in {"closed", "refuted", "replaced"}:
+            raise SupervisorError(
+                f"Next active edge id {next_active_edge_id!r} refers to a non-open edge with status "
+                f"{edge_map[next_active_edge_id].get('status')!r}."
+            )
+        current_edge = set_theorem_frontier_active_edge(payload, next_active_edge_id)
+        current_node = nodes.get(normalize_frontier_text(current_edge.get("parent"))) if isinstance(current_edge, dict) else None
     else:
-        payload["active_leaf_id"] = None
+        set_theorem_frontier_active_edge(payload, "")
         current_node = None
 
+    same_edge = previous_active_edge_id and previous_active_edge_id == payload.get("active_edge_id")
     same_leaf = previous_active_leaf_id and previous_active_leaf_id == payload.get("active_leaf_id")
     same_blocker = bool(previous_blocker) and previous_blocker == review["blocker_cluster"]
+    active_edge_age = int(metrics.get("active_edge_age", 0) or 0) + 1 if same_edge and payload.get("active_edge_id") else (1 if payload.get("active_edge_id") else 0)
     active_leaf_age = int(metrics.get("active_leaf_age", 0) or 0) + 1 if same_leaf and payload.get("active_leaf_id") else (1 if payload.get("active_leaf_id") else 0)
     blocker_cluster_age = int(metrics.get("blocker_cluster_age", 0) or 0) + 1 if same_blocker else 1
     failed_close_attempts = (
         int(metrics.get("failed_close_attempts", 0) or 0) + 1
-        if review["assessed_action"] == "CLOSE" and outcome != "CLOSED" and same_leaf
+        if review["assessed_action"] == "CLOSE" and outcome != "CLOSED" and same_edge
         else (1 if review["assessed_action"] == "CLOSE" and outcome != "CLOSED" else 0)
     )
     low_cone_purity_streak = (
@@ -4239,17 +5145,9 @@ def update_theorem_frontier_full_state(
 
     metrics.update(
         {
+            "active_edge_age": active_edge_age,
             "active_leaf_age": active_leaf_age,
             "blocker_cluster_age": blocker_cluster_age,
-            "closed_nodes_count": int(metrics.get("closed_nodes_count", 0) or 0) + (1 if outcome == "CLOSED" else 0),
-            "refuted_nodes_count": int(metrics.get("refuted_nodes_count", 0) or 0) + (1 if outcome == "REFUTED_REPLACED" else 0),
-            "paper_nodes_closed": int(metrics.get("paper_nodes_closed", 0) or 0)
-            + (
-                1
-                if outcome == "CLOSED"
-                and active_record.get("kind") in {"paper", "paper_faithful_reformulation"}
-                else 0
-            ),
             "failed_close_attempts": failed_close_attempts,
             "low_cone_purity_streak": low_cone_purity_streak,
             "cone_purity": review["cone_purity"],
@@ -4258,7 +5156,7 @@ def update_theorem_frontier_full_state(
     )
     reasons: List[str] = []
     if failed_close_attempts >= THEOREM_FRONTIER_FAILED_CLOSE_THRESHOLD:
-        reasons.append("same active leaf failed to close twice; expand or replace it")
+        reasons.append("same active edge failed to close twice; expand or replace it")
     if blocker_cluster_age >= THEOREM_FRONTIER_BLOCKER_CLUSTER_THRESHOLD:
         reasons.append("same blocker cluster persisted for five reviews; mandatory escalation")
     if low_cone_purity_streak >= THEOREM_FRONTIER_LOW_CONE_PURITY_THRESHOLD:
@@ -4269,7 +5167,9 @@ def update_theorem_frontier_full_state(
     payload["current_action"] = review["assessed_action"]
     payload["current"] = {
         "cycle": cycle,
+        "reviewed_edge_id": active_edge_id,
         "reviewed_node_id": active_node_id,
+        "next_active_edge_id": payload.get("active_edge_id"),
         "next_active_leaf_id": payload.get("active_leaf_id"),
         "requested_action": requested_action,
         "assessed_action": review["assessed_action"],
@@ -4277,9 +5177,14 @@ def update_theorem_frontier_full_state(
         "blocker_cluster": review["blocker_cluster"],
         "cone_purity": review["cone_purity"],
         "open_hypotheses": list(review["open_hypotheses"]),
+        "closed_edge_ids": sorted(review_closed_edge_ids),
+        "expanded_edge_id": expanded_edge_id or "",
+        "paper_verifier_decision": paper_decision,
+        "nl_proof_verifier_decision": nl_proof_decision,
         "justification": review["justification"],
         "updated_at": timestamp_now(),
     }
+    sync_theorem_frontier_metrics(payload)
     state["theorem_frontier"] = payload
     state["last_theorem_frontier_review"] = review
     JsonFile.dump(theorem_frontier_state_path(config), payload)
@@ -4288,6 +5193,8 @@ def update_theorem_frontier_full_state(
         {
             "cycle": cycle,
             "mode": "full",
+            "active_edge_id": payload.get("active_edge_id"),
+            "reviewed_edge_id": active_edge_id,
             "reviewed_node_id": active_node_id,
             "next_active_leaf_id": payload.get("active_leaf_id"),
             "assessed_action": review["assessed_action"],
@@ -4296,6 +5203,7 @@ def update_theorem_frontier_full_state(
             "cone_purity": review["cone_purity"],
             "open_hypotheses": list(review["open_hypotheses"]),
             "paper_verifier_decision": paper_decision,
+            "nl_proof_verifier_decision": nl_proof_decision,
             "metrics": dict(metrics),
             "escalation": dict(escalation),
             "current_anchor": current_node.get("lean_anchor") if isinstance(current_node, dict) else None,
@@ -4900,7 +5808,7 @@ def branch_context_text(state: Dict[str, Any]) -> str:
         - Episode: {context.get('episode_id', '')}
         - Branch: {context.get('branch_name', '')}
         - Summary: {str(context.get('summary', '')).strip()}
-        - Frontier anchor node: {str(context.get('frontier_anchor_node_id', '')).strip()}
+        - Frontier anchor edge: {str(context.get('frontier_anchor_edge_id', context.get('frontier_anchor_node_id', ''))).strip()}
         - Rewrite scope: {str(context.get('rewrite_scope', '')).strip()}
         - Branch worker prompt: {str(context.get('worker_prompt', '')).strip()}
         - Why this might eventually succeed: {str(context.get('why_this_might_eventually_succeed', '')).strip()}
@@ -5007,17 +5915,18 @@ def phase_worker_instructions(config: Config, phase: str, provider: str) -> str:
             Requirements:
             - Maintain `{tasks_label}`, `{papernotes_label}`, and `{plan_label}`.
             - Create or update `{definitions_label}` and `{theorems_label}`.
-            - Write a machine-readable main-results manifest to `{main_results_label}` for the theorem-frontier DAG seeding step.
+            - Write a machine-readable coarse paper-DAG manifest to `{main_results_label}` for the theorem-frontier seeding step.
             - During theorem stating, keep Lean edits inside the statement-file cone: only `PaperDefinitions.lean` / `PaperTheorems.lean` files (including module-layout variants with those exact filenames) should change.
             - Keep the definitions and statements easy for a human to compare against the paper.
             - Make both files syntactically valid Lean.
             - Do not introduce unapproved axioms.
             - If `{main_results_label}` does not exist yet, start from the supervisor-written stub and replace every placeholder field.
-            - The manifest must list every main paper result that should appear as an initial theorem-frontier node in proof formalization, using exact natural-language statements, exact Lean statements, exact anchors, and any dependency edges among those main results.
-            - The manifest must also choose `initial_active_node_id`, the paper-facing result that proof formalization should start on first.
+            - The manifest must describe the initial coarse theorem-frontier DAG extracted from the paper's proof spine, using exact natural-language statements, exact Lean statements, exact anchors, and only paper-facing / paper-faithful nodes.
+            - Every seeded edge must carry a rigorous paper-derived `natural_language_proof`; include explicit `direct_proof` self-edges for any coarse leaf obligations that are to be attacked directly.
+            - The manifest must also choose `initial_active_edge_id`, the first coarse obligation edge that proof formalization should start on.
             - The manifest must be a JSON object with exactly these top-level keys:
-              `phase`, `main_results`, `dependency_edges`, `initial_active_node_id`.
-            - Every entry in `main_results` must be an exact theorem-frontier node object for a paper-facing result, with kind `paper` or `paper_faithful_reformulation`.
+              `phase`, `nodes`, `edges`, `initial_active_edge_id`.
+            - Every entry in `nodes` must be an exact theorem-frontier node object for a paper-facing result, lemma, proposition, or faithful reformulation, with kind `paper` or `paper_faithful_reformulation`.
             - `DONE` means the statement files are in place and ready for reviewer comparison against the paper.
             """
         ).strip()
@@ -5129,9 +6038,12 @@ def theorem_frontier_worker_instructions(config: Config, state: Dict[str, Any], 
             f"""\
             Theorem-frontier artifact requirements:
             - In addition to the normal worker handoff, write a theorem-frontier JSON to `{artifact_label}`.
-            - That JSON must name exactly one active theorem node and one requested action: `CLOSE`, `EXPAND`, or `REFUTE_REPLACE`.
-            - Treat the active node as the authoritative proof target for this burst.
-            - If the active node is already in the authoritative DAG, identify it by `active_node_id` and do not restate its theorem fields.
+            - That JSON must name exactly one active obligation edge and one requested action: `CLOSE`, `EXPAND`, or `REFUTE_REPLACE`.
+            - Treat the active edge as the authoritative proof target for this burst; its parent node is the theorem currently being advanced.
+            - In full DAG mode, meaningful progress is edge-centric: either prove one or more existing dependency/reduction edges (`claimed_closed_edge_ids`) or expand one unresolved edge into a richer local sub-DAG (`expanded_edge_id` plus proposed nodes/edges).
+            - A successful expansion must also supply complete natural-language proofs for every newly introduced edge and for every newly introduced leaf node. Use the paper as needed, but do not leave those proof texts implicit.
+            - If you want to prove a theorem directly, the DAG must contain an explicit `direct_proof` self-edge for that node; the supervisor will not invent one for you.
+            - If the active node is already in the authoritative DAG, identify the current obligation by `active_edge_id`; use `active_node_id` only as a helper/diagnostic.
             - Only include a full `active_node` object when introducing a genuinely new active node that is not already authoritative.
             - Work only inside the active cone: the active node, its current children, or mechanically necessary support directly tied to closing that node.
             - If you propose a structural change, include exact proposed nodes and edges. Do not leave them vague.
@@ -5139,15 +6051,18 @@ def theorem_frontier_worker_instructions(config: Config, state: Dict[str, Any], 
             Your theorem-frontier JSON must have exactly these top-level keys:
             {{
               "phase": "{phase}",
+              "active_edge_id": "stable obligation edge id",
               "active_node_id": "stable theorem node id",
               "active_node": {{ exact node object only if `active_node_id` is not already authoritative }} | null,
               "requested_action": "CLOSE" | "EXPAND" | "REFUTE_REPLACE",
               "cone_scope": "what work is inside the active cone for this burst",
               "allowed_edit_paths": ["repo-relative .lean files allowed inside that cone for this burst"],
               "result_summary": "what changed relative to the active node",
-              "proposed_nodes": [{{ exact node objects, if any }}],
-              "proposed_edges": [{{ "parent": "...", "child": "...", "edge_type": "...", "justification": "..." }}],
-              "next_candidate_ids": ["node ids that could become the next active leaf"],
+              "proposed_nodes": [{{ exact node objects, including `natural_language_proof` for any new leaf node }}],
+              "proposed_edges": [{{ "parent": "...", "child": "...", "edge_type": "...", "justification": "...", "natural_language_proof": "complete rigorous NL proof of this edge" }}],
+              "next_candidate_edge_ids": ["edge ids that could become the next active obligation"],
+              "claimed_closed_edge_ids": ["canonical edge ids proved/discharged in this burst"],
+              "expanded_edge_id": "canonical edge id expanded in this burst, or empty",
               "structural_change_reason": "why a structural edit is needed, or empty if none"
             }}
             Any Lean file changed outside `allowed_edit_paths` will fail theorem-frontier cone validation for the cycle.
@@ -5189,21 +6104,26 @@ def theorem_frontier_reviewer_instructions(config: Config, state: Dict[str, Any]
             Theorem-frontier review requirements:
             - In addition to the normal reviewer decision, write a theorem-frontier review JSON to `{artifact_label}`.
             - Judge the cycle by theorem-frontier standards, not by build cleanliness alone.
-            - Confirm whether the requested action really happened on one active theorem node.
+            - Confirm whether the requested action really happened on one active obligation edge.
+            - In full DAG mode, count real progress only if the burst either closed one or more existing edges or expanded one unresolved edge into a larger local DAG.
+            - Do not accept an `EXPANDED` outcome if the newly admitted edges or leaf nodes lack complete natural-language proofs.
             - If the worker mostly added wrappers above the same blocker or drifted outside the active cone, use `NO_FRONTIER_PROGRESS`.
             - If cone purity is low, record that explicitly.
-            - Use `next_active_theorem_id` to name the leaf that should be active after this review. Use the current active theorem id if the same node stays active, or leave it empty only if there is no next active leaf yet.
+            - Use `next_active_edge_id` to name the obligation that should be active after this review. Use the current active edge id if the same obligation stays active, or leave it empty only if there is no next active edge yet.
 
             Your theorem-frontier review JSON must have exactly these keys:
             {{
               "phase": "{phase}",
-              "active_theorem_id": "reviewed node id",
+              "active_edge_id": "reviewed edge id",
+              "active_theorem_id": "reviewed parent node id",
               "assessed_action": "CLOSE" | "EXPAND" | "REFUTE_REPLACE",
               "blocker_cluster": "canonical blocker after review",
               "outcome": "CLOSED" | "EXPANDED" | "REFUTED_REPLACED" | "STILL_OPEN" | "NO_FRONTIER_PROGRESS",
-              "next_active_theorem_id": "next active leaf id or current id",
+              "next_active_edge_id": "next active edge id or current id",
               "cone_purity": "HIGH" | "MEDIUM" | "LOW",
               "open_hypotheses": ["remaining assumptions still blocking closure"],
+              "closed_edge_ids": ["canonical edge ids proved/discharged by this cycle"],
+              "expanded_edge_id": "canonical edge id expanded/replaced by this cycle, or empty",
               "justification": "brief theorem-frontier justification"
             }}
             The reviewer should identify authoritative nodes by id and let the supervisor use the canonical DAG statements.
@@ -5247,6 +6167,7 @@ def theorem_frontier_paper_verifier_instructions(config: Config, state: Dict[str
         - Review the proposed node/edge change only against the paper, `PAPERNOTES.md`, and already approved reformulations.
         - Trigger approval only for structural changes that are paper-exact, paper-faithful reformulations, conservative strengthenings, or explicit exploratory detours.
         - Reject any structural edit that is paper-incompatible, hides a necessary split, or silently changes the proof spine.
+        - For any structural edit you approve, require complete natural-language proofs on every newly admitted edge and every newly admitted leaf node. Do not approve vague proof placeholders.
 
         Your paper-verifier JSON must have exactly these keys:
         {{
@@ -5256,8 +6177,36 @@ def theorem_frontier_paper_verifier_instructions(config: Config, state: Dict[str
           "decision": "APPROVE" | "APPROVE_WITH_CAVEAT" | "REJECT",
           "classification": "paper_exact" | "paper_faithful_reformulation" | "conservative_strengthening" | "exploratory_detour" | "paper_incompatible",
           "approved_node_ids": ["node ids approved by this review"],
-          "approved_edges": [{{ "parent": "...", "child": "..." }}],
+          "approved_edges": [{{ "edge_id": "parent|edge_type|child", "parent": "...", "edge_type": "...", "child": "..." }}],
           "justification": "paper-faithfulness justification",
+          "caveat": "leave empty unless APPROVE_WITH_CAVEAT"
+        }}
+        """
+    ).strip()
+
+
+def theorem_frontier_nl_proof_verifier_instructions(config: Config, state: Dict[str, Any], phase: str, provider: str) -> str:
+    if not theorem_frontier_full_enabled(config, phase):
+        return ""
+    artifact_label = supervisor_prompt_label(config, provider, theorem_frontier_nl_proof_verifier_path(config))
+    return textwrap.dedent(
+        f"""\
+        NL-proof-verifier requirements:
+        - You are acting as the dedicated verifier of natural-language proofs for theorem-frontier structural admissions.
+        - Do not judge paper-faithfulness here; the paper-verifier already handled that.
+        - Judge only whether the natural-language proofs on the paper-approved newly admitted edges and newly admitted leaf nodes are complete, rigorous, and sufficient.
+        - Approve only the subset whose natural-language proofs are genuinely rigorous. Reject or withhold approval from anything with gaps, handwaving, or missing case analysis.
+        - You may approve a strict subset of the paper-approved nodes/edges if only that subset has rigorous natural-language proofs.
+
+        Your NL-proof-verifier JSON must have exactly these keys:
+        {{
+          "phase": "{phase}",
+          "parent_node_id": "node whose subtree is changing",
+          "change_kind": "CREATE_ACTIVE" | "EXPAND" | "REFUTE_REPLACE",
+          "decision": "APPROVE" | "APPROVE_WITH_CAVEAT" | "REJECT",
+          "approved_node_ids": ["paper-approved node ids whose NL proofs are rigorous"],
+          "approved_edges": [{{ "edge_id": "parent|edge_type|child", "parent": "...", "edge_type": "...", "child": "..." }}],
+          "justification": "brief rigor judgment",
           "caveat": "leave empty unless APPROVE_WITH_CAVEAT"
         }}
         """
@@ -5365,8 +6314,8 @@ def phase_reviewer_instructions(config: Config, phase: str) -> str:
             f"""\
             Decide whether the worker should continue theorem stating, advance to proof formalization, or stop.
             Compare `PaperDefinitions.lean` and `PaperTheorems.lean` against the paper and insist on changes if they do not correspond.
-            Compare the main-results manifest `{main_results_label}` against the paper and the statement files.
-            Require that it includes all main paper results, excludes support-only statements, and chooses a reasonable initial active paper node.
+            Compare the coarse paper-DAG manifest `{main_results_label}` against the paper and the statement files.
+            Require that it captures a reasonable coarse proof spine from the paper, uses only paper / paper-faithful nodes, and chooses a reasonable initial active obligation edge.
             Require syntactically valid Lean before advancing.
             """
         ).strip()
@@ -5449,6 +6398,63 @@ def build_theorem_frontier_paper_verifier_prompt(
     ).strip()
 
 
+def build_theorem_frontier_nl_proof_verifier_prompt(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    worker_terminal_output: str,
+    worker_handoff_text: str,
+    worker_frontier_update: Dict[str, Any],
+    paper_review: Dict[str, Any],
+    is_initial: bool,
+) -> str:
+    goal_text = read_text(config.goal_file).strip()
+    recent_reviews = state.get("review_log", [])[-3:]
+    paper_notes = trim_text(read_text(config.repo_path / "PAPERNOTES.md").strip(), 16000) or "(none)"
+    frontier_payload = theorem_frontier_payload(state) or default_theorem_frontier_payload("full")
+    preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
+    artifact_label = supervisor_prompt_label(config, config.reviewer.provider, theorem_frontier_nl_proof_verifier_path(config))
+    return textwrap.dedent(
+        f"""\
+        You are the NL-proof verifier for theorem-frontier structural admissions.
+
+        {preface}
+
+        Global goal:
+        {goal_text}
+
+        {phase_context_text(config, state, phase, config.reviewer.provider)}
+
+        Worker theorem-frontier JSON:
+        {json.dumps(worker_frontier_update, indent=2, ensure_ascii=False)}
+
+        Paper-verifier structural review:
+        {json.dumps(paper_review, indent=2, ensure_ascii=False)}
+
+        Current authoritative theorem-frontier payload:
+        {trim_text(json.dumps(frontier_payload, indent=2, ensure_ascii=False), 18000)}
+
+        Worker handoff JSON:
+        {worker_handoff_text}
+
+        Recent reviewer decisions:
+        {json.dumps(recent_reviews, indent=2, ensure_ascii=False) if recent_reviews else "[]"}
+
+        Relevant paper notes from `repo/PAPERNOTES.md`:
+        {paper_notes}
+
+        Worker terminal output:
+        {trim_text(worker_terminal_output, 18000)}
+
+        {theorem_frontier_nl_proof_verifier_instructions(config, state, phase, config.reviewer.provider)}
+
+        Before ending this turn:
+        - write your NL-proof-verifier JSON to `{artifact_label}`
+        - also print the same JSON as the final thing in your terminal output
+        """
+    ).strip()
+
+
 def build_reviewer_prompt(
     config: Config,
     state: Dict[str, Any],
@@ -5501,6 +6507,20 @@ def build_reviewer_prompt(
             {json.dumps(paper_verifier, indent=2, ensure_ascii=False) if isinstance(paper_verifier, dict) else "{}"}
             """
         )
+    nl_proof_verifier_text = ""
+    if theorem_frontier_full_enabled(config, phase):
+        nl_proof_verifier = state.get("last_theorem_frontier_nl_proof_review")
+        nl_proof_verifier_label = supervisor_prompt_label(
+            config,
+            config.reviewer.provider,
+            theorem_frontier_nl_proof_verifier_path(config),
+        )
+        nl_proof_verifier_text = textwrap.dedent(
+            f"""\n
+            NL-proof verifier review from `{nl_proof_verifier_label}`:
+            {json.dumps(nl_proof_verifier, indent=2, ensure_ascii=False) if isinstance(nl_proof_verifier, dict) else "{}"}
+            """
+        )
     validation_label = supervisor_prompt_label(config, config.reviewer.provider, validation_summary_path(config))
     review_decision_label = supervisor_prompt_label(config, config.reviewer.provider, config.state_dir / "review_decision.json")
     frontier_review_notes = theorem_frontier_reviewer_instructions(config, state, phase, config.reviewer.provider)
@@ -5526,6 +6546,7 @@ def build_reviewer_prompt(
         {worker_handoff_text}
         {frontier_update_text}
         {paper_verifier_text}
+        {nl_proof_verifier_text}
 
         Supervisor validation summary from `{validation_label}`:
         {trim_text(json.dumps(validation_summary, indent=2, ensure_ascii=False), 16000)}
@@ -5687,16 +6708,19 @@ def build_branch_strategy_prompt(
         )
     if theorem_frontier_full_enabled(config, phase):
         frontier_summary = theorem_frontier_branch_summary(state)
+        active_edge_id = normalize_frontier_text(frontier_summary.get("active_edge_id"))
         active_leaf_id = normalize_frontier_text(frontier_summary.get("active_leaf_id"))
-        if active_leaf_id:
-            active_frontier_anchor = active_leaf_id
+        if active_edge_id or active_leaf_id:
+            active_frontier_anchor = active_edge_id or active_leaf_id
             blocker_cluster = str(frontier_summary.get("blocker_cluster") or "").strip()
             theorem_branch_note = textwrap.dedent(
                 f"""\
                 Theorem-frontier branching rule:
-                - Any branch proposal must be a competing replacement route for the active theorem node `{active_leaf_id}`.
+                - Any branch proposal must be a competing replacement route for the active obligation edge `{active_edge_id or '(unset)'}` under theorem node `{active_leaf_id or '(unknown)'}`.
+                - The active theorem node `{active_leaf_id or '(unknown)'}` still provides the local statement context, but the edge is the unit of work.
                 - Do not propose branches that widen the frontier above or outside that node's subtree.
-                - Branch only when there are genuinely competing next moves for this node: different close routes, materially different expansions, or a real refute/replace alternative.
+                - Do not propose branches that widen the frontier above or outside that obligation's subtree.
+                - Branch only when there are genuinely competing next moves for this edge: different close routes, materially different expansions, or a real refute/replace alternative.
                 - Do not branch just to keep multiple wrapper-building or bookkeeping variants of the same blocker alive.
                 - If the routes still share the same blocker cluster and unresolved hypothesis set, prefer `NO_BRANCH`.
                 - Branching is most justified when escalation pressure is building or when there are clearly different ways to cut blocker cluster `{blocker_cluster or '(unset)'}`.
@@ -5756,7 +6780,7 @@ def build_branch_strategy_prompt(
         {{
           "phase": "{phase}",
           "branch_decision": "NO_BRANCH" | "BRANCH",
-          "frontier_anchor_node_id": "{active_frontier_anchor}",
+          "frontier_anchor_edge_id": "{active_frontier_anchor}",
           "confidence": 0.0,
           "reason": "brief reason",
           "strategies": [
@@ -5805,11 +6829,12 @@ def build_branch_selection_prompt(
     active_frontier_anchor = ""
     if theorem_frontier_full_enabled(config, phase):
         frontier_summary = theorem_frontier_branch_summary(state)
+        active_edge_id = normalize_frontier_text(frontier_summary.get("active_edge_id"))
         active_leaf_id = normalize_frontier_text(frontier_summary.get("active_leaf_id"))
-        if active_leaf_id:
-            active_frontier_anchor = active_leaf_id
+        if active_edge_id or active_leaf_id:
+            active_frontier_anchor = active_edge_id or active_leaf_id
             theorem_branch_note = (
-                f"Active theorem-frontier branch point: `{active_leaf_id}`. "
+                f"Active theorem-frontier branch point: edge `{active_edge_id or '(unset)'}` under node `{active_leaf_id or '(unknown)'}`. "
                 "Prefer the branch that most cleanly closes that subtree, strictly reduces the unresolved hypothesis set, "
                 "and leaves the smallest residual cutset."
             )
@@ -5867,7 +6892,7 @@ def build_branch_selection_prompt(
         {{
           "phase": "{phase}",
           "selection_decision": "CONTINUE_BRANCHING" | "SELECT_BRANCH",
-          "frontier_anchor_node_id": "{active_frontier_anchor}",
+          "frontier_anchor_edge_id": "{active_frontier_anchor}",
           "confidence": 0.0,
           "reason": "brief reason",
           "selected_branch": "branch name or empty string"
@@ -5898,12 +6923,12 @@ def build_branch_replacement_prompt(
     )
     theorem_branch_note = ""
     if theorem_frontier_full_enabled(config, phase):
-        anchor_id = normalize_frontier_text(episode.get("frontier_anchor_node_id"))
+        anchor_id = normalize_frontier_text(episode.get("frontier_anchor_edge_id") or episode.get("frontier_anchor_node_id"))
         blocker = str(episode.get("frontier_anchor_blocker_cluster") or "").strip()
         if anchor_id:
             theorem_branch_note = (
-                f"The active frontier is anchored at theorem node `{anchor_id}`. "
-                f"Only replace the current frontier if the proposal offers materially different ways to close or replace that same node/subtree, not just new wrapper variants for blocker `{blocker or '(unset)'}`."
+                f"The active frontier is anchored at obligation edge `{anchor_id}`. "
+                f"Only replace the current frontier if the proposal offers materially different ways to close or replace that same obligation/subtree, not just new wrapper variants for blocker `{blocker or '(unset)'}`."
             )
     return textwrap.dedent(
         f"""\
@@ -6287,16 +7312,18 @@ def run_validation(
             "path": str(manifest_path),
             "present": manifest_path.exists(),
             "ok": False,
-            "main_result_count": 0,
-            "initial_active_node_id": "",
+            "node_count": 0,
+            "edge_count": 0,
+            "initial_active_edge_id": "",
             "error": "",
         }
         if manifest_path.exists():
             try:
                 manifest = load_validated_paper_main_results_manifest(config)
                 manifest_summary["ok"] = True
-                manifest_summary["main_result_count"] = len(manifest["main_results"])
-                manifest_summary["initial_active_node_id"] = manifest["initial_active_node_id"]
+                manifest_summary["node_count"] = len(manifest["nodes"])
+                manifest_summary["edge_count"] = len(manifest["edges"])
+                manifest_summary["initial_active_edge_id"] = manifest["initial_active_edge_id"]
             except SupervisorError as exc:
                 manifest_summary["error"] = str(exc)
         summary["paper_main_results_manifest"] = manifest_summary
@@ -6312,6 +7339,16 @@ def run_validation(
         summary["git"]["previous_validation_head"] = validation_git_head(previous_validation)
         summary["git"]["changed_lean_files"] = changed_lean_files_since_validation(config, previous_validation)
         summary["theorem_stating_edit_policy"] = validation_theorem_stating_edit_policy(config, phase, summary["git"])
+
+    git_summary = summary.get("git") if isinstance(summary.get("git"), dict) else {}
+    summary["build_ok"] = bool((summary.get("build") or {}).get("ok"))
+    summary["git_ok"] = bool(
+        git_summary.get("enabled")
+        and git_summary.get("repo_ok")
+        and git_summary.get("worktree_clean")
+        and git_summary.get("remote_matches_config")
+    )
+    summary["head"] = git_summary.get("head")
 
     summary["policy_ok"] = (
         summary["all_required_files_present"]
@@ -6677,10 +7714,15 @@ def role_auxiliary_artifact_paths(config: Config, role: str) -> List[Path]:
         return [
             theorem_frontier_review_path(config),
             theorem_frontier_paper_verifier_path(config),
+            theorem_frontier_nl_proof_verifier_path(config),
             branch_strategy_artifact_path(config),
             branch_selection_artifact_path(config),
             branch_replacement_artifact_path(config),
         ]
+    if role == "paper_verifier":
+        return [theorem_frontier_paper_verifier_path(config)]
+    if role == "nl_proof_verifier":
+        return [theorem_frontier_nl_proof_verifier_path(config)]
     return []
 
 
@@ -6765,11 +7807,19 @@ def launch_tmux_burst_with_retries(
             )
 
         delay_seconds = retry_delays[attempt - 1]
-        delay_hours = int(delay_seconds // 3600)
-        print(
-            f"{stage_label.capitalize()} process exited with code {run['exit_code']}. "
-            f"Retrying the same burst in {delay_hours} hour(s). See {run['per_cycle_log']}"
-        )
+        if burst_hit_productive_local_failure(run):
+            delay_seconds = min(delay_seconds, PRODUCTIVE_LOCAL_FAILURE_MAX_RETRY_DELAY_SECONDS)
+            delay_minutes = int(delay_seconds // 60)
+            print(
+                f"{stage_label.capitalize()} ended after a productive local proof/build failure. "
+                f"Retrying the same burst in {delay_minutes} minute(s). See {run['per_cycle_log']}"
+            )
+        else:
+            delay_hours = int(delay_seconds // 3600)
+            print(
+                f"{stage_label.capitalize()} process exited with code {run['exit_code']}. "
+                f"Retrying the same burst in {delay_hours} hour(s). See {run['per_cycle_log']}"
+            )
         time.sleep(delay_seconds)
         attempt += 1
 
@@ -7043,17 +8093,25 @@ def validate_branch_strategy_decision(
             "Branch-strategy decision must include between 2 and "
             f"{limit} strategies when branching."
         )
+    frontier_anchor_edge_id = normalize_frontier_text(decision.get("frontier_anchor_edge_id"))
     frontier_anchor_node_id = normalize_frontier_text(decision.get("frontier_anchor_node_id"))
-    active_leaf_id = theorem_frontier_active_leaf_id(state or {})
-    if theorem_frontier_full_enabled(config, phase) and active_leaf_id:
-        if frontier_anchor_node_id != active_leaf_id:
+    if theorem_frontier_full_enabled(config, phase) and not frontier_anchor_edge_id:
+        if frontier_anchor_node_id and frontier_anchor_node_id == theorem_frontier_active_leaf_id(state or {}):
+            frontier_anchor_edge_id = theorem_frontier_active_edge_id(state or {})
+        else:
+            raise SupervisorError("Branch-strategy decision must include frontier_anchor_edge_id (legacy frontier_anchor_node_id also accepted).")
+    active_edge_id = theorem_frontier_active_edge_id(state or {})
+    active_node_id = theorem_frontier_active_leaf_id(state or {})
+    if theorem_frontier_full_enabled(config, phase) and active_edge_id:
+        if frontier_anchor_edge_id != active_edge_id:
             raise SupervisorError(
-                "Branch-strategy decision frontier_anchor_node_id must match the active theorem-frontier leaf "
-                f"{active_leaf_id!r}."
+                "Branch-strategy decision frontier_anchor_edge_id / frontier_anchor_node_id must match the active theorem-frontier edge "
+                f"{active_edge_id!r}."
             )
     decision["branch_decision"] = branch_decision
     decision["strategies"] = strategies
-    decision["frontier_anchor_node_id"] = frontier_anchor_node_id
+    decision["frontier_anchor_edge_id"] = frontier_anchor_edge_id
+    decision["frontier_anchor_node_id"] = active_node_id or frontier_anchor_node_id or ""
     return decision
 
 
@@ -7084,17 +8142,25 @@ def validate_branch_selection_decision(
             )
     else:
         selected_branch = ""
+    frontier_anchor_edge_id = normalize_frontier_text(decision.get("frontier_anchor_edge_id"))
     frontier_anchor_node_id = normalize_frontier_text(decision.get("frontier_anchor_node_id"))
-    active_leaf_id = theorem_frontier_active_leaf_id(state or {})
-    if theorem_frontier_full_enabled(config, phase) and active_leaf_id:
-        if frontier_anchor_node_id != active_leaf_id:
+    if theorem_frontier_full_enabled(config, phase) and not frontier_anchor_edge_id:
+        if frontier_anchor_node_id and frontier_anchor_node_id == theorem_frontier_active_leaf_id(state or {}):
+            frontier_anchor_edge_id = theorem_frontier_active_edge_id(state or {})
+        else:
+            raise SupervisorError("Branch-selection decision must include frontier_anchor_edge_id (legacy frontier_anchor_node_id also accepted).")
+    active_edge_id = theorem_frontier_active_edge_id(state or {})
+    active_node_id = theorem_frontier_active_leaf_id(state or {})
+    if theorem_frontier_full_enabled(config, phase) and active_edge_id:
+        if frontier_anchor_edge_id != active_edge_id:
             raise SupervisorError(
-                "Branch-selection decision frontier_anchor_node_id must match the active theorem-frontier leaf "
-                f"{active_leaf_id!r}."
+                "Branch-selection decision frontier_anchor_edge_id / frontier_anchor_node_id must match the active theorem-frontier edge "
+                f"{active_edge_id!r}."
             )
     decision["selection_decision"] = selection_decision
     decision["selected_branch"] = selected_branch
-    decision["frontier_anchor_node_id"] = frontier_anchor_node_id
+    decision["frontier_anchor_edge_id"] = frontier_anchor_edge_id
+    decision["frontier_anchor_node_id"] = active_node_id or frontier_anchor_node_id or ""
     return decision
 
 
@@ -7468,6 +8534,93 @@ def run_theorem_frontier_paper_verifier_review(
     return review
 
 
+def run_theorem_frontier_nl_proof_verifier_review(
+    config: Config,
+    state: Dict[str, Any],
+    nl_proof_verifier: ProviderAdapter,
+    phase: str,
+    worker_terminal_output: str,
+    worker_handoff: Dict[str, Any],
+    worker_frontier_update: Dict[str, Any],
+    paper_review: Dict[str, Any],
+    *,
+    cycle: int,
+    policy: Optional[Policy] = None,
+) -> Dict[str, Any]:
+    worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
+    prompt = build_theorem_frontier_nl_proof_verifier_prompt(
+        config,
+        state,
+        phase,
+        worker_terminal_output,
+        worker_handoff_text,
+        worker_frontier_update,
+        paper_review,
+        nl_proof_verifier.needs_initial_run(),
+    )
+    prompt_for_chat = build_theorem_frontier_nl_proof_verifier_prompt(
+        config,
+        state,
+        phase,
+        "[omitted from the web transcript; raw terminal output is only kept in local logs]",
+        worker_handoff_text,
+        worker_frontier_update,
+        paper_review,
+        nl_proof_verifier.needs_initial_run(),
+    )
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="theorem_frontier_nl_proof_verifier_prompt",
+        actor="supervisor",
+        target="nl_proof_verifier",
+        content=prompt_for_chat,
+        content_type="text",
+        summary=f"Supervisor -> theorem-frontier NL-proof verifier prompt for cycle {cycle}",
+    )
+
+    def _validate_nl_proof_verifier(run: Dict[str, Any]) -> Dict[str, Any]:
+        output = run["captured_output"].strip()
+        rev = load_json_artifact_with_fallback(
+            Path(run["artifact_path"]),
+            output,
+            ("phase", "decision"),
+            fallback_paths=legacy_supervisor_artifact_paths(config, Path(run["artifact_path"])),
+        )
+        return validate_theorem_frontier_nl_proof_verifier_review(phase, rev)
+
+    run, review = run_burst_with_validation(
+        nl_proof_verifier,
+        cycle,
+        prompt,
+        config=config,
+        state=state,
+        phase=phase,
+        stage_label="NL-proof-verifier burst",
+        policy=policy,
+        validate=_validate_nl_proof_verifier,
+    )
+    nl_proof_verifier.mark_initialized()
+    review["cycle"] = cycle
+    state["last_theorem_frontier_nl_proof_review"] = review
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="theorem_frontier_nl_proof_verifier_review",
+        actor="nl_proof_verifier",
+        target="supervisor",
+        content=review,
+        content_type="json",
+    )
+    save_state(config, state)
+    append_jsonl(config.state_dir / "theorem_frontier_nl_proof_verifier_log.jsonl", review)
+    return review
+
+
 def config_to_raw_dict(config: Config, *, policy: Optional[Policy] = None) -> Dict[str, Any]:
     effective = effective_policy(config, policy=policy)
     workflow: Dict[str, Any] = {
@@ -7553,6 +8706,10 @@ def branch_episode_snapshots(episode: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "name": branch.get("name"),
                 "branch_status": branch_status,
                 "summary": branch.get("summary"),
+                "frontier_anchor_edge_id": normalize_frontier_text(
+                    branch.get("frontier_anchor_edge_id") or episode.get("frontier_anchor_edge_id")
+                )
+                or None,
                 "frontier_anchor_node_id": normalize_frontier_text(
                     branch.get("frontier_anchor_node_id") or episode.get("frontier_anchor_node_id")
                 )
@@ -7583,6 +8740,7 @@ def branch_episode_snapshots(episode: Dict[str, Any]) -> List[Dict[str, Any]]:
                     len(proposal.get("strategies", [])) if isinstance(proposal, dict) and isinstance(proposal.get("strategies"), list) else 0
                 ),
                 "git_head": ((latest_validation.get("git") or {}).get("head") if isinstance(latest_validation, dict) else None),
+                "theorem_frontier_active_edge_id": frontier_summary.get("active_edge_id"),
                 "theorem_frontier_active_leaf_id": frontier_summary.get("active_leaf_id"),
                 "theorem_frontier_active_leaf_anchor": frontier_summary.get("active_leaf_anchor"),
                 "theorem_frontier_blocker_cluster": frontier_summary.get("blocker_cluster"),
@@ -7590,6 +8748,7 @@ def branch_episode_snapshots(episode: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "theorem_frontier_assessed_action": frontier_summary.get("assessed_action"),
                 "theorem_frontier_open_hypotheses_count": frontier_summary.get("open_hypotheses_count"),
                 "theorem_frontier_open_hypotheses": frontier_summary.get("open_hypotheses"),
+                "theorem_frontier_active_edge_age": frontier_summary.get("active_edge_age"),
                 "theorem_frontier_active_leaf_age": frontier_summary.get("active_leaf_age"),
                 "theorem_frontier_blocker_cluster_age": frontier_summary.get("blocker_cluster_age"),
                 "theorem_frontier_failed_close_attempts": frontier_summary.get("failed_close_attempts"),
@@ -7710,6 +8869,9 @@ def build_child_branch_state(
         "worker_prompt": strategy["worker_prompt"],
         "why_this_might_eventually_succeed": strategy["why_this_might_eventually_succeed"],
         "rewrite_scope": strategy["rewrite_scope"],
+        "frontier_anchor_edge_id": normalize_frontier_text(
+            strategy.get("frontier_anchor_edge_id") or strategy.get("frontier_anchor_node_id")
+        ) or None,
         "frontier_anchor_node_id": normalize_frontier_text(strategy.get("frontier_anchor_node_id")) or None,
     }
     reset_child_branch_theorem_frontier_runtime_state(child_state)
@@ -7737,11 +8899,16 @@ def create_branch_episode(
     base_review_count = branch_review_count(state)
     parent_head = status.get("head")
     frontier_summary = theorem_frontier_branch_summary(state)
-    frontier_anchor_node_id = (
-        normalize_frontier_text(branch_strategy.get("frontier_anchor_node_id"))
-        or normalize_frontier_text(frontier_summary.get("active_leaf_id"))
-        or None
-    )
+    active_edge_id = normalize_frontier_text(frontier_summary.get("active_edge_id")) or None
+    active_node_id = normalize_frontier_text(frontier_summary.get("active_leaf_id")) or None
+    requested_anchor_edge_id = normalize_frontier_text(branch_strategy.get("frontier_anchor_edge_id")) or None
+    requested_anchor_node_id = normalize_frontier_text(branch_strategy.get("frontier_anchor_node_id")) or None
+    frontier_anchor_edge_id = requested_anchor_edge_id
+    if not frontier_anchor_edge_id and requested_anchor_node_id and requested_anchor_node_id == active_node_id:
+        frontier_anchor_edge_id = active_edge_id
+    if not frontier_anchor_edge_id:
+        frontier_anchor_edge_id = active_edge_id
+    frontier_anchor_node_id = normalize_frontier_text(frontier_summary.get("active_leaf_id")) or None
     branches: List[Dict[str, Any]] = []
     for strategy in branch_strategy["strategies"]:
         label = sanitize_branch_label(strategy["name"])
@@ -7763,7 +8930,12 @@ def create_branch_episode(
         child_state = build_child_branch_state(
             state,
             episode_id=episode_id,
-            strategy={**strategy, "name": label, "frontier_anchor_node_id": frontier_anchor_node_id},
+            strategy={
+                **strategy,
+                "name": label,
+                "frontier_anchor_edge_id": frontier_anchor_edge_id,
+                "frontier_anchor_node_id": frontier_anchor_node_id,
+            },
             parent_max_current_branches=config.branching.max_current_branches,
         )
         child_state_dir = worktree_path / ".agent-supervisor"
@@ -7779,6 +8951,7 @@ def create_branch_episode(
                 "worker_prompt": strategy["worker_prompt"],
                 "why_this_might_eventually_succeed": strategy["why_this_might_eventually_succeed"],
                 "rewrite_scope": strategy["rewrite_scope"],
+                "frontier_anchor_edge_id": frontier_anchor_edge_id,
                 "frontier_anchor_node_id": frontier_anchor_node_id,
                 "status": "active",
                 "worktree_path": str(worktree_path),
@@ -7799,6 +8972,7 @@ def create_branch_episode(
         "evaluation_cycle_budget": branch_review_budget(config, policy),
         "selection_continue_count": 0,
         "selection_question": branch_selection_question_for_state(state),
+        "frontier_anchor_edge_id": frontier_anchor_edge_id,
         "frontier_anchor_node_id": frontier_anchor_node_id,
         "frontier_anchor_lean_anchor": frontier_summary.get("active_leaf_anchor"),
         "frontier_anchor_lean_statement": frontier_summary.get("active_leaf_lean_statement"),
@@ -8099,13 +9273,13 @@ def pending_branch_proposal_snapshots(snapshots: Sequence[Dict[str, Any]]) -> Li
 
 
 def proposal_snapshot_anchor_matches_episode(episode: Dict[str, Any], proposal_snapshot: Dict[str, Any]) -> bool:
-    episode_anchor = normalize_frontier_text(episode.get("frontier_anchor_node_id"))
+    episode_anchor = normalize_frontier_text(episode.get("frontier_anchor_edge_id") or episode.get("frontier_anchor_node_id"))
     if not episode_anchor:
         return True
     proposal = proposal_snapshot.get("pending_branch_proposal")
     if not isinstance(proposal, dict):
         return False
-    proposal_anchor = normalize_frontier_text(proposal.get("frontier_anchor_node_id"))
+    proposal_anchor = normalize_frontier_text(proposal.get("frontier_anchor_edge_id") or proposal.get("frontier_anchor_node_id"))
     return proposal_anchor == episode_anchor
 
 
@@ -8119,10 +9293,12 @@ def record_automatic_branch_selection(
     reason: str,
 ) -> Dict[str, Any]:
     cycle = int(state.get("cycle", 0) or 0)
+    frontier_anchor_edge_id = normalize_frontier_text(episode.get("frontier_anchor_edge_id") or episode.get("frontier_anchor_node_id")) or None
     frontier_anchor_node_id = normalize_frontier_text(episode.get("frontier_anchor_node_id")) or None
     selection = {
         "phase": phase,
         "selection_decision": "SELECT_BRANCH",
+        "frontier_anchor_edge_id": frontier_anchor_edge_id,
         "frontier_anchor_node_id": frontier_anchor_node_id,
         "confidence": 1.0,
         "reason": reason,
@@ -8154,9 +9330,12 @@ def record_branch_selection_decision(
     selection: Dict[str, Any],
 ) -> Dict[str, Any]:
     cycle = int(state.get("cycle", 0) or 0)
-    if "frontier_anchor_node_id" not in selection:
+    if "frontier_anchor_edge_id" not in selection and "frontier_anchor_node_id" not in selection:
         selection = {
             **selection,
+            "frontier_anchor_edge_id": normalize_frontier_text(
+                episode.get("frontier_anchor_edge_id") or episode.get("frontier_anchor_node_id")
+            ) or None,
             "frontier_anchor_node_id": normalize_frontier_text(episode.get("frontier_anchor_node_id")) or None,
         }
     record_chat_event(
@@ -8332,9 +9511,10 @@ def branch_episode_status_lines(
                 f" pending_proposal={int(snapshot.get('pending_branch_proposal_strategy_count', 0) or 0)}-way"
             )
         frontier_bits = ""
-        if snapshot.get("theorem_frontier_active_leaf_id"):
+        if snapshot.get("theorem_frontier_active_edge_id") or snapshot.get("theorem_frontier_active_leaf_id"):
             frontier_bits = (
-                f" frontier={snapshot.get('theorem_frontier_active_leaf_id')}"
+                f" frontier_edge={snapshot.get('theorem_frontier_active_edge_id') or 'none'}"
+                f" frontier_node={snapshot.get('theorem_frontier_active_leaf_id') or 'none'}"
                 f" blocker={snapshot.get('theorem_frontier_blocker_cluster') or 'none'}"
                 f" open_hyps={int(snapshot.get('theorem_frontier_open_hypotheses_count', 0) or 0)}"
             )
@@ -8676,6 +9856,7 @@ def main() -> int:
     worker = make_adapter("worker", config, state)
     reviewer = make_adapter("reviewer", config, state)
     paper_verifier = make_adapter("paper_verifier", config, state)
+    nl_proof_verifier = make_adapter("nl_proof_verifier", config, state)
 
     if phase == "proof_formalization" and not has_active_branch_episode and can_attempt_stuck_recovery(state, policy):
         suggestion = run_stuck_recovery_review(config, state, reviewer, phase, policy=policy)
@@ -8898,6 +10079,7 @@ def main() -> int:
             if not isinstance(worker_frontier_update, dict):
                 raise SupervisorError("No theorem-frontier worker update in state for full-mode reviewer cycle.")
             paper_review = state.get("last_theorem_frontier_paper_review")
+            nl_proof_review = state.get("last_theorem_frontier_nl_proof_review")
             if isinstance(worker_frontier_update, dict) and theorem_frontier_requires_paper_verifier(state, worker_frontier_update):
                 if not (isinstance(paper_review, dict) and int(paper_review.get("cycle", 0) or 0) == cycle):
                     paper_review = run_theorem_frontier_paper_verifier_review(
@@ -8911,8 +10093,25 @@ def main() -> int:
                         cycle=cycle,
                         policy=policy,
                     )
+                if paper_review.get("decision") in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
+                    if not (isinstance(nl_proof_review, dict) and int(nl_proof_review.get("cycle", 0) or 0) == cycle):
+                        nl_proof_review = run_theorem_frontier_nl_proof_verifier_review(
+                            config,
+                            state,
+                            nl_proof_verifier,
+                            phase,
+                            worker_terminal_output,
+                            worker_handoff,
+                            worker_frontier_update,
+                            paper_review,
+                            cycle=cycle,
+                            policy=policy,
+                        )
+                else:
+                    state["last_theorem_frontier_nl_proof_review"] = None
             else:
                 state["last_theorem_frontier_paper_review"] = None
+                state["last_theorem_frontier_nl_proof_review"] = None
         print(f"\n===== cycle {cycle}: reviewer | phase={phase} =====")
         worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
         reviewer_prompt = build_reviewer_prompt(
@@ -8988,13 +10187,20 @@ def main() -> int:
                     worker_frontier_update = state.get("last_theorem_frontier_worker_update")
                     if not isinstance(worker_frontier_update, dict):
                         raise SupervisorError("Missing theorem-frontier worker update while applying full frontier review.")
-                    _dag_before_node_ids = set((theorem_frontier_payload(state) or {}).get("nodes", {}).keys())
+                    _dag_before_payload = theorem_frontier_payload(state) or {}
+                    _dag_before_node_ids = set((_dag_before_payload.get("nodes") or {}).keys())
+                    _dag_before_edge_ids = {
+                        str(edge.get("edge_id"))
+                        for edge in (_dag_before_payload.get("edges") or [])
+                        if isinstance(edge, dict) and edge.get("edge_id")
+                    }
                     current_frontier = update_theorem_frontier_full_state(
                         config,
                         state,
                         worker_frontier_update,
                         frontier_review,
                         state.get("last_theorem_frontier_paper_review") if isinstance(state.get("last_theorem_frontier_paper_review"), dict) else None,
+                        state.get("last_theorem_frontier_nl_proof_review") if isinstance(state.get("last_theorem_frontier_nl_proof_review"), dict) else None,
                         cycle=cycle,
                     )
                     ensure_dag_site(config)
@@ -9003,6 +10209,7 @@ def main() -> int:
                         config,
                         state,
                         _dag_before_node_ids,
+                        _dag_before_edge_ids,
                         current_frontier,
                         cycle=cycle,
                         outcome=frontier_review.get("outcome", ""),
@@ -9191,8 +10398,9 @@ def main() -> int:
                     actor="supervisor",
                     target="workflow",
                     content={
-                        "initial_active_node_id": seeded_frontier.get("active_leaf_id"),
-                        "main_result_node_ids": sorted(seeded_frontier.get("nodes", {}).keys()),
+                        "initial_active_edge_id": seeded_frontier.get("active_edge_id"),
+                        "seed_node_ids": sorted(seeded_frontier.get("nodes", {}).keys()),
+                        "seed_edge_count": len(seeded_frontier.get("edges", []) or []),
                         "source": str(paper_main_results_manifest_path(config)),
                     },
                     content_type="json",

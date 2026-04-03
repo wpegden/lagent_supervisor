@@ -21,23 +21,40 @@ function computeLayout(nodes, edges, options) {
     return { positions: {}, layers: [], width: 0, height: 0 };
   }
 
-  // Build adjacency: parent -> children, child -> parents
+// Build adjacency: parent -> children, child -> parents.
+// Prefer the explicit exported edge list; fall back to node child_ids only if
+// no usable edges are present.
   var childrenOf = {};
   var parentsOf = {};
   ids.forEach(function (id) {
     childrenOf[id] = [];
     parentsOf[id] = [];
   });
-  ids.forEach(function (id) {
-    var node = nodes[id];
-    var cids = node.child_ids || [];
-    for (var i = 0; i < cids.length; i++) {
-      if (nodes[cids[i]]) {
-        childrenOf[id].push(cids[i]);
-        parentsOf[cids[i]].push(id);
-      }
-    }
+  var hasExplicitEdges = Array.isArray(edges) && edges.some(function (edge) {
+    return edge && nodes[edge.parent] && nodes[edge.child];
   });
+  if (hasExplicitEdges) {
+    edges.forEach(function (edge) {
+      if (!edge || !nodes[edge.parent] || !nodes[edge.child]) return;
+      if (childrenOf[edge.parent].indexOf(edge.child) === -1) {
+        childrenOf[edge.parent].push(edge.child);
+      }
+      if (parentsOf[edge.child].indexOf(edge.parent) === -1) {
+        parentsOf[edge.child].push(edge.parent);
+      }
+    });
+  } else {
+    ids.forEach(function (id) {
+      var node = nodes[id];
+      var cids = node.child_ids || [];
+      for (var i = 0; i < cids.length; i++) {
+        if (nodes[cids[i]]) {
+          childrenOf[id].push(cids[i]);
+          parentsOf[cids[i]].push(id);
+        }
+      }
+    });
+  }
 
   // Layer assignment: longest path from roots
   var layer = {};
