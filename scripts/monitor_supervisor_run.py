@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -85,6 +86,12 @@ def log_line(path: Path, message: str) -> None:
     path.open("a", encoding="utf-8").write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
 
 
+def format_age_seconds(value: float) -> str:
+    if not math.isfinite(value):
+        return "inf"
+    return str(int(value))
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -116,6 +123,33 @@ def detect_budget_issue(text: str) -> bool:
     return any(pattern in hay for pattern in supervisor.BUDGET_ERROR_PATTERNS)
 
 
+def detect_handoff_issue(text: str) -> bool:
+    hay = text.lower()
+    patterns = (
+        "artifact missing required keys",
+        "could not parse json artifact",
+        "could not parse json object",
+        "missing worker handoff",
+        "missing validation summary",
+        "handoff parse issue",
+    )
+    return any(pattern in hay for pattern in patterns)
+
+
+def detect_build_issue(text: str) -> bool:
+    hay = text.lower()
+    patterns = (
+        "`lake build` is failing",
+        "build failure",
+        "validation error detected",
+        "cannot complete proof_formalization while `lake build` is failing",
+        "cannot advance from theorem_stating while `lake build` is failing",
+        "theorem-frontier cone file guard failed",
+        "syntax checks failed",
+    )
+    return any(pattern in hay for pattern in patterns)
+
+
 def diagnose_run(
     state_dir: Path,
     state: dict[str, Any],
@@ -126,11 +160,16 @@ def diagnose_run(
     stall_restart_seconds: int,
 ) -> dict[str, Any]:
     cycle = int(state.get("cycle", 0) or 0)
+    phase = str(state.get("phase", "") or "")
     worker_log_path = latest_cycle_log(state_dir, "worker", cycle)
-    reviewer_log_path = latest_cycle_log(state_dir, "reviewer", max(cycle - 1, 1))
+    last_review = state.get("last_review") if isinstance(state.get("last_review"), dict) else {}
+    last_review_cycle = int(last_review.get("cycle", 0) or 0) if isinstance(last_review, dict) else 0
+    last_validation = state.get("last_validation") if isinstance(state.get("last_validation"), dict) else {}
+    last_validation_cycle = int(last_validation.get("cycle", 0) or 0) if isinstance(last_validation, dict) else 0
+    reviewer_cycle = cycle if last_validation_cycle == cycle and last_review_cycle < cycle else max(last_review_cycle, 1)
+    reviewer_log_path = latest_cycle_log(state_dir, "reviewer", reviewer_cycle)
     worker_tail = tail_text(worker_log_path, max_lines=60) if worker_log_path else ""
     reviewer_tail = tail_text(reviewer_log_path, max_lines=80) if reviewer_log_path else ""
-    last_review = state.get("last_review") if isinstance(state.get("last_review"), dict) else {}
     last_transition_error = (
         state.get("last_transition_error")
         if isinstance(state.get("last_transition_error"), dict)
@@ -147,6 +186,9 @@ def diagnose_run(
     elif current_command != "python3":
         status = "supervisor_not_running"
         summary = f"supervisor pane command is {current_command or 'none'}"
+    elif cycle <= 0 and not phase:
+        status = "starting_up"
+        summary = "supervisor is starting and state is not populated yet"
     elif last_transition_error:
         status = "transition_blocked"
         summary = str(last_transition_error.get("error", "") or "phase transition is blocked")
@@ -164,14 +206,10 @@ def diagnose_run(
     elif "theorem-frontier" in review_text.lower() and "missing required" in review_text.lower():
         status = "frontier_schema_issue"
         summary = "theorem-frontier artifact/schema issue detected"
-    elif "handoff" in review_text.lower() and (
-        "parse" in review_text.lower() or "json" in review_text.lower()
-    ):
+    elif detect_handoff_issue("\n".join(part for part in [reason, next_prompt, worker_tail, reviewer_tail] if part)):
         status = "handoff_issue"
         summary = "worker/reviewer handoff parse issue detected"
-    elif "build" in review_text.lower() and (
-        "failed" in review_text.lower() or "error" in review_text.lower()
-    ):
+    elif detect_build_issue("\n".join(part for part in [reason, next_prompt, worker_tail, reviewer_tail] if part)):
         status = "build_issue"
         summary = "build failure or validation error detected"
     return {
@@ -263,6 +301,7 @@ def main() -> int:
         state = load_state(state_path)
         cycle = int(state.get("cycle", 0) or 0)
         phase = str(state.get("phase", "")).strip() or "unknown"
+        restart_requested = supervisor.cycle_boundary_restart_request_path(config).exists()
         session_alive = tmux_has_session(args.session)
         current_command = tmux_current_command(args.session) if session_alive else ""
         state_age = time.time() - state_path.stat().st_mtime if state_path.exists() else float("inf")
@@ -285,6 +324,7 @@ def main() -> int:
             "current_command": current_command,
             "phase": phase,
             "cycle": cycle,
+            "restart_requested": restart_requested,
             "state_age_seconds": state_age,
             "activity_age_seconds": activity_age,
             "diagnosis": diagnosis,
@@ -294,11 +334,15 @@ def main() -> int:
         log_line(
             monitor_log,
             f"check phase={phase} cycle={cycle} session_alive={session_alive} "
-            f"current_command={current_command or 'none'} state_age={int(state_age)}s "
-            f"activity_age={int(activity_age)}s diagnosis={diagnosis['status']}: {diagnosis['summary']}",
+            f"current_command={current_command or 'none'} state_age={format_age_seconds(state_age)}s "
+            f"activity_age={format_age_seconds(activity_age)}s diagnosis={diagnosis['status']}: {diagnosis['summary']}",
         )
 
         if not session_alive:
+            if restart_requested:
+                log_line(monitor_log, "cycle-boundary restart requested; supervisor is intentionally stopped")
+                time.sleep(args.initial_poll_seconds)
+                continue
             if is_terminal_state(state, config.max_cycles):
                 log_line(monitor_log, "terminal state detected with no live session; monitor exiting")
                 return 0
@@ -307,6 +351,13 @@ def main() -> int:
             continue
 
         if current_command != "python3":
+            if restart_requested:
+                log_line(
+                    monitor_log,
+                    f"cycle-boundary restart requested; supervisor pane command is {current_command or 'none'} and will not be auto-restarted",
+                )
+                time.sleep(args.initial_poll_seconds)
+                continue
             if is_terminal_state(state, config.max_cycles):
                 log_line(
                     monitor_log,
