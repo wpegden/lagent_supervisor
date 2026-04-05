@@ -12,8 +12,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,7 +59,7 @@ BRANCH_SELECTION_DECISIONS: Tuple[str, ...] = ("CONTINUE_BRANCHING", "SELECT_BRA
 BRANCH_REPLACEMENT_DECISIONS: Tuple[str, ...] = ("KEEP_FRONTIER", "REPLACE_WITH_PROPOSAL")
 SORRY_MODES: Tuple[str, ...] = ("default", "allowed")
 THEOREM_FRONTIER_PHASES: Tuple[str, ...] = ("off", "full")
-THEOREM_FRONTIER_ACTIONS: Tuple[str, ...] = ("CLOSE", "EXPAND", "REFUTE_REPLACE")
+THEOREM_FRONTIER_ACTIONS: Tuple[str, ...] = ("CLOSE", "REFACTOR", "EXPAND", "REFUTE_REPLACE")
 THEOREM_FRONTIER_OUTCOMES: Tuple[str, ...] = (
     "CLOSED",
     "EXPANDED",
@@ -81,6 +83,11 @@ THEOREM_FRONTIER_NODE_STATUSES: Tuple[str, ...] = (
     "replaced",
     "frozen",
 )
+THEOREM_FRONTIER_LEAN_PROOF_STATUSES: Tuple[str, ...] = (
+    "unproved",
+    "proved",
+)
+GENERATED_FRONTIER_DIRNAME = "GeneratedFrontier"
 THEOREM_FRONTIER_PAPER_DECISIONS: Tuple[str, ...] = ("APPROVE", "APPROVE_WITH_CAVEAT", "REJECT")
 THEOREM_FRONTIER_PAPER_CLASSIFICATIONS: Tuple[str, ...] = (
     "paper_exact",
@@ -239,6 +246,7 @@ class Config:
     burst_timeout_seconds: float
     branching: BranchingConfig = field(default_factory=BranchingConfig)
     policy_path: Optional[Path] = None
+    source_path: Optional[Path] = None
 
 
 DAG_VIEWER_DIR = PROJECT_ROOT / "dag_viewer"
@@ -629,6 +637,78 @@ def latest_codex_token_count_event_in_file(path: Path) -> Optional[Dict[str, Any
     return None
 
 
+def codex_token_usage_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    total = info.get("total_token_usage")
+    last = info.get("last_token_usage")
+    if not isinstance(total, dict) or not isinstance(last, dict):
+        return None
+    return {
+        "input_tokens": int(total.get("input_tokens") or 0),
+        "cached_input_tokens": int(total.get("cached_input_tokens") or 0),
+        "output_tokens": int(total.get("output_tokens") or 0),
+        "reasoning_output_tokens": int(total.get("reasoning_output_tokens") or 0),
+        "total_tokens": int(total.get("total_tokens") or 0),
+        "last_input_tokens": int(last.get("input_tokens") or 0),
+        "last_cached_input_tokens": int(last.get("cached_input_tokens") or 0),
+        "last_output_tokens": int(last.get("output_tokens") or 0),
+        "last_reasoning_output_tokens": int(last.get("reasoning_output_tokens") or 0),
+        "last_total_tokens": int(last.get("total_tokens") or 0),
+        "model_context_window": int(info.get("model_context_window") or 0),
+    }
+
+
+def codex_session_log_matches_scope(path: Path, scope_dir: Path) -> bool:
+    try:
+        tail_text = read_text_tail(path)
+    except OSError:
+        return False
+    scope_text = str(scope_dir.resolve())
+    for line in reversed(tail_text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        record_type = str(record.get("type") or "")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if record_type == "turn_context" and str(payload.get("cwd") or "") == scope_text:
+            return True
+        if record_type == "session_meta" and str(payload.get("cwd") or "") == scope_text:
+            return True
+    return False
+
+
+def latest_codex_token_usage_for_scope(scope_dir: Path, *, limit: int = 20) -> Optional[Dict[str, Any]]:
+    latest: Optional[Dict[str, Any]] = None
+    for path in recent_codex_session_log_paths(limit=limit):
+        if not codex_session_log_matches_scope(path, scope_dir):
+            continue
+        record = latest_codex_token_count_event_in_file(path)
+        if record is None:
+            continue
+        usage = codex_token_usage_from_record(record)
+        if usage is None:
+            continue
+        candidate = {
+            "timestamp": str(record.get("timestamp") or ""),
+            "source_path": str(path),
+            **usage,
+        }
+        if latest is None or candidate["timestamp"] > str(latest.get("timestamp") or ""):
+            latest = candidate
+    return latest
+
+
 def latest_codex_weekly_budget_status() -> Optional[Dict[str, Any]]:
     latest_record: Optional[Dict[str, Any]] = None
     latest_path: Optional[Path] = None
@@ -949,6 +1029,7 @@ def load_config(path: Path) -> Config:
             poll_seconds=poll_seconds,
         ),
         policy_path=policy_path,
+        source_path=path,
     )
 
 
@@ -1253,6 +1334,64 @@ def paper_main_results_manifest_path(config: Config) -> Path:
     return config.state_dir / "paper_main_results.json"
 
 
+def repo_primary_lean_lib_name(config: Config) -> str:
+    lakefile_toml = config.repo_path / "lakefile.toml"
+    if lakefile_toml.exists():
+        try:
+            data = tomllib.loads(lakefile_toml.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            data = {}
+        libs = data.get("lean_lib")
+        if isinstance(libs, list):
+            for entry in libs:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if name and (config.repo_path / name).is_dir():
+                    return name
+        package_name = str(data.get("name") or "").strip()
+        if package_name and (config.repo_path / package_name).is_dir():
+            return package_name
+    return ""
+
+
+def theorem_frontier_generated_module_root(config: Config) -> str:
+    lib_name = repo_primary_lean_lib_name(config)
+    if lib_name:
+        return f"{lib_name}.{GENERATED_FRONTIER_DIRNAME}"
+    return GENERATED_FRONTIER_DIRNAME
+
+
+def theorem_frontier_generated_dir(config: Config) -> Path:
+    lib_name = repo_primary_lean_lib_name(config)
+    if lib_name:
+        return config.repo_path / lib_name / GENERATED_FRONTIER_DIRNAME
+    return config.repo_path / GENERATED_FRONTIER_DIRNAME
+
+
+def theorem_frontier_generated_statements_path(config: Config) -> Path:
+    return theorem_frontier_generated_dir(config) / "Statements.lean"
+
+
+def theorem_frontier_generated_proofs_dir(config: Config) -> Path:
+    return theorem_frontier_generated_dir(config) / "Proofs"
+
+
+def theorem_frontier_generated_node_slug(node_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(node_id or "").strip()).strip("_").lower()
+    if not cleaned:
+        cleaned = "node"
+    if not cleaned[0].isalpha():
+        cleaned = f"node_{cleaned}"
+    elif not cleaned.startswith("node_"):
+        cleaned = f"node_{cleaned}"
+    return cleaned
+
+
+def theorem_frontier_generated_proof_path(config: Config, node_id: str) -> Path:
+    return theorem_frontier_generated_proofs_dir(config) / f"{theorem_frontier_generated_node_slug(node_id)}.lean"
+
+
 def cycle_checkpoints_dir(config: Config) -> Path:
     return config.state_dir / "checkpoints"
 
@@ -1324,7 +1463,7 @@ def paper_main_results_manifest_stub(config: Config) -> Dict[str, Any]:
                 "node_id": "paper.main",
                 "kind": "paper",
                 "natural_language_statement": "REPLACE_ME: exact paper statement for the first main result.",
-                "natural_language_proof": "REPLACE_ME: rigorous natural-language proof of this node from its current children; explicitly cite each child node id in backticks.",
+                "natural_language_proof": "REPLACE_ME: complete publication-grade natural-language proof of this node from its current children, at least as detailed as the paper and usually more detailed because it must be locally self-contained.",
                 "lean_statement": "def REPLACE_ME_main_statement : Prop := False",
                 "lean_anchor": "PaperTheorems.REPLACE_ME_main_statement",
                 "paper_provenance": "REPLACE_ME: exact theorem/proposition label from the paper.",
@@ -1336,13 +1475,13 @@ def paper_main_results_manifest_stub(config: Config) -> Dict[str, Any]:
                 "node_id": "paper.main_aux",
                 "kind": "paper_faithful_reformulation",
                 "natural_language_statement": "REPLACE_ME: exact auxiliary paper lemma/case statement used on the proof spine.",
-                "natural_language_proof": "REPLACE_ME: rigorous natural-language proof of this node from its current children; explicitly cite each child node id in backticks.",
+                "natural_language_proof": "REPLACE_ME: complete publication-grade natural-language proof of this node from its current children, at least as detailed as the paper and usually more detailed because it must be locally self-contained.",
                 "lean_statement": "def REPLACE_ME_main_aux_statement : Prop := False",
                 "lean_anchor": "PaperTheorems.REPLACE_ME_main_aux_statement",
                 "paper_provenance": "REPLACE_ME: exact paper lemma/proposition/case label.",
                 "blocker_cluster": "REPLACE_ME auxiliary blocker cluster",
                 "acceptance_evidence": "REPLACE_ME: what must be proved for this auxiliary node to close.",
-                "notes": "Use `paper` for exact paper statements and `paper_faithful_reformulation` only when Lean needs a faithful reformulation. If a proof cites another named paper lemma/case, add that dependency as a child node instead of hiding it in prose.",
+                "notes": "Use `paper` for exact paper statements and `paper_faithful_reformulation` only when Lean needs a faithful reformulation. If a proof relies on another named paper lemma/case, add that dependency as a child node instead of hiding it in prose.",
             },
         ],
         "edges": [
@@ -1552,7 +1691,7 @@ def update_supervisor_tasks_file(config: Config, phase: str) -> None:
 
 def ensure_repo_files(config: Config, phase: str) -> None:
     config.state_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("logs", "runtime", "prompts", "scopes"):
+    for name in ("logs", "runtime", "prompts"):
         (config.state_dir / name).mkdir(parents=True, exist_ok=True)
     if theorem_frontier_enabled(config, phase) and not theorem_frontier_state_path(config).exists():
         from lagent_supervisor.frontier import default_theorem_frontier_payload
@@ -1737,14 +1876,26 @@ def ensure_git_repository(config: Config) -> None:
             )
 
 
+def scope_root_dir(config: Config) -> Path:
+    identity = f"{config.repo_path.resolve()}::{config.state_dir.resolve()}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    label = sanitize_repo_name(config.repo_path.name)
+    root = Path(tempfile.gettempdir()) / "lagent-supervisor-scopes" / f"{label}-{digest}"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def role_scope_dir(config: Config, provider: str, role: str) -> Path:
-    scope = config.state_dir / "scopes" / f"{provider}-{role}"
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    scope = scope_root_dir(config) / f"{provider}-{role}"
     scope.mkdir(parents=True, exist_ok=True)
     links = {
         "repo": config.repo_path,
-        "supervisor": config.state_dir,
         ".agent-supervisor": config.state_dir,
     }
+    legacy_supervisor_link = scope / "supervisor"
+    if legacy_supervisor_link.is_symlink():
+        legacy_supervisor_link.unlink(missing_ok=True)  # type: ignore[arg-type]
     for name, target in links.items():
         link = scope / name
         if link.is_symlink() or link.exists():
@@ -1969,6 +2120,14 @@ def dag_manifest_path(config: Config) -> Path:
 
 def dag_manifest_web_path(config: Config) -> Path:
     return dag_root_dir(config) / "repos.txt"
+
+
+def dag_codex_budget_path(config: Config) -> Path:
+    return dag_root_dir(config) / "codex-budget.json"
+
+
+def dag_codex_budget_web_path(config: Config) -> Path:
+    return dag_root_dir(config) / "codex-budget.txt"
 
 
 def dag_assets_dir(config: Config) -> Path:

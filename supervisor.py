@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+from typing import TextIO
 
 from lagent_supervisor.shared import *
 from lagent_supervisor.storage import JsonFile, append_jsonl, write_jsonl
@@ -313,6 +314,13 @@ def refresh_chat_codex_budget_status(config: Config) -> Dict[str, Any]:
     return payload
 
 
+def refresh_dag_codex_budget_status(config: Config) -> Dict[str, Any]:
+    payload = chat_codex_budget_payload()
+    JsonFile.dump(dag_codex_budget_path(config), payload, mode=PUBLIC_WEB_JSON_MODE)
+    JsonFile.dump(dag_codex_budget_web_path(config), payload, mode=PUBLIC_WEB_JSON_MODE)
+    return payload
+
+
 def frontier_summary_for_meta(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     payload = theorem_frontier_payload(state)
     if not isinstance(payload, dict):
@@ -361,6 +369,8 @@ def run_status_for_meta(config: Config, state: Dict[str, Any]) -> Dict[str, Any]
     current_cycle = int(state.get("cycle", 0) or 0)
     resume_cycle, stage = determine_resume_cycle_and_stage(state)
     last_completed_cycle = max(last_review_cycle(state), 0)
+    last_review = state.get("last_review") if isinstance(state.get("last_review"), dict) else {}
+    final_decision = str(last_review.get("decision") or "").strip().upper()
     frontier_summary = frontier_summary_for_meta(state) or {}
     active_node_id = normalize_frontier_text(frontier_summary.get("active_node_id"))
     last_transition_error = state.get("last_transition_error") if isinstance(state.get("last_transition_error"), dict) else {}
@@ -391,6 +401,12 @@ def run_status_for_meta(config: Config, state: Dict[str, Any]) -> Dict[str, Any]
     status = "running"
     if last_transition_error and str(last_transition_error.get("phase") or "").strip() == phase:
         status = "blocked"
+    elif final_decision == "DONE":
+        status = "completed"
+        stage = None
+        resume_cycle = None
+        full_task = "Completed"
+        task = "Completed"
 
     return {
         "status": status,
@@ -401,7 +417,128 @@ def run_status_for_meta(config: Config, state: Dict[str, Any]) -> Dict[str, Any]
         "current_task": task or None,
         "current_task_full": full_task or None,
         "active_node_id": active_node_id or None,
+        "agent_token_usage": agent_token_usage_summary(state),
     }
+
+
+TOKEN_USAGE_TOTAL_FIELDS: Tuple[str, ...] = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _provider_usage_snapshot(adapter: ProviderAdapter) -> Dict[str, Any]:
+    if adapter.cfg.provider == "codex":
+        usage = latest_codex_token_usage_for_scope(adapter.work_dir())
+        return {
+            "provider": adapter.cfg.provider,
+            "role": adapter.role,
+            "available": usage is not None,
+            "usage": usage,
+        }
+    return {
+        "provider": adapter.cfg.provider,
+        "role": adapter.role,
+        "available": False,
+        "usage": None,
+    }
+
+
+def _provider_usage_delta(start: Dict[str, Any], end: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    start_usage = start.get("usage") if isinstance(start, dict) else None
+    end_usage = end.get("usage") if isinstance(end, dict) else None
+    if not isinstance(end_usage, dict):
+        return None
+    if not isinstance(start_usage, dict):
+        return {
+            "mode": "end_total",
+            **{field: int(end_usage.get(field) or 0) for field in TOKEN_USAGE_TOTAL_FIELDS},
+        }
+    if str(start_usage.get("source_path") or "") != str(end_usage.get("source_path") or ""):
+        return {
+            "mode": "end_total_new_session",
+            **{field: int(end_usage.get(field) or 0) for field in TOKEN_USAGE_TOTAL_FIELDS},
+        }
+    delta: Dict[str, Any] = {"mode": "delta"}
+    for field in TOKEN_USAGE_TOTAL_FIELDS:
+        delta[field] = max(0, int(end_usage.get(field) or 0) - int(start_usage.get(field) or 0))
+    return delta
+
+
+def agent_token_usage_summary(state: Dict[str, Any]) -> Dict[str, Any]:
+    payload = state.get("agent_token_usage")
+    if not isinstance(payload, dict):
+        return {"tracked": False, "by_role": {}, "recent_bursts": []}
+    by_role = payload.get("by_role")
+    recent = payload.get("recent_bursts")
+    return {
+        "tracked": bool(by_role),
+        "by_role": by_role if isinstance(by_role, dict) else {},
+        "recent_bursts": recent[-10:] if isinstance(recent, list) else [],
+    }
+
+
+def record_agent_burst_usage(
+    config: Config,
+    state: Dict[str, Any],
+    *,
+    cycle: int,
+    phase: str,
+    adapter: ProviderAdapter,
+    stage_label: str,
+    attempt: int,
+    run: Dict[str, Any],
+) -> None:
+    usage = run.get("usage")
+    if not isinstance(usage, dict):
+        return
+    end_usage = usage.get("end")
+    if not (isinstance(end_usage, dict) and end_usage.get("available")):
+        return
+    delta = usage.get("delta")
+    if not isinstance(delta, dict):
+        return
+    totals = state.setdefault("agent_token_usage", {})
+    by_role = totals.setdefault("by_role", {})
+    recent = totals.setdefault("recent_bursts", [])
+    role_key = f"{adapter.cfg.provider}:{adapter.role}"
+    role_entry = by_role.setdefault(
+        role_key,
+        {
+            "provider": adapter.cfg.provider,
+            "role": adapter.role,
+            "burst_count": 0,
+            **{field: 0 for field in TOKEN_USAGE_TOTAL_FIELDS},
+        },
+    )
+    role_entry["burst_count"] = int(role_entry.get("burst_count") or 0) + 1
+    for field in TOKEN_USAGE_TOTAL_FIELDS:
+        role_entry[field] = int(role_entry.get(field) or 0) + int(delta.get(field) or 0)
+    role_entry["last_timestamp"] = end_usage.get("timestamp")
+    role_entry["last_cycle"] = int(cycle)
+    role_entry["last_phase"] = phase
+    role_entry["last_stage"] = stage_label
+    role_entry["source_path"] = end_usage.get("source_path")
+    burst_entry = {
+        "timestamp": timestamp_now(),
+        "cycle": int(cycle),
+        "phase": phase,
+        "provider": adapter.cfg.provider,
+        "role": adapter.role,
+        "stage_label": stage_label,
+        "attempt": int(attempt),
+        "delta": {field: int(delta.get(field) or 0) for field in TOKEN_USAGE_TOTAL_FIELDS},
+        "mode": str(delta.get("mode") or ""),
+        "source_path": end_usage.get("source_path"),
+        "burst_tag": run.get("burst_tag"),
+    }
+    recent.append(burst_entry)
+    if len(recent) > 200:
+        del recent[:-200]
+    save_state(config, state)
 
 
 def export_dag_frontier_snapshot(config: Config, state: Dict[str, Any]) -> None:
@@ -417,11 +554,46 @@ def export_dag_frontier_snapshot(config: Config, state: Dict[str, Any]) -> None:
     JsonFile.dump(dag_frontier_web_path(config), export, mode=PUBLIC_WEB_JSON_MODE)
 
 
+def theorem_frontier_reviewer_resolution_note(state: Dict[str, Any]) -> str:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return ""
+    current = payload.get("current")
+    if not isinstance(current, dict):
+        return ""
+    requested = normalize_frontier_text(current.get("requested_next_active_node_id"))
+    resolved = normalize_frontier_text(current.get("next_active_node_id") or payload.get("active_node_id"))
+    if not requested or not resolved or requested == resolved:
+        return ""
+    return (
+        f"the reviewer requested `{requested}`, but the authoritative frontier for that cycle "
+        f"resolved to `{resolved}` instead; continue from `{resolved}`."
+    )
+
+
+def theorem_frontier_close_validation_note(state: Dict[str, Any], phase: str) -> str:
+    payload = state.get("last_theorem_frontier_close_validation_error")
+    if not isinstance(payload, dict):
+        return ""
+    if str(payload.get("phase") or "").strip() != phase:
+        return ""
+    node_id = normalize_frontier_text(payload.get("active_node_id"))
+    error = normalize_frontier_text(payload.get("error"))
+    if not error:
+        return ""
+    node_text = f" for `{node_id}`" if node_id else ""
+    return (
+        f"deterministic CLOSE validation failed{node_text}: {error} "
+        "Edit only the active generated proof file until the generated close-check script succeeds, or use `REFACTOR` first "
+        "if supporting proof code must change before the strict `CLOSE` can land."
+    )
+
+
 def _compact_frontier_node(node: Dict[str, Any]) -> Dict[str, Any]:
     return {
         k: node[k]
         for k in (
-            "node_id", "kind", "status", "display_label",
+            "node_id", "kind", "status", "lean_proof_status", "display_label",
             "natural_language_statement",
             "natural_language_proof",
             "lean_statement", "lean_anchor", "paper_provenance",
@@ -493,31 +665,161 @@ def dag_cycle_history_entry_from_state(
     return entry
 
 
+def _history_clone_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(state))
+
+
+def _load_cycle_history_replay_bundle(
+    config: Config,
+    *,
+    phase: str,
+    cycle: int,
+) -> Optional[Dict[str, Any]]:
+    decision_path = reviewer_decision_path(config, cycle)
+    if not decision_path.exists():
+        return None
+    raw_decision = JsonFile.load(decision_path, None)
+    if not isinstance(raw_decision, dict):
+        return None
+    bundle: Dict[str, Any] = {
+        "decision": validate_reviewer_decision(phase, cycle, raw_decision),
+    }
+    if not theorem_frontier_enabled(config, phase):
+        return bundle
+    worker_path = theorem_frontier_worker_update_path(config, cycle)
+    frontier_review_path = theorem_frontier_review_path(config, cycle)
+    if not worker_path.exists() or not frontier_review_path.exists():
+        return None
+    raw_worker = JsonFile.load(worker_path, None)
+    raw_frontier_review = JsonFile.load(frontier_review_path, None)
+    if not isinstance(raw_worker, dict) or not isinstance(raw_frontier_review, dict):
+        return None
+    worker_update = validate_theorem_frontier_worker_update_full(phase, cycle, raw_worker)
+    frontier_review = validate_theorem_frontier_review_full(phase, cycle, raw_frontier_review)
+    bundle["worker_update"] = worker_update
+    bundle["frontier_review"] = frontier_review
+    if theorem_frontier_requires_paper_verifier(worker_update):
+        paper_path = theorem_frontier_paper_verifier_path(config, cycle)
+        if paper_path.exists():
+            raw_paper = JsonFile.load(paper_path, None)
+            if isinstance(raw_paper, dict):
+                bundle["paper_review"] = validate_theorem_frontier_paper_verifier_review(phase, cycle, raw_paper)
+        nl_path = theorem_frontier_nl_proof_verifier_path(config, cycle)
+        if nl_path.exists():
+            raw_nl = JsonFile.load(nl_path, None)
+            if isinstance(raw_nl, dict):
+                bundle["nl_proof_review"] = validate_theorem_frontier_nl_proof_verifier_review(phase, cycle, raw_nl)
+    return bundle
+
+
+def _checkpoint_state_matches_history_bundle(
+    checkpoint_state: Dict[str, Any],
+    bundle: Dict[str, Any],
+    *,
+    cycle: int,
+) -> bool:
+    last_review = checkpoint_state.get("last_review") if isinstance(checkpoint_state.get("last_review"), dict) else {}
+    if int(last_review.get("cycle", 0) or 0) != cycle:
+        return False
+    decision = bundle.get("decision") if isinstance(bundle.get("decision"), dict) else {}
+    if str(last_review.get("decision", "")).strip().upper() != str(decision.get("decision", "")).strip().upper():
+        return False
+    if not isinstance(bundle.get("frontier_review"), dict):
+        return True
+    payload = theorem_frontier_payload(checkpoint_state)
+    if not isinstance(payload, dict):
+        return False
+    current = payload.get("current") if isinstance(payload.get("current"), dict) else {}
+    frontier_review = bundle["frontier_review"]
+    if int(current.get("cycle", 0) or 0) != cycle:
+        return False
+    if normalize_frontier_text(current.get("reviewed_node_id")) != normalize_frontier_text(frontier_review.get("active_node_id")):
+        return False
+    if str(current.get("current_action", "")).strip().upper() != str(frontier_review.get("assessed_action", "")).strip().upper():
+        return False
+    if str(current.get("current_outcome", "")).strip().upper() != str(frontier_review.get("outcome", "")).strip().upper():
+        return False
+    return True
+
+
+def _rebuild_cycle_history_state_from_bundle(
+    config: Config,
+    previous_state: Dict[str, Any],
+    bundle: Dict[str, Any],
+    *,
+    cycle: int,
+) -> Optional[Dict[str, Any]]:
+    state = _history_clone_state(previous_state)
+    phase = current_phase(config, state)
+    state["cycle"] = int(cycle)
+    decision = dict(bundle.get("decision") or {})
+    if not isinstance(decision, dict):
+        return None
+    if theorem_frontier_enabled(config, phase) and isinstance(bundle.get("worker_update"), dict) and isinstance(bundle.get("frontier_review"), dict):
+        state["last_theorem_frontier_worker_update"] = dict(bundle["worker_update"])
+        if isinstance(bundle.get("paper_review"), dict):
+            state["last_theorem_frontier_paper_review"] = dict(bundle["paper_review"])
+        if isinstance(bundle.get("nl_proof_review"), dict):
+            state["last_theorem_frontier_nl_proof_review"] = dict(bundle["nl_proof_review"])
+        state["last_theorem_frontier_review"] = dict(bundle["frontier_review"])
+        frontier_payload_before = theorem_frontier_payload(state) or {}
+        frontier_current = frontier_payload_before.get("current") if isinstance(frontier_payload_before, dict) else {}
+        if int((frontier_current or {}).get("cycle", 0) or 0) != cycle:
+            update_theorem_frontier_full_state(
+                config,
+                state,
+                bundle["worker_update"],
+                bundle["frontier_review"],
+                bundle.get("paper_review") if isinstance(bundle.get("paper_review"), dict) else None,
+                bundle.get("nl_proof_review") if isinstance(bundle.get("nl_proof_review"), dict) else None,
+                cycle=cycle,
+                persist=False,
+            )
+    decision["cycle"] = cycle
+    decision["phase"] = phase
+    state["last_review"] = decision
+    return state
+
+
 def build_dag_cycle_history_entries(config: Config, state: Dict[str, Any]) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     checkpoints = sorted(list_cycle_checkpoints(config), key=lambda item: int(item.get("cycle", 0) or 0))
     last_checkpoint_cycle = 0
+    current_cycle = int(state.get("cycle", 0) or 0)
+    last_review = state.get("last_review") if isinstance(state.get("last_review"), dict) else {}
+    last_completed_cycle = int(last_review.get("cycle", 0) or 0)
+    previous_history_state: Optional[Dict[str, Any]] = None
     for checkpoint in checkpoints:
         cycle = int(checkpoint.get("cycle", 0) or 0)
+        if last_completed_cycle > 0 and cycle > last_completed_cycle:
+            continue
         checkpoint_state_path = Path(str(checkpoint.get("checkpoint_dir", ""))) / "state" / "state.json"
         if cycle <= 0 or not checkpoint_state_path.exists():
             continue
         checkpoint_state = JsonFile.load(checkpoint_state_path, None)
         if not isinstance(checkpoint_state, dict):
             continue
+        history_state = checkpoint_state
+        if previous_history_state is not None:
+            phase = current_phase(config, previous_history_state)
+            bundle = _load_cycle_history_replay_bundle(config, phase=phase, cycle=cycle)
+            if bundle is not None and not _checkpoint_state_matches_history_bundle(checkpoint_state, bundle, cycle=cycle):
+                rebuilt = _rebuild_cycle_history_state_from_bundle(config, previous_history_state, bundle, cycle=cycle)
+                if isinstance(rebuilt, dict):
+                    history_state = rebuilt
         entries.append(
             dag_cycle_history_entry_from_state(
                 config,
-                checkpoint_state,
+                history_state,
                 cycle=cycle,
                 timestamp=str(checkpoint.get("created_at") or ""),
                 entry_type="cycle_snapshot",
                 completed_phase=str(checkpoint.get("completed_phase") or ""),
             )
         )
+        previous_history_state = _history_clone_state(history_state)
         last_checkpoint_cycle = max(last_checkpoint_cycle, cycle)
 
-    current_cycle = int(state.get("cycle", 0) or 0)
     if current_cycle > 0 and current_cycle > last_checkpoint_cycle:
         entries.append(
             dag_cycle_history_entry_from_state(
@@ -604,6 +906,11 @@ def export_dag_frontier_cycle(
             for nid, n in nodes.items()
             if isinstance(n, dict)
         },
+        "node_lean_proof_statuses": {
+            nid: str(n.get("lean_proof_status", ""))
+            for nid, n in nodes.items()
+            if isinstance(n, dict) and n.get("lean_proof_status") not in (None, "")
+        },
         "edges": [_compact_frontier_edge(e) for e in edges if isinstance(e, dict)],
         "metrics": dict(payload.get("metrics") or {}),
         "escalation": dict(payload.get("escalation") or {}),
@@ -622,6 +929,9 @@ def export_dag_frontier_cycle(
 def worker_directive_summary(state: Dict[str, Any]) -> str:
     last_review = state.get("last_review")
     parts: List[str] = []
+    resolution_note = theorem_frontier_reviewer_resolution_note(state)
+    if resolution_note:
+        parts.append(f"Supervisor note: {resolution_note}")
     if isinstance(last_review, dict):
         next_prompt = str(last_review.get("next_prompt", "")).strip()
         if next_prompt:
@@ -686,6 +996,7 @@ def install_dag_viewer_assets(root_dir: Path) -> None:
 def ensure_dag_site(config: Config) -> None:
     root = dag_root_dir(config)
     install_dag_viewer_assets(root)
+    refresh_dag_codex_budget_status(config)
     dag_repo_dir(config).mkdir(parents=True, exist_ok=True)
 
 
@@ -722,6 +1033,7 @@ def update_dag_manifest(config: Config, state: Dict[str, Any]) -> None:
 
 def export_dag_meta(config: Config, state: Dict[str, Any]) -> None:
     summary = frontier_summary_for_meta(state)
+    refresh_dag_codex_budget_status(config)
     meta = {
         "repo_name": config.chat.repo_name,
         "project_name": config.chat.project_name,
@@ -729,6 +1041,7 @@ def export_dag_meta(config: Config, state: Dict[str, Any]) -> None:
         "current_phase": current_phase(config, state),
         "current_cycle": int(state.get("cycle", 0) or 0),
         "run_status": run_status_for_meta(config, state),
+        "agent_token_usage": agent_token_usage_summary(state),
         "frontier_summary": summary,
         "branch_overview": branch_overview(state),
     }
@@ -1318,6 +1631,54 @@ def save_state(config: Config, state: Dict[str, Any]) -> None:
     sync_chat_state_metadata(config, state)
 
 
+class TeeTextIO:
+    def __init__(self, primary: TextIO, mirror: TextIO) -> None:
+        self._primary = primary
+        self._mirror = mirror
+
+    def write(self, data: str) -> int:
+        self._primary.write(data)
+        self._mirror.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._mirror.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._primary, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return int(getattr(self._primary, "fileno")())
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._primary, name)
+
+
+_SUPERVISOR_LOG_HANDLE: Optional[TextIO] = None
+_SUPERVISOR_LOG_PATH: Optional[Path] = None
+_ORIGINAL_STDOUT: TextIO = sys.stdout
+_ORIGINAL_STDERR: TextIO = sys.stderr
+
+
+def install_supervisor_file_logging(config: Config) -> None:
+    global _SUPERVISOR_LOG_HANDLE, _SUPERVISOR_LOG_PATH
+    log_path = config.state_dir / "logs" / "supervisor.main.log"
+    if _SUPERVISOR_LOG_HANDLE is not None and _SUPERVISOR_LOG_PATH == log_path:
+        return
+    if _SUPERVISOR_LOG_HANDLE is not None:
+        try:
+            _SUPERVISOR_LOG_HANDLE.flush()
+            _SUPERVISOR_LOG_HANDLE.close()
+        except Exception:
+            pass
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _SUPERVISOR_LOG_HANDLE = log_path.open("a", encoding="utf-8", buffering=1)
+    _SUPERVISOR_LOG_PATH = log_path
+    sys.stdout = TeeTextIO(_ORIGINAL_STDOUT, _SUPERVISOR_LOG_HANDLE)
+    sys.stderr = TeeTextIO(_ORIGINAL_STDERR, _SUPERVISOR_LOG_HANDLE)
+
+
 
 
 
@@ -1491,6 +1852,7 @@ def update_theorem_frontier_full_state(
             status=str(record.get("status") or "open"),
             parent_ids=record.get("parent_ids", []),
             child_ids=record.get("child_ids", []),
+            lean_proof_status="unproved",
         )
         record.clear()
         record.update(replacement)
@@ -1620,8 +1982,10 @@ def update_theorem_frontier_full_state(
 
     if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and paper_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
         raise SupervisorError("Cannot accept a structural theorem-frontier outcome without paper-verifier approval.")
-    if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and nl_proof_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
-        raise SupervisorError("Cannot accept a structural theorem-frontier outcome without NL-proof-verifier approval.")
+    if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and nl_proof_decision != "APPROVE":
+        raise SupervisorError(
+            "Cannot accept a structural theorem-frontier outcome without a clean APPROVE from the NL-proof verifier."
+        )
 
     if paper_decision == "REJECT" and outcome in {"EXPANDED", "REFUTED_REPLACED"}:
         raise SupervisorError("Paper-verifier rejected the structural change, so the structural outcome cannot be accepted.")
@@ -1667,7 +2031,8 @@ def update_theorem_frontier_full_state(
             recompute_relationships(payload)
         repair_theorem_frontier_closed_nodes(nodes, edges)
 
-    next_active_node_id = normalize_frontier_text(review.get("next_active_node_id"))
+    requested_next_active_node_id = normalize_frontier_text(review.get("next_active_node_id"))
+    next_active_node_id = requested_next_active_node_id
     if outcome in {"EXPANDED", "REFUTED_REPLACED"} and not next_active_node_id and worker_update.get("next_candidate_node_ids"):
         for candidate in worker_update["next_candidate_node_ids"]:
             candidate_id = normalize_frontier_text(candidate)
@@ -1677,20 +2042,24 @@ def update_theorem_frontier_full_state(
     elif outcome in {"STILL_OPEN", "NO_FRONTIER_PROGRESS"} and not next_active_node_id:
         next_active_node_id = active_node_id
     if outcome == "CLOSED" and next_active_node_id == active_node_id:
-        raise SupervisorError(
-            "A theorem-frontier node cannot be both CLOSED and the next active node in the same review."
-        )
+        next_active_node_id = ""
 
     if outcome == "CLOSED":
-        closable, reason = theorem_frontier_node_closure_check(nodes, edges, active_node_id)
-        if not closable:
-            raise SupervisorError(
-                f"Theorem-frontier CLOSED outcome cannot be accepted for {active_node_id!r}: {reason}."
-            )
-        active_record["status"] = "closed"
+        active_record["lean_proof_status"] = "proved"
+        proof_anchor = normalize_frontier_text(worker_update.get("lean_proof_anchor"))
+        if proof_anchor:
+            active_record["lean_proof_anchor"] = proof_anchor
         active_record["updated_at"] = timestamp_now()
 
-    current_node = set_active_node(next_active_node_id)
+    repair_theorem_frontier_closed_nodes(nodes, edges)
+
+    resolved_next_active_node_id = resolve_theorem_frontier_next_active_node_id(
+        nodes,
+        edges,
+        preferred_node_ids=[next_active_node_id],
+        anchor_node_ids=[requested_next_active_node_id, next_active_node_id, active_node_id],
+    )
+    current_node = set_active_node(resolved_next_active_node_id)
 
     same_node = previous_active_node_id and previous_active_node_id == payload.get("active_node_id")
     same_blocker = bool(previous_blocker) and previous_blocker == review["blocker_cluster"]
@@ -1736,6 +2105,7 @@ def update_theorem_frontier_full_state(
     payload["current"] = {
         "cycle": cycle,
         "reviewed_node_id": active_node_id,
+        "requested_next_active_node_id": requested_next_active_node_id or next_active_node_id or None,
         "next_active_node_id": payload.get("active_node_id"),
         "requested_action": requested_action,
         "assessed_action": review["assessed_action"],
@@ -1762,6 +2132,7 @@ def update_theorem_frontier_full_state(
                 "mode": "full",
                 "active_node_id": payload.get("active_node_id"),
                 "reviewed_node_id": active_node_id,
+                "requested_next_active_node_id": requested_next_active_node_id or next_active_node_id or None,
                 "next_active_node_id": payload.get("active_node_id"),
                 "assessed_action": review["assessed_action"],
                 "outcome": outcome,
@@ -1788,7 +2159,7 @@ def preflight_theorem_frontier_full_state_update(
     cycle: int,
 ) -> None:
     preview_state = deep_copy_jsonish(state)
-    update_theorem_frontier_full_state(
+    preview_payload = update_theorem_frontier_full_state(
         config,
         preview_state,
         worker_update,
@@ -1802,6 +2173,134 @@ def preflight_theorem_frontier_full_state_update(
         cycle=cycle,
         persist=False,
     )
+    preview_nodes = preview_payload.get("nodes") if isinstance(preview_payload, dict) else None
+    preview_edges = preview_payload.get("edges") if isinstance(preview_payload, dict) else None
+    if isinstance(preview_nodes, dict) and isinstance(preview_edges, list):
+        active_node_id = normalize_frontier_text(review.get("active_node_id"))
+        active_node = preview_nodes.get(active_node_id) if active_node_id else None
+        if isinstance(active_node, dict):
+            if str(review.get("outcome") or "").strip().upper() == "CLOSED":
+                sync_theorem_frontier_generated_files(
+                    config,
+                    preview_state,
+                    ensure_active_proof=False,
+                    ensure_proof_node_ids=[active_node_id],
+                )
+                child_nodes = [
+                    preview_nodes[child_id]
+                    for child_id in theorem_frontier_node_children(preview_nodes, preview_edges, active_node_id)
+                    if child_id in preview_nodes and isinstance(preview_nodes[child_id], dict)
+                ]
+                validate_theorem_frontier_generated_local_proof(
+                    config,
+                    active_node,
+                    child_nodes,
+                    label=f"cycle-{cycle:04d}-{active_node_id.replace('.', '-')}",
+                )
+            else:
+                declaration_index = collect_repo_lean_declarations(config)
+                if not declaration_index:
+                    return
+                theorem_frontier_statement_binding(config, active_node, declaration_index)
+
+
+def theorem_frontier_review_requires_admission_preflight(review: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(review, dict):
+        return False
+    outcome = str(review.get("outcome") or "").strip().upper()
+    return outcome in {"CLOSED", "EXPANDED", "REFUTED_REPLACED"}
+
+
+def validate_worker_owned_theorem_frontier_update(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+) -> None:
+    if not theorem_frontier_full_enabled(config, phase):
+        return
+    requested_action = str(worker_update.get("requested_action") or "").strip().upper()
+    if requested_action not in {"EXPAND", "REFUTE_REPLACE"}:
+        return
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return
+    declaration_index = collect_repo_lean_declarations(config)
+    if not declaration_index:
+        raise WorkerFixableValidationError(
+            "Cannot validate theorem-frontier structural bindings without discoverable Lean declarations."
+        )
+
+    def _check_node(node: Dict[str, Any], *, label: str) -> None:
+        try:
+            theorem_frontier_statement_binding(config, node, declaration_index)
+        except SupervisorError as exc:
+            node_id = normalize_frontier_text(node.get("node_id")) or label
+            raise WorkerFixableValidationError(
+                f"Theorem-frontier structural update for {node_id!r} is not admissible yet: {exc} "
+                f"Update the node metadata so lean_statement exactly matches the anchored source declaration "
+                f"before resubmitting {requested_action}."
+            ) from exc
+
+    active_node_after = worker_update.get("active_node_after")
+    if isinstance(active_node_after, dict):
+        _check_node(active_node_after, label="active_node_after")
+    for proposed in worker_update.get("proposed_nodes", []) or []:
+        if isinstance(proposed, dict):
+            _check_node(proposed, label="proposed node")
+
+
+def validate_theorem_frontier_terminal_repo_evidence(config: Config, state: Dict[str, Any]) -> None:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict) or payload.get("mode") != "full":
+        return
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    if not isinstance(nodes, dict) or not isinstance(edges, list):
+        return
+    sync_theorem_frontier_generated_files(
+        config,
+        state,
+        ensure_active_proof=True,
+        ensure_proof_node_ids=[
+            node_id
+            for node_id, node in nodes.items()
+            if isinstance(node, dict) and str(node.get("lean_proof_status") or "").strip().lower() == "proved"
+        ],
+    )
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("lean_proof_status") or "").strip().lower() != "proved":
+            continue
+        child_nodes = [
+            nodes[child_id]
+            for child_id in theorem_frontier_node_children(nodes, edges, node_id)
+            if child_id in nodes and isinstance(nodes[child_id], dict)
+        ]
+        validate_theorem_frontier_generated_local_proof(
+            config,
+            node,
+            child_nodes,
+            label=f"terminal-{node_id.replace('.', '-')}",
+        )
+
+
+def validate_paper_main_results_manifest_repo_evidence(config: Config) -> None:
+    manifest = load_validated_paper_main_results_manifest(config)
+    declaration_index = collect_repo_lean_declarations(config)
+    if not declaration_index:
+        raise SupervisorError(
+            "Cannot advance from theorem_stating without discoverable Lean declarations for the seeded manifest nodes."
+        )
+    nodes = manifest.get("nodes")
+    if not isinstance(nodes, list):
+        raise SupervisorError("Paper coarse-DAG manifest is missing node records.")
+    for raw_node in nodes:
+        if not isinstance(raw_node, dict):
+            continue
+        theorem_frontier_statement_binding(config, raw_node, declaration_index)
 
 
 def phase_specific_worker_statuses(phase: str) -> Sequence[str]:
@@ -2308,6 +2807,71 @@ def list_cycle_checkpoints(config: Config) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _ephemeral_cycle_number_from_path(path: Path) -> Optional[int]:
+    match = re.search(r"-(\d{4})(?:\.[^.]+)*$", path.name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def clear_future_cycle_ephemera(config: Config, completed_cycle: int) -> None:
+    prompts_dir = config.state_dir / "prompts"
+    if prompts_dir.exists():
+        for path in prompts_dir.iterdir():
+            if not path.is_file():
+                continue
+            cycle_num = _ephemeral_cycle_number_from_path(path)
+            if cycle_num is not None and cycle_num > completed_cycle:
+                path.unlink(missing_ok=True)  # type: ignore[arg-type]
+
+    logs_dir = config.state_dir / "logs"
+    if logs_dir.exists():
+        for path in logs_dir.iterdir():
+            if not path.is_file():
+                continue
+            name = path.name
+            if name.endswith(".latest.ansi.log") or name.endswith(".all.ansi.log"):
+                path.unlink(missing_ok=True)  # type: ignore[arg-type]
+                continue
+            if name.endswith(".ansi.log"):
+                cycle_num = _ephemeral_cycle_number_from_path(path)
+                if cycle_num is not None and cycle_num > completed_cycle:
+                    path.unlink(missing_ok=True)  # type: ignore[arg-type]
+
+    runtime_dir = config.state_dir / "runtime"
+    if runtime_dir.exists():
+        for path in runtime_dir.iterdir():
+            if not path.is_file():
+                continue
+            cycle_num = _ephemeral_cycle_number_from_path(path)
+            if cycle_num is not None and cycle_num > completed_cycle:
+                path.unlink(missing_ok=True)  # type: ignore[arg-type]
+
+
+def clear_future_cycle_checkpoints(config: Config, completed_cycle: int) -> None:
+    for checkpoint in list_cycle_checkpoints(config):
+        cycle = int(checkpoint.get("cycle", 0) or 0)
+        if cycle <= completed_cycle:
+            continue
+        checkpoint_dir = Path(str(checkpoint.get("checkpoint_dir", "")))
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+    def _trim_manifest(current: Dict[str, Any]) -> Dict[str, Any]:
+        checkpoints = current.get("checkpoints") if isinstance(current, dict) else None
+        if not isinstance(checkpoints, list):
+            checkpoints = []
+        kept = [
+            item
+            for item in checkpoints
+            if isinstance(item, dict) and int(item.get("cycle", 0) or 0) <= completed_cycle
+        ]
+        kept.sort(key=lambda item: int(item.get("cycle", 0) or 0), reverse=True)
+        return {"checkpoints": kept}
+
+    JsonFile.update(cycle_checkpoint_manifest_path(config), {"checkpoints": []}, _trim_manifest)
+
+
 def select_cycle_checkpoint(
     config: Config,
     *,
@@ -2509,6 +3073,22 @@ def restore_cycle_checkpoint(
             theorem_frontier_paper_verifier_path(config),
             theorem_frontier_nl_proof_verifier_path(config),
         )
+        clear_future_cycle_checkpoints(config, int(checkpoint.get("cycle", 0) or 0))
+        def _restore_manifest_entry(current: Dict[str, Any]) -> Dict[str, Any]:
+            checkpoints = current.get("checkpoints") if isinstance(current, dict) else None
+            if not isinstance(checkpoints, list):
+                checkpoints = []
+            updated = [
+                item
+                for item in checkpoints
+                if not (isinstance(item, dict) and int(item.get("cycle", 0) or 0) == int(checkpoint.get("cycle", 0) or 0))
+            ]
+            updated.append(dict(checkpoint))
+            updated.sort(key=lambda item: int(item.get("cycle", 0) or 0), reverse=True)
+            return {"checkpoints": updated}
+
+        JsonFile.update(cycle_checkpoint_manifest_path(config), {"checkpoints": []}, _restore_manifest_entry)
+        clear_future_cycle_ephemera(config, int(checkpoint.get("cycle", 0) or 0))
         state = load_state(config)
         ensure_chat_site(config)
         if chat_repo_events_path(config).exists():
@@ -2677,8 +3257,14 @@ def phase_worker_instructions(config: Config, phase: str, provider: str) -> str:
             - Do not introduce unapproved axioms.
             - If `{main_results_label}` does not exist yet, start from the supervisor-written stub and replace every placeholder field.
             - The manifest must describe the initial coarse theorem-frontier DAG extracted from the paper's proof spine, using exact natural-language statements, exact Lean statements, exact anchors, and only paper-facing / paper-faithful nodes.
-            - Every seeded node must carry a rigorous paper-derived `natural_language_proof` from its current children.
-            - For every non-leaf node, that proof must explicitly cite every current child node id in backticks, and it must not appeal to named paper lemmas/cases that are not represented by those children.
+            - For every seeded node, `lean_anchor` must name the exact source declaration for that node's statement.
+            - For every seeded node, `lean_statement` must be an exact copy of the declaration text at `lean_anchor`, not a paraphrase, summary, or normalized variant.
+            - The supervisor will mechanically check those statement anchors before theorem stating may advance.
+            - Every seeded node must carry a complete publication-grade paper-derived `natural_language_proof` from its current children.
+            - Those proofs should be at least as detailed as the paper's corresponding argument, and often more detailed because they must stand on their own as local proof witnesses for the DAG.
+            - Do not use placeholder or sketch prose such as "leaf of the DAG", "direct target", "formalizes", "packages", "routine", or "by the paper" in place of an actual proof.
+            - Copying sections of the paper verbatim or near-verbatim is completely acceptable when that text meets these locality and rigor requirements.
+            - Keep every proof local to the declared child set: if a proof relies on another named paper lemma/case, represent that dependency as a child node instead of hiding it in prose.
             - The manifest must also choose `initial_active_node_id`, the first theorem node that proof formalization should start on.
             - Choose `initial_active_node_id` for leverage, not convenience: prefer a lower or structurally doubtful node whose clarification is most likely to force upstream refactors/restatements if the current route is wrong, rather than a routine top-level wrapper.
             - The manifest must be a JSON object with exactly these top-level keys:
@@ -2805,21 +3391,57 @@ def theorem_frontier_worker_instructions(config: Config, state: Dict[str, Any], 
         return ""
     cycle = int(state.get("cycle", 0) or 0)
     artifact_label = supervisor_prompt_label(config, provider, theorem_frontier_worker_update_path(config, cycle))
+    payload = theorem_frontier_payload(state) or {}
+    active_node_id = normalize_frontier_text(payload.get("active_node_id"))
+    generated_statements_label = repo_prompt_label(config, provider, theorem_frontier_generated_statements_path(config))
+    active_generated_proof_label = (
+        repo_prompt_label(config, provider, theorem_frontier_generated_proof_path(config, active_node_id))
+        if active_node_id
+        else "repo/GeneratedFrontier/Proofs/<active-node>.lean"
+    )
+    worker_update_check_script = PROJECT_ROOT / "scripts" / "verify_theorem_frontier_worker_update.py"
+    if config.source_path is not None:
+        worker_update_check_command = (
+            f"python3 {shlex.quote(str(worker_update_check_script))} "
+            f"--config {shlex.quote(str(config.source_path))} "
+            f"--worker-update {shlex.quote(repo_relative_path(config, theorem_frontier_worker_update_path(config, cycle)))}"
+        )
+    else:
+        worker_update_check_command = (
+            f"python3 {shlex.quote(str(worker_update_check_script))} "
+            f"--repo {shlex.quote(str(config.repo_path))} "
+            f"--worker-update {shlex.quote(repo_relative_path(config, theorem_frontier_worker_update_path(config, cycle)))}"
+        )
     return textwrap.dedent(
         f"""\
         Theorem-frontier artifact requirements:
         - In addition to the normal worker handoff, write a theorem-frontier JSON to `{artifact_label}`.
-        - That JSON must name exactly one active theorem node and one requested action: `CLOSE`, `EXPAND`, or `REFUTE_REPLACE`.
+        - That JSON must name exactly one active theorem node and one requested action: `CLOSE`, `REFACTOR`, `EXPAND`, or `REFUTE_REPLACE`.
         - The active node is the authoritative proof target for this burst.
         - `CLOSE` means prove the active node from its current children.
+        - `REFACTOR` means keep the same active node and child interface, but reorganize proof/support code without changing the frontier.
+        - A successful `CLOSE` records the local Lean implication from the current children; the node becomes globally closed later, once those current children are themselves closed.
+        - Structural actions (`EXPAND` / `REFUTE_REPLACE`) still use each node's handwritten `lean_anchor` and `lean_statement`.
+        - The supervisor generates an immutable frontier statements file at `{generated_statements_label}`.
+        - The active node's generated proof file is `{active_generated_proof_label}`.
+        - For `CLOSE`, edit only `{active_generated_proof_label}` and set `allowed_edit_paths` to exactly that one file.
+        - For `REFACTOR`, keep the frontier/NL artifacts unchanged; you may edit `{active_generated_proof_label}` plus cone-local support `.lean` files, but do not edit `{generated_statements_label}` or any other generated proof file.
+        - For `CLOSE` and `REFACTOR`, `lean_proof_anchor` is only optional provenance and is ignored by the deterministic supervisor check.
+        - Before handing off any theorem-frontier update, run the exact supervisor worker-update validator yourself on the final artifact: `{worker_update_check_command}`.
+        - That script checks the same worker-stage rules the supervisor uses: theorem-frontier JSON schema, allowed node kinds, structural constraints, cone/edit policy, and for `CLOSE` / `REFACTOR` the deterministic generated-frontier checks.
+        - Run it only after your last Lean edits and final theorem-frontier JSON rewrite. If it fails, keep fixing and rerun it until it succeeds.
+        - Only submit a theorem-frontier update if that script succeeds.
         - `EXPAND` means refine the active node by inserting new nodes between it and its current children only.
         - `REFUTE_REPLACE` means replace the active node's current decomposition with a different route.
-        - Every node in the DAG carries a complete natural-language proof from its current children. Do not leave those proof texts implicit.
-        - For every non-leaf node, that proof must explicitly cite every current child node id in backticks, and it must not appeal to named paper lemmas/cases outside that local child set.
+        - Every node in the DAG carries a complete publication-grade natural-language proof from its current children. Do not leave those proof texts implicit.
+        - Write each node proof at least as detailed as the paper's corresponding argument, and often more detailed because the proof must be locally self-contained relative to the current children.
+        - Do not submit placeholder or sketch prose such as "leaf of the DAG", "direct target", "formalizes", "packages", "routine", or "by the paper" in place of an actual proof.
+        - Copying sections of the paper verbatim or near-verbatim is completely acceptable when that text meets these locality and rigor requirements.
+        - Keep every proof local to the declared child set: do not rely on named paper lemmas/cases outside the current node and its children.
         - Work only inside the active cone: the active node, its current children, or mechanically necessary support directly tied to closing that node.
         - When you suggest `next_candidate_node_ids`, prefer nodes whose clarification would be maximally informative about the current proof route: usually lower nodes, or nodes whose local proof looks tricky or doubtful enough that progress there could force knock-on restatement/refactor work upstream.
         - If you propose a structural change, include the exact rewritten active node plus the new local nodes and structural edges. Do not leave them vague.
-        - If `requested_action` is `CLOSE`, set `active_node_after` to `null` and leave `proposed_nodes` / `proposed_edges` empty.
+        - If `requested_action` is `CLOSE` or `REFACTOR`, set `active_node_after` to `null` and leave `proposed_nodes` / `proposed_edges` empty.
         - If `requested_action` is `EXPAND` or `REFUTE_REPLACE`, `active_node_after` must be the exact rewritten active node.
 
         Your theorem-frontier JSON must have exactly these top-level keys:
@@ -2828,7 +3450,8 @@ def theorem_frontier_worker_instructions(config: Config, state: Dict[str, Any], 
           "cycle": {cycle},
           "active_node_id": "stable theorem node id",
           "active_node_after": null | {{ exact rewritten active-node object after this burst }},
-          "requested_action": "CLOSE" | "EXPAND" | "REFUTE_REPLACE",
+          "requested_action": "CLOSE" | "REFACTOR" | "EXPAND" | "REFUTE_REPLACE",
+          "lean_proof_anchor": "optional provenance note; leave empty for generated-frontier CLOSE/REFACTOR unless useful",
           "cone_scope": "what work is inside the active cone for this burst",
           "allowed_edit_paths": [] | ["repo-relative .lean files allowed inside that cone for this burst"],
           "result_summary": "what changed relative to the active node",
@@ -2854,9 +3477,14 @@ def theorem_frontier_reviewer_instructions(config: Config, state: Dict[str, Any]
         - In addition to the normal reviewer decision, write a theorem-frontier review JSON to `{artifact_label}`.
         - Judge the cycle by theorem-frontier standards, not by build cleanliness alone.
         - Confirm whether the requested action really happened on the one active theorem node.
-        - Count real progress only if the burst either closed the active node or refined/replaced its local decomposition.
+        - `CLOSE` and `REFACTOR` are now supervisor-deterministic actions and should not reach you; focus on structural actions only.
+        - Count real progress here only when the burst refined/replaced the active node's local decomposition.
         - Do not accept an `EXPANDED` or `REFUTED_REPLACED` outcome if the rewritten node proof or newly admitted nodes lack complete natural-language proofs.
-        - Reject any structural update whose node proofs do not explicitly cite their current child node ids in backticks or that still appeal to named paper lemmas/cases outside the declared child set.
+        - Treat the overall proof-writing impression as a calibration signal: in a healthy proof-carrying DAG, the aggregate natural-language proof text for the active proof spine should usually feel at least as substantial as the corresponding paper argument, and often longer because each node proof must be locally self-contained.
+        - If the node proofs feel much sketchier or shorter than the paper's local arguments, treat that as evidence that the DAG is too coarse or the proofs are not yet rigorous enough to admit.
+        - Pay attention to whether the declared children really seem to be the route being used. If some children look unnecessary or the proof seems to rely on an unstated intermediate instead, require a refactor rather than admitting the node.
+        - Reject any structural update whose node proofs still appeal to named paper lemmas/cases outside the declared local child set or use placeholder/sketch language instead of a real proof.
+        - Do not penalize proofs for copying sections of the paper verbatim or near-verbatim when that wording is actually the best rigorous local proof for the declared children.
         - If the worker mostly added wrappers above the same blocker or drifted outside the active cone, use `NO_FRONTIER_PROGRESS`.
         - If cone purity is low, record that explicitly.
         - Use `next_active_node_id` to name the theorem node that should be active after this review. Use the current active node id if the same node stays active, or leave it empty only if there is no next active node yet.
@@ -2920,7 +3548,10 @@ def theorem_frontier_nl_proof_verifier_instructions(config: Config, state: Dict[
         - You are acting as the dedicated verifier of natural-language proofs for theorem-frontier structural admissions.
         - Do not judge paper-faithfulness here; the paper-verifier already handled that.
         - Judge only whether the natural-language proofs on the paper-approved rewritten active node and newly admitted nodes are complete, rigorous, and sufficient.
-        - Approve only the subset of paper-approved nodes whose natural-language proofs are genuinely rigorous. Reject or withhold approval from anything with gaps, handwaving, or missing case analysis.
+        - Use the paper's own level of detail as a floor, not a ceiling: these local node proofs should usually be at least as detailed as the corresponding paper argument, and often longer because they must be self-contained relative to the declared children.
+        - Treat suspiciously short or high-level proofs as a warning sign that the decomposition is too coarse or the proof is still a sketch.
+        - Approve only the subset of paper-approved nodes whose natural-language proofs are genuinely rigorous. Reject or withhold approval from anything with gaps, handwaving, missing case analysis, or placeholder/sketch language.
+        - Copying sections of the paper verbatim or near-verbatim is completely acceptable when the resulting node proof is the right rigorous local proof from the declared children.
         - If you are approving a rewritten active node itself, include that active node id in `approved_node_ids` along with any newly admitted nodes.
 
         Your NL-proof-verifier JSON must have exactly these keys:
@@ -2934,6 +3565,7 @@ def theorem_frontier_nl_proof_verifier_instructions(config: Config, state: Dict[
           "justification": "brief rigor judgment",
           "caveat": "leave empty unless APPROVE_WITH_CAVEAT"
         }}
+        Structural admission into the authoritative DAG requires `decision = "APPROVE"` from this verifier. Use `APPROVE_WITH_CAVEAT` only when the cycle should continue without admitting the rewritten node set yet.
         """
     ).strip()
 
@@ -2954,9 +3586,12 @@ def build_worker_prompt(
     review_guidance = ""
     if not is_initial:
         next_prompt = normalize_saved_reviewer_next_prompt(last_review.get("next_prompt") or "")
+        resolution_note = theorem_frontier_reviewer_resolution_note(state)
+        resolution_line = f"- Supervisor note: {resolution_note}\n" if resolution_note else ""
         review_guidance = textwrap.dedent(
             f"""\
             Reviewer guidance:
+            {resolution_line}\
             - Reason: {(last_review.get("reason") or "No reason supplied.").strip()}
             - Next prompt: {next_prompt or "Continue from the current frontier."}
             """
@@ -2986,6 +3621,16 @@ def build_worker_prompt(
             - Creative suggestion: {str(latest_recovery.get('creative_suggestion', '')).strip()}
             """
         )
+    close_validation_notes = ""
+    if not is_initial:
+        close_note = theorem_frontier_close_validation_note(state, phase)
+        if close_note:
+            close_validation_notes = textwrap.dedent(
+                f"""\
+                Supervisor CLOSE validation note:
+                - {close_note}
+                """
+            )
     provider_notes = provider_context_worker_instructions(config)
     git_notes = git_worker_instructions(config)
     frontier_notes = theorem_frontier_worker_instructions(config, state, phase, config.worker.provider)
@@ -3005,7 +3650,7 @@ def build_worker_prompt(
 
         {phase_context_text(config, state, phase, config.worker.provider)}
 
-        {review_guidance}{transition_blocker_notes}{stuck_recovery_notes}{provider_notes}
+        {review_guidance}{transition_blocker_notes}{close_validation_notes}{stuck_recovery_notes}{provider_notes}
         {phase_worker_instructions(config, phase, config.worker.provider)}
         {frontier_notes}
         {git_notes}
@@ -3057,7 +3702,8 @@ def phase_reviewer_instructions(config: Config, phase: str) -> str:
             Compare `PaperDefinitions.lean` and `PaperTheorems.lean` against the paper and insist on changes if they do not correspond.
             Compare the coarse paper-DAG manifest `{main_results_label}` against the paper and the statement files.
             Require that it captures a real coarse proof spine from the paper, uses only paper / paper-faithful nodes, and chooses a reasonable initial active theorem node.
-            Reject theorem-only skeletons: every non-leaf node proof must be local to its declared children, explicitly cite those child node ids in backticks, and avoid named paper lemmas/cases that are not present as children.
+            Require that every seeded node's `lean_anchor` names a real source declaration and that the manifest's `lean_statement` text is an exact source match for that declaration.
+            Reject theorem-only skeletons: every node proof must be a genuinely detailed local proof from the declared children, not a proof sketch or placeholder. Use the paper's own detail level as a floor and the overall amount of proof text as a sanity-check on whether the DAG is really proof-carrying. Copying sections of the paper verbatim or near-verbatim is completely acceptable when it meets that local rigor standard.
             Require syntactically valid Lean before advancing.
             """
         ).strip()
@@ -4034,6 +4680,7 @@ class ChatMarkdownRefresher:
         try:
             refresh_chat_markdown_metadata(self.config, update_manifest=False)
             refresh_chat_codex_budget_status(self.config)
+            refresh_dag_codex_budget_status(self.config)
         except Exception as exc:
             message = str(exc)
             if message != self.last_warning:
@@ -4084,11 +4731,12 @@ def launch_tmux_burst(
     latest_log = logs_dir / f"{adapter.role}.latest.ansi.log"
     session = adapter.config.tmux.session_name
     window_name = f"{adapter.role}-{cycle:04d}" if safe_burst_tag is None else f"{adapter.role}-{safe_burst_tag}"
+    usage_start = _provider_usage_snapshot(adapter)
 
     if reuse_existing_window:
         existing = find_live_tmux_burst_pane(session, window_name)
         if existing is not None:
-            return wait_for_tmux_burst_completion(
+            result = wait_for_tmux_burst_completion(
                 adapter,
                 pane_id=existing["pane_id"],
                 window_id=existing["window_id"],
@@ -4101,6 +4749,14 @@ def launch_tmux_burst(
                 session=session,
                 window_name=window_name,
             )
+            usage_end = _provider_usage_snapshot(adapter)
+            result["usage"] = {
+                "start": usage_start,
+                "end": usage_end,
+                "delta": _provider_usage_delta(usage_start, usage_end),
+            }
+            result["burst_tag"] = safe_burst_tag
+            return result
 
     if state is not None and phase is not None and adapter.cfg.provider == "codex":
         wait_for_codex_weekly_budget_if_needed(
@@ -4141,7 +4797,7 @@ def launch_tmux_burst(
     tmux_cmd("send-keys", "-t", pane_id, launch_cmd, "C-m")
     tmux_cmd("select-window", "-t", window_id)
 
-    return wait_for_tmux_burst_completion(
+    result = wait_for_tmux_burst_completion(
         adapter,
         pane_id=pane_id,
         window_id=window_id,
@@ -4154,6 +4810,14 @@ def launch_tmux_burst(
         session=session,
         window_name=window_name,
     )
+    usage_end = _provider_usage_snapshot(adapter)
+    result["usage"] = {
+        "start": usage_start,
+        "end": usage_end,
+        "delta": _provider_usage_delta(usage_start, usage_end),
+    }
+    result["burst_tag"] = safe_burst_tag
+    return result
 
 
 def role_cycle_artifact_paths(
@@ -4357,11 +5021,24 @@ def run_burst_with_validation(
             policy=policy,
             reuse_existing_window=reuse_existing_window and attempt == 1,
         )
+        if config is not None and state is not None and phase is not None:
+            record_agent_burst_usage(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                adapter=adapter,
+                stage_label=stage_label,
+                attempt=attempt,
+                run=run,
+            )
         try:
             result = validate(run)
             return run, result
         except SupervisorError as exc:
             last_error = str(exc)
+            if isinstance(exc, ValidationRoutingError) and exc.retry_role != adapter.role:
+                raise
             if attempt > validation_retry_limit:
                 raise
             if config is not None:
@@ -4557,6 +5234,7 @@ def validate_worker_cycle_artifacts(
     previous_validation = state.get("last_validation") if isinstance(state.get("last_validation"), dict) else None
     cycle_baseline = current_cycle_lean_baseline(state, cycle)
     frontier_update: Optional[Dict[str, Any]] = None
+    validation_summary: Dict[str, Any]
     if theorem_frontier_enabled(config, phase):
         frontier_update = load_validated_theorem_frontier_worker_update(
             config,
@@ -4564,6 +5242,48 @@ def validate_worker_cycle_artifacts(
             cycle,
             worker_terminal_output,
         )
+        worker_update_report = verify_theorem_frontier_worker_update_artifact(
+            config,
+            state,
+            phase,
+            cycle,
+            frontier_update,
+            previous_validation=previous_validation,
+            cycle_baseline=cycle_baseline,
+        )
+        validation_summary = worker_update_report["validation_summary"]
+    else:
+        validation_summary = run_validation(
+            config,
+            phase,
+            cycle,
+            previous_validation=previous_validation,
+            cycle_baseline=cycle_baseline,
+        )
+    return {
+        "worker_handoff": worker_handoff,
+        "frontier_update": frontier_update,
+        "validation_summary": validation_summary,
+    }
+
+
+def verify_theorem_frontier_worker_update_artifact(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+    *,
+    previous_validation: Optional[Dict[str, Any]] = None,
+    cycle_baseline: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    validate_worker_owned_theorem_frontier_update(
+        config,
+        state,
+        phase,
+        cycle,
+        worker_update,
+    )
     validation_summary = run_validation(
         config,
         phase,
@@ -4575,12 +5295,114 @@ def validate_worker_cycle_artifacts(
         config,
         phase,
         validation_summary,
-        frontier_update,
+        worker_update,
     )
+    validate_theorem_frontier_generated_edit_policy(
+        config,
+        state,
+        phase,
+        worker_update,
+        validation_summary,
+    )
+    deterministic_report: Optional[Dict[str, Any]] = None
+    requested_action = str(worker_update.get("requested_action") or "").strip().upper()
+    if requested_action in {"CLOSE", "REFACTOR"}:
+        try:
+            deterministic_report = verify_theorem_frontier_deterministic_action(
+                config,
+                state,
+                phase,
+                cycle,
+                worker_update,
+                validation_summary=validation_summary,
+            )
+        except SupervisorError as exc:
+            if requested_action == "REFACTOR":
+                raise WorkerFixableValidationError(
+                    f"Theorem-frontier REFACTOR is not admissible yet: {str(exc).strip()} "
+                    "Keep the frozen generated frontier statements unchanged and restore every already-proved generated proof file."
+                ) from exc
+            raise
     return {
-        "worker_handoff": worker_handoff,
-        "frontier_update": frontier_update,
+        "phase": phase,
+        "cycle": int(cycle),
+        "requested_action": requested_action,
+        "active_node_id": normalize_frontier_text(worker_update.get("active_node_id")),
         "validation_summary": validation_summary,
+        "deterministic_report": deterministic_report,
+    }
+
+
+def verify_theorem_frontier_deterministic_action(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+    *,
+    validation_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not theorem_frontier_full_enabled(config, phase):
+        raise SupervisorError("Theorem-frontier deterministic worker validation is only available in full theorem-frontier mode.")
+    requested_action = str(worker_update.get("requested_action") or "").strip().upper()
+    if requested_action not in {"CLOSE", "REFACTOR"}:
+        raise SupervisorError(
+            f"Theorem-frontier deterministic worker validation only supports CLOSE/REFACTOR, got {requested_action or '<empty>'!r}."
+        )
+    validate_worker_owned_theorem_frontier_update(
+        config,
+        state,
+        phase,
+        cycle,
+        worker_update,
+    )
+    summary = validation_summary
+    if not isinstance(summary, dict):
+        previous_validation = state.get("last_validation") if isinstance(state.get("last_validation"), dict) else None
+        cycle_baseline = current_cycle_lean_baseline(state, cycle)
+        summary = run_validation(
+            config,
+            phase,
+            cycle,
+            previous_validation=previous_validation,
+            cycle_baseline=cycle_baseline,
+        )
+        summary["theorem_frontier_cone_files"] = apply_theorem_frontier_cone_file_guard(
+            config,
+            phase,
+            summary,
+            worker_update,
+        )
+    validate_theorem_frontier_generated_edit_policy(
+        config,
+        state,
+        phase,
+        worker_update,
+        summary,
+    )
+    if requested_action == "CLOSE":
+        action_report = verify_theorem_frontier_close_attempt(
+            config,
+            state,
+            phase,
+            cycle,
+            worker_update,
+        )
+    else:
+        action_report = verify_theorem_frontier_refactor_attempt(
+            config,
+            state,
+            phase,
+            cycle,
+            worker_update,
+        )
+    return {
+        "phase": phase,
+        "cycle": int(cycle),
+        "requested_action": requested_action,
+        "active_node_id": normalize_frontier_text(worker_update.get("active_node_id")),
+        "validation_summary": summary,
+        "action_report": action_report,
     }
 
 
@@ -4612,6 +5434,195 @@ def validate_reviewer_cycle_artifacts(
         "frontier_review": frontier_review,
     }
 
+
+def _deterministic_frontier_decision_from_review(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+    frontier_review: Dict[str, Any],
+    *,
+    reason: str,
+) -> Dict[str, Any]:
+    preview_state = deep_copy_jsonish(state)
+    preview_payload = update_theorem_frontier_full_state(
+        config,
+        preview_state,
+        worker_update,
+        frontier_review,
+        None,
+        None,
+        cycle=cycle,
+        persist=False,
+    )
+    preview_active_node_id = normalize_frontier_text(preview_payload.get("active_node_id")) if isinstance(preview_payload, dict) else ""
+    next_prompt = (
+        f"Continue proof formalization at `{preview_active_node_id}`."
+        if preview_active_node_id
+        else "All theorem-frontier nodes are locally proved and closed; advance out of proof formalization."
+    )
+    decision_value = "CONTINUE" if preview_active_node_id else "ADVANCE_PHASE"
+    decision = validate_reviewer_decision(
+        phase,
+        cycle,
+        {
+            "phase": phase,
+            "cycle": cycle,
+            "decision": decision_value,
+            "confidence": 1.0,
+            "reason": reason,
+            "next_prompt": next_prompt,
+        },
+    )
+    return {
+        "decision": decision,
+        "frontier_review": frontier_review,
+        "preview_payload": preview_payload,
+    }
+
+
+def synthesize_deterministic_frontier_result(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return None
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        return None
+    requested_action = str(worker_update.get("requested_action") or "").strip().upper()
+    active_node_id = normalize_frontier_text(worker_update.get("active_node_id"))
+    active_node = nodes.get(active_node_id) if active_node_id else None
+    if not isinstance(active_node, dict):
+        return None
+    blocker_cluster = normalize_frontier_text(active_node.get("blocker_cluster"))
+
+    if requested_action == "CLOSE":
+        try:
+            deterministic_report = verify_theorem_frontier_deterministic_action(
+                config,
+                state,
+                phase,
+                cycle,
+                worker_update,
+            )
+            close_report = deterministic_report["action_report"]
+        except SupervisorError as exc:
+            frontier_review = validate_theorem_frontier_review_full(
+                phase,
+                cycle,
+                {
+                    "phase": phase,
+                    "cycle": cycle,
+                    "active_node_id": active_node_id,
+                    "assessed_action": "CLOSE",
+                    "blocker_cluster": blocker_cluster,
+                    "outcome": "STILL_OPEN",
+                    "next_active_node_id": active_node_id,
+                    "cone_purity": "HIGH",
+                    "open_hypotheses": [],
+                    "justification": f"Deterministic CLOSE validation failed: {str(exc).strip()}",
+                },
+            )
+            result = _deterministic_frontier_decision_from_review(
+                config,
+                state,
+                phase,
+                cycle,
+                worker_update,
+                frontier_review,
+                reason=(
+                    f"The supervisor mechanically checked the generated CLOSE proof for `{active_node_id}` and it did not "
+                    f"build yet: {str(exc).strip()}"
+                ),
+            )
+            result["close_validation_error"] = str(exc).strip()
+            return result
+
+        next_candidate_ids = [
+            normalize_frontier_text(item)
+            for item in (worker_update.get("next_candidate_node_ids") or [])
+            if normalize_frontier_text(item)
+        ]
+        next_active_node_id = next_candidate_ids[0] if next_candidate_ids else ""
+        frontier_review = validate_theorem_frontier_review_full(
+            phase,
+            cycle,
+            {
+                "phase": phase,
+                "cycle": cycle,
+                "active_node_id": active_node_id,
+                "assessed_action": "CLOSE",
+                "blocker_cluster": blocker_cluster,
+                "outcome": "CLOSED",
+                "next_active_node_id": next_active_node_id,
+                "cone_purity": "HIGH",
+                "open_hypotheses": [],
+                "justification": (
+                    "The supervisor mechanically validated the worker-supplied CLOSE by compiling the generated "
+                    "frontier proof file against the immutable generated statement layer."
+                ),
+            },
+        )
+        return _deterministic_frontier_decision_from_review(
+            config,
+            state,
+            phase,
+            cycle,
+            worker_update,
+            frontier_review,
+            reason=(
+                f"The supervisor deterministically validated the CLOSE on `{active_node_id}` by compiling "
+                "the generated frontier proof file against the frozen local statement interface."
+            ),
+        )
+
+    if requested_action == "REFACTOR":
+        deterministic_report = verify_theorem_frontier_deterministic_action(
+            config,
+            state,
+            phase,
+            cycle,
+            worker_update,
+        )
+        report = deterministic_report["action_report"]
+        frontier_review = validate_theorem_frontier_review_full(
+            phase,
+            cycle,
+            {
+                "phase": phase,
+                "cycle": cycle,
+                "active_node_id": active_node_id,
+                "assessed_action": "REFACTOR",
+                "blocker_cluster": blocker_cluster,
+                "outcome": "STILL_OPEN",
+                "next_active_node_id": active_node_id,
+                "cone_purity": "HIGH",
+                "open_hypotheses": [],
+                "justification": (
+                    "The supervisor deterministically validated the REFACTOR by keeping the generated frontier "
+                    "statement interface frozen and rechecking all currently proved generated proof files."
+                ),
+            },
+        )
+        return _deterministic_frontier_decision_from_review(
+            config,
+            state,
+            phase,
+            cycle,
+            worker_update,
+            frontier_review,
+            reason=(
+                f"The supervisor deterministically validated REFACTOR on `{active_node_id}` while preserving "
+                f"{len(report.get('proved_node_ids') or [])} already-proved node(s) against the frozen frontier statements."
+            ),
+        )
+    return None
 
 def validate_reviewer_decision(phase: str, cycle: int, decision: Dict[str, Any]) -> Dict[str, Any]:
     hard_required = {"cycle", "decision"}
@@ -4806,6 +5817,7 @@ def validate_branch_replacement_decision(
 
 def clear_incomplete_current_cycle_worker_state(config: Config, state: Dict[str, Any], cycle: int) -> None:
     state.pop("last_worker_output", None)
+    state.pop("last_worker_output_cycle", None)
     state.pop("last_worker_handoff", None)
     if isinstance(state.get("last_validation"), dict) and last_validation_cycle(state) == cycle:
         state.pop("last_validation", None)
@@ -4831,19 +5843,59 @@ def clear_incomplete_current_cycle_worker_state(config: Config, state: Dict[str,
     )
 
 
+def cached_current_cycle_worker_handoff(state: Dict[str, Any], cycle: int) -> Optional[Dict[str, Any]]:
+    handoff = state.get("last_worker_handoff")
+    if not isinstance(handoff, dict):
+        return None
+    try:
+        return handoff if int(handoff.get("cycle", 0) or 0) == cycle else None
+    except Exception:
+        return None
+
+
+def cached_current_cycle_worker_output(state: Dict[str, Any], cycle: int) -> str:
+    output = str(state.get("last_worker_output") or "").strip()
+    if not output:
+        return ""
+    try:
+        output_cycle = int(state.get("last_worker_output_cycle", 0) or 0)
+    except Exception:
+        output_cycle = 0
+    if output_cycle:
+        return output if output_cycle == cycle else ""
+    if cached_current_cycle_worker_handoff(state, cycle) is not None:
+        return output
+    validation = state.get("last_validation")
+    if isinstance(validation, dict):
+        try:
+            if int(validation.get("cycle", 0) or 0) == cycle:
+                return output
+        except Exception:
+            pass
+    return ""
+
+
 def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phase: str) -> bool:
     cycle = int(state.get("cycle", 0) or 0)
     if cycle <= 0 or last_review_cycle(state) >= cycle:
         return False
+    current_cycle_handoff = cached_current_cycle_worker_handoff(state, cycle)
+    current_cycle_worker_output = cached_current_cycle_worker_output(state, cycle)
+    current_cycle_frontier_update = state.get("last_theorem_frontier_worker_update")
+    if not (
+        isinstance(current_cycle_frontier_update, dict)
+        and int(current_cycle_frontier_update.get("cycle", 0) or 0) == cycle
+    ):
+        current_cycle_frontier_update = None
     worker_state_complete = (
         isinstance(state.get("last_validation"), dict)
         and last_validation_cycle(state) == cycle
-        and isinstance(state.get("last_worker_handoff"), dict)
-        and "last_worker_output" in state
+        and current_cycle_handoff is not None
+        and bool(current_cycle_worker_output)
     )
     frontier_state_complete = (
         not theorem_frontier_enabled(config, phase)
-        or isinstance(state.get("last_theorem_frontier_worker_update"), dict)
+        or current_cycle_frontier_update is not None
     )
     if worker_state_complete and frontier_state_complete:
         return False
@@ -4851,7 +5903,7 @@ def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phas
     artifact_path = worker_handoff_path(config, cycle)
     fallback_paths = artifact_fallback_paths(config, artifact_path, worker_handoff_path(config))
     log_path = config.state_dir / "logs" / f"worker-cycle-{cycle:04d}.ansi.log"
-    worker_terminal_output = str(state.get("last_worker_output") or "").strip()
+    worker_terminal_output = current_cycle_worker_output
     if not worker_terminal_output and log_path.exists():
         worker_terminal_output = read_text(log_path).strip()
     if not artifact_path.exists() and not any(path.exists() for path in fallback_paths) and not worker_terminal_output:
@@ -4871,6 +5923,7 @@ def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phas
             return False
         worker_handoff = validate_worker_handoff(phase, cycle, worker_handoff)
         state["last_worker_output"] = worker_terminal_output
+        state["last_worker_output_cycle"] = cycle
         state["last_worker_handoff"] = worker_handoff
         record_chat_event(
             config,
@@ -4944,6 +5997,68 @@ def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phas
     if recovered_any or baseline_created:
         save_state(config, state)
     return recovered_any or baseline_created
+
+
+def recover_interrupted_reviewer_state(
+    config: Config,
+    state: Dict[str, Any],
+    reviewer: ProviderAdapter,
+    phase: str,
+    policy: Policy,
+) -> Optional[bool]:
+    cycle = int(state.get("cycle", 0) or 0)
+    if cycle <= 0 or last_review_cycle(state) >= cycle:
+        return None
+    validation_summary = state.get("last_validation")
+    if not isinstance(validation_summary, dict) or last_validation_cycle(state) != cycle:
+        return None
+    worker_handoff = state.get("last_worker_handoff")
+    if not isinstance(worker_handoff, dict):
+        return None
+
+    decision_path = reviewer_decision_path(config, cycle)
+    frontier_path = theorem_frontier_review_path(config, cycle)
+    if not decision_path.exists() and not frontier_path.exists():
+        return None
+
+    reviewer_terminal_output = ""
+    log_path = config.state_dir / "logs" / f"reviewer-cycle-{cycle:04d}.ansi.log"
+    if log_path.exists():
+        reviewer_terminal_output = read_text(log_path).strip()
+
+    decision = load_json_artifact_with_fallback(
+        decision_path,
+        reviewer_terminal_output,
+        ("phase", "cycle", "decision"),
+        fallback_paths=artifact_fallback_paths(
+            config,
+            decision_path,
+            reviewer_decision_path(config),
+        ),
+    )
+    decision = validate_reviewer_decision(phase, cycle, decision)
+    persist_supervisor_artifact(decision, decision_path, reviewer_decision_path(config))
+    reviewer_result = validate_reviewer_cycle_artifacts(
+        config,
+        state,
+        phase,
+        cycle,
+        reviewer_terminal_output,
+        decision,
+    )
+
+    print(f"Recovered completed reviewer burst for cycle {cycle}; finalizing cycle state.")
+    should_stop = finalize_reviewer_cycle(
+        config,
+        state,
+        reviewer,
+        phase,
+        cycle,
+        reviewer_result,
+        validation_summary,
+        policy,
+    )
+    return should_stop
 
 
 def maybe_consume_human_input(config: Config, state: Dict[str, Any]) -> bool:
@@ -6479,6 +7594,7 @@ def monitor_active_branch_episode(
 
 
 def enforce_terminal_decision(
+    config: Config,
     phase: str,
     decision_value: str,
     validation_summary: Dict[str, Any],
@@ -6496,6 +7612,8 @@ def enforce_terminal_decision(
             raise SupervisorError(
                 "Cannot advance from theorem_stating after editing Lean files outside the statement-file cone."
             )
+        if theorem_frontier_phase(config) == "full":
+            validate_paper_main_results_manifest_repo_evidence(config)
     if phase == "proof_formalization" and decision_value in {"ADVANCE_PHASE", "DONE"}:
         if not validation_summary["build"]["ok"]:
             raise SupervisorError("Cannot complete proof_formalization while `lake build` is failing.")
@@ -6512,12 +7630,504 @@ def enforce_terminal_decision(
             raise SupervisorError("Cannot finish cleanup with unapproved axioms present.")
 
 
+def finalize_reviewer_cycle(
+    config: Config,
+    state: Dict[str, Any],
+    reviewer: ProviderAdapter,
+    phase: str,
+    cycle: int,
+    reviewer_result: Dict[str, Any],
+    validation_summary: Dict[str, Any],
+    policy: Policy,
+) -> bool:
+    decision = reviewer_result["decision"]
+    frontier_review: Optional[Dict[str, Any]] = reviewer_result.get("frontier_review")
+    current_frontier: Optional[Dict[str, Any]] = None
+    decision_already_recorded = last_review_cycle(state) >= cycle
+
+    if theorem_frontier_enabled(config, phase):
+        state["last_theorem_frontier_review"] = frontier_review
+        worker_frontier_update = state.get("last_theorem_frontier_worker_update")
+        if not isinstance(worker_frontier_update, dict):
+            raise SupervisorError("Missing theorem-frontier worker update while applying frontier review.")
+        frontier_payload_before = theorem_frontier_payload(state) or {}
+        frontier_current = frontier_payload_before.get("current") if isinstance(frontier_payload_before, dict) else {}
+        frontier_already_applied = int((frontier_current or {}).get("cycle", 0) or 0) == cycle
+        if not frontier_already_applied:
+            _dag_before_node_ids = set((frontier_payload_before.get("nodes") or {}).keys())
+            _dag_before_edge_ids = {
+                f"{str(edge.get('parent', ''))}->{str(edge.get('child', ''))}"
+                for edge in (frontier_payload_before.get("edges") or [])
+                if isinstance(edge, dict) and edge.get("parent") and edge.get("child")
+            }
+            current_frontier = update_theorem_frontier_full_state(
+                config,
+                state,
+                worker_frontier_update,
+                frontier_review,
+                state.get("last_theorem_frontier_paper_review") if isinstance(state.get("last_theorem_frontier_paper_review"), dict) else None,
+                state.get("last_theorem_frontier_nl_proof_review") if isinstance(state.get("last_theorem_frontier_nl_proof_review"), dict) else None,
+                cycle=cycle,
+            )
+            ensure_dag_site(config)
+            export_dag_frontier_snapshot(config, state)
+            export_dag_frontier_cycle(
+                config,
+                state,
+                _dag_before_node_ids,
+                _dag_before_edge_ids,
+                current_frontier,
+                cycle=cycle,
+                outcome=frontier_review.get("outcome", ""),
+                reviewed_node_id=frontier_review.get("active_node_id", ""),
+                worker_directive=worker_directive_summary(state),
+            )
+            export_dag_meta(config, state)
+            metrics = current_frontier.get("metrics") if isinstance(current_frontier, dict) else {}
+            escalation = current_frontier.get("escalation") if isinstance(current_frontier, dict) else {}
+            review_event_content: Union[Dict[str, Any], Any] = {
+                **frontier_review,
+                "active_node_id": current_frontier.get("active_node_id"),
+                "active_node_age": (metrics or {}).get("active_node_age"),
+                "blocker_cluster_age": (metrics or {}).get("blocker_cluster_age"),
+                "cone_purity": frontier_review.get("cone_purity"),
+                "escalation_required": bool((escalation or {}).get("required")),
+            }
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                kind="theorem_frontier_review",
+                actor="reviewer",
+                target="supervisor",
+                content=review_event_content,
+                content_type="json",
+            )
+
+    decision["cycle"] = cycle
+    decision["phase"] = phase
+    state["last_review"] = decision
+    review_log = state.setdefault("review_log", [])
+    if not isinstance(review_log, list):
+        review_log = []
+        state["review_log"] = review_log
+    if not decision_already_recorded:
+        review_log.append(decision)
+        record_chat_event(
+            config,
+            state,
+            cycle=cycle,
+            phase=phase,
+            kind="reviewer_decision",
+            actor="reviewer",
+            target="supervisor",
+            content=decision,
+            content_type="json",
+        )
+    save_state(config, state)
+    if not decision_already_recorded:
+        append_jsonl(config.state_dir / "review_log.jsonl", decision)
+
+    print("\n===== reviewer decision =====")
+    print(json.dumps(decision, indent=2, ensure_ascii=False))
+
+    decision_value = decision["decision"]
+    if decision_value not in {"ADVANCE_PHASE", "DONE"} and state.get("last_transition_error") is not None:
+        state["last_transition_error"] = None
+        save_state(config, state)
+    if decision_value in {"ADVANCE_PHASE", "DONE"}:
+        validate_theorem_frontier_terminal_repo_evidence(config, state)
+    try:
+        enforce_terminal_decision(config, phase, decision_value, validation_summary)
+    except SupervisorError as exc:
+        if decision_value in {"ADVANCE_PHASE", "DONE"}:
+            state["last_transition_error"] = {
+                "cycle": cycle,
+                "phase": phase,
+                "decision": decision_value,
+                "error": str(exc),
+                "recorded_at": timestamp_now(),
+            }
+            save_state(config, state)
+            log_supervisor_warning(
+                config,
+                cycle=cycle,
+                phase=phase,
+                category="transition_blocked",
+                message=str(exc),
+                detail={
+                    "decision": decision_value,
+                    "validation_summary_path": str(validation_summary_path(config)),
+                },
+            )
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                kind="transition_blocked",
+                actor="supervisor",
+                target="workflow",
+                content=state["last_transition_error"],
+                content_type="json",
+                summary=f"Blocked {decision_value} from {phase}",
+            )
+            save_state(config, state)
+            print(
+                f"Phase transition blocked; staying in {phase} and continuing in the current phase: {exc}"
+            )
+            write_completed_cycle_checkpoint(
+                config,
+                state,
+                cycle=cycle,
+                completed_phase=phase,
+                decision=decision,
+                validation_summary=validation_summary,
+            )
+            if honor_cycle_boundary_restart_request(
+                config,
+                state,
+                cycle=cycle,
+                phase=current_phase(config, state),
+                decision=decision,
+            ):
+                return True
+            time.sleep(supervisor_sleep_seconds(config, policy))
+            return False
+        raise
+    if state.get("last_transition_error") is not None:
+        state["last_transition_error"] = None
+        save_state(config, state)
+
+    if (not decision_already_recorded) and should_consider_branching(config, state, phase, decision):
+        preflight_error = branch_episode_preflight_error(config)
+        if preflight_error:
+            print(f"Skipping branch consideration for cycle {cycle}: {preflight_error}.")
+        else:
+            branch_strategy = run_branch_strategy_review(
+                config,
+                state,
+                reviewer,
+                phase,
+                decision,
+                policy=policy,
+            )
+            state["last_branch_consideration_cycle"] = cycle
+            save_state(config, state)
+            print("\n===== branch strategy decision =====")
+            print(json.dumps(branch_strategy, indent=2, ensure_ascii=False))
+            if branch_strategy["branch_decision"] == "BRANCH":
+                if branching_enabled(config):
+                    episode = create_branch_episode(
+                        config,
+                        state,
+                        phase,
+                        decision,
+                        branch_strategy,
+                        policy=policy,
+                    )
+                    write_completed_cycle_checkpoint(
+                        config,
+                        state,
+                        cycle=cycle,
+                        completed_phase=phase,
+                        decision=decision,
+                        validation_summary=validation_summary,
+                    )
+                    if honor_cycle_boundary_restart_request(
+                        config,
+                        state,
+                        cycle=cycle,
+                        phase=current_phase(config, state),
+                        decision=decision,
+                    ):
+                        return True
+                    print(
+                        f"Created branch episode {episode['id']} with {len(episode['branches'])} branch(es). "
+                        "Parent supervisor will monitor child branches until selection."
+                    )
+                    return False
+                if can_propose_branch_replacement(state, config):
+                    proposal = store_pending_branch_proposal(state, branch_strategy, cycle=cycle)
+                    save_state(config, state)
+                    write_completed_cycle_checkpoint(
+                        config,
+                        state,
+                        cycle=cycle,
+                        completed_phase=phase,
+                        decision=decision,
+                        validation_summary=validation_summary,
+                    )
+                    honor_cycle_boundary_restart_request(
+                        config,
+                        state,
+                        cycle=cycle,
+                        phase=current_phase(config, state),
+                        decision=decision,
+                        already_stopping=True,
+                    )
+                    print(
+                        "Queued a parent-coordinated branch replacement proposal with "
+                        f"{len(proposal.get('strategies', []))} strategy branch(es); "
+                        "stopping this branch supervisor so the parent frontier monitor can evaluate it."
+                    )
+                    return True
+
+    if phase == "proof_formalization" and decision_value != "STUCK" and stuck_recovery_attempts(state):
+        clear_stuck_recovery(state)
+        save_state(config, state)
+    if decision_value == "ADVANCE_PHASE":
+        next_value = next_phase(phase)
+        state.setdefault("phase_history", []).append(
+            {
+                "cycle": cycle,
+                "phase": phase,
+                "decision": decision_value,
+                "reason": decision.get("reason", ""),
+            }
+        )
+        if next_value is None:
+            print("Reviewer advanced past the final phase; stopping as DONE.")
+            return True
+        if (
+            phase == "theorem_stating"
+            and next_value == "proof_formalization"
+            and theorem_frontier_phase(config) == "full"
+        ):
+            manifest = load_validated_paper_main_results_manifest(config)
+            seeded_frontier = seed_theorem_frontier_from_main_results_manifest(
+                config,
+                state,
+                manifest,
+                cycle=cycle,
+            )
+        state["phase"] = next_value
+        save_state(config, state)
+        if (
+            phase == "theorem_stating"
+            and next_value == "proof_formalization"
+            and theorem_frontier_phase(config) == "full"
+        ):
+            ensure_dag_site(config)
+            export_dag_frontier_snapshot(config, state)
+            export_dag_frontier_seed(config, seeded_frontier, cycle=cycle)
+            export_dag_meta(config, state)
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=next_value,
+                kind="theorem_frontier_seed",
+                actor="supervisor",
+                target="workflow",
+                content={
+                    "initial_active_node_id": seeded_frontier.get("active_node_id"),
+                    "seed_node_ids": sorted(seeded_frontier.get("nodes", {}).keys()),
+                    "seed_edge_count": len(seeded_frontier.get("edges", []) or []),
+                    "source": str(paper_main_results_manifest_path(config)),
+                },
+                content_type="json",
+            )
+        if is_style_cleanup_phase(next_value):
+            update_cleanup_last_good_commit(config, state, validation_summary)
+        record_chat_event(
+            config,
+            state,
+            cycle=cycle,
+            phase=next_value,
+            kind="phase_transition",
+            actor="supervisor",
+            target="workflow",
+            content={
+                "from_phase": phase,
+                "to_phase": next_value,
+                "reason": decision.get("reason", ""),
+            },
+            content_type="json",
+        )
+        save_state(config, state)
+        write_completed_cycle_checkpoint(
+            config,
+            state,
+            cycle=cycle,
+            completed_phase=phase,
+            decision=decision,
+            validation_summary=validation_summary,
+        )
+        if honor_cycle_boundary_restart_request(
+            config,
+            state,
+            cycle=cycle,
+            phase=current_phase(config, state),
+            decision=decision,
+        ):
+            return True
+        print(f"Advancing workflow phase: {phase} -> {next_value}")
+        time.sleep(supervisor_sleep_seconds(config, policy))
+        return False
+    if decision_value == "NEED_INPUT":
+        worker_handoff = state.get("last_worker_handoff")
+        if not isinstance(worker_handoff, dict):
+            raise SupervisorError("Cannot request human input without a worker handoff in state.")
+        write_input_request(config, phase, worker_handoff, decision, validation_summary)
+        state["awaiting_human_input"] = True
+        record_chat_event(
+            config,
+            state,
+            cycle=cycle,
+            phase=phase,
+            kind="input_request",
+            actor="supervisor",
+            target="human",
+            content=read_text(config.workflow.input_request_path).strip(),
+            content_type="text",
+        )
+        save_state(config, state)
+        write_completed_cycle_checkpoint(
+            config,
+            state,
+            cycle=cycle,
+            completed_phase=phase,
+            decision=decision,
+            validation_summary=validation_summary,
+        )
+        honor_cycle_boundary_restart_request(
+            config,
+            state,
+            cycle=cycle,
+            phase=current_phase(config, state),
+            decision=decision,
+            already_stopping=True,
+        )
+        print(f"Stopping because reviewer requested human input. See {config.workflow.input_request_path}")
+        return True
+    if decision_value == "STUCK":
+        if is_style_cleanup_phase(phase):
+            restore_cleanup_last_good_commit(
+                config,
+                state,
+                cycle=cycle,
+                reason="cleanup reviewer decided the optional cleanup phase had stalled",
+            )
+            write_completed_cycle_checkpoint(
+                config,
+                state,
+                cycle=cycle,
+                completed_phase=phase,
+                decision=decision,
+                validation_summary=state.get("last_validation") if isinstance(state.get("last_validation"), dict) else validation_summary,
+            )
+            honor_cycle_boundary_restart_request(
+                config,
+                state,
+                cycle=cycle,
+                phase=current_phase(config, state),
+                decision=decision,
+                already_stopping=True,
+            )
+            print("Cleanup reviewer returned STUCK; restored last good commit and stopping as DONE.")
+            return True
+        if can_attempt_stuck_recovery(state, policy):
+            suggestion = run_stuck_recovery_review(config, state, reviewer, phase, policy=policy)
+            attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
+            write_completed_cycle_checkpoint(
+                config,
+                state,
+                cycle=cycle,
+                completed_phase=phase,
+                decision=decision,
+                validation_summary=validation_summary,
+            )
+            if honor_cycle_boundary_restart_request(
+                config,
+                state,
+                cycle=cycle,
+                phase=current_phase(config, state),
+                decision=decision,
+            ):
+                return True
+            print(
+                f"Reviewer returned STUCK; queued stuck-recovery attempt "
+                f"{suggestion['attempt']}/{attempt_limit}."
+            )
+            time.sleep(supervisor_sleep_seconds(config, policy))
+            return False
+        attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
+        write_completed_cycle_checkpoint(
+            config,
+            state,
+            cycle=cycle,
+            completed_phase=phase,
+            decision=decision,
+            validation_summary=validation_summary,
+        )
+        honor_cycle_boundary_restart_request(
+            config,
+            state,
+            cycle=cycle,
+            phase=current_phase(config, state),
+            decision=decision,
+            already_stopping=True,
+        )
+        print(
+            "Stopping because reviewer returned STUCK after exhausting "
+            f"{attempt_limit} stuck-recovery attempts."
+        )
+        return True
+    if decision_value == "DONE":
+        if is_style_cleanup_phase(phase):
+            update_cleanup_last_good_commit(config, state, validation_summary)
+            save_state(config, state)
+        write_completed_cycle_checkpoint(
+            config,
+            state,
+            cycle=cycle,
+            completed_phase=phase,
+            decision=decision,
+            validation_summary=state.get("last_validation") if isinstance(state.get("last_validation"), dict) else validation_summary,
+        )
+        honor_cycle_boundary_restart_request(
+            config,
+            state,
+            cycle=cycle,
+            phase=current_phase(config, state),
+            decision=decision,
+            already_stopping=True,
+        )
+        print("Stopping because reviewer returned DONE.")
+        return True
+
+    write_completed_cycle_checkpoint(
+        config,
+        state,
+        cycle=cycle,
+        completed_phase=phase,
+        decision=decision,
+        validation_summary=validation_summary,
+    )
+    if honor_cycle_boundary_restart_request(
+        config,
+        state,
+        cycle=cycle,
+        phase=current_phase(config, state),
+        decision=decision,
+    ):
+        return True
+    time.sleep(supervisor_sleep_seconds(config, policy))
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Lean formalization worker/reviewer supervisor")
     parser.add_argument("--config", required=True, help="Path to JSON config")
     args = parser.parse_args()
 
     config = load_config(Path(args.config).expanduser().resolve())
+    if config.source_path is not None:
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "config_path.txt").write_text(str(config.source_path) + "\n", encoding="utf-8")
+    install_supervisor_file_logging(config)
     check_dependencies(config)
     ensure_git_repository(config)
     installed_provider_context = install_personal_provider_context_files(
@@ -6619,6 +8229,11 @@ def main() -> int:
         ensure_repo_files(config, phase)
         if recover_interrupted_worker_state(config, state, phase):
             print(f"Recovered completed worker burst for cycle {int(state.get('cycle', 0))}; resuming reviewer stage.")
+        reviewer_recovery = recover_interrupted_reviewer_state(config, state, reviewer, phase, policy)
+        if reviewer_recovery is not None:
+            if reviewer_recovery:
+                break
+            continue
         cycle, stage = determine_resume_cycle_and_stage(state)
         is_new_cycle = cycle > int(state.get("cycle", 0) or 0)
         if is_new_cycle:
@@ -6628,6 +8243,8 @@ def main() -> int:
             state["cycle"] = cycle
         baseline_created = False
         if stage == "worker":
+            if theorem_frontier_full_enabled(config, phase):
+                sync_theorem_frontier_generated_files(config, state, ensure_active_proof=True)
             baseline_created = ensure_current_cycle_lean_baseline(config, state, cycle)
         if is_new_cycle or baseline_created:
             save_state(config, state)
@@ -6709,6 +8326,7 @@ def main() -> int:
             frontier_update = worker_result.get("frontier_update")
             validation_summary = worker_result["validation_summary"]
             state["last_worker_output"] = worker_terminal_output
+            state["last_worker_output_cycle"] = cycle
             state["last_worker_handoff"] = worker_handoff
             record_chat_event(
                 config,
@@ -6809,579 +8427,195 @@ def main() -> int:
                 save_state(config, state)
 
         policy = policy_manager.reload(state=state, persist=True)
+        auto_frontier_result: Optional[Dict[str, Any]] = None
+        state["last_theorem_frontier_close_validation_error"] = None
         if theorem_frontier_full_enabled(config, phase):
             worker_frontier_update = state.get("last_theorem_frontier_worker_update")
-            if not isinstance(worker_frontier_update, dict):
-                raise SupervisorError("No theorem-frontier worker update in state for full-mode reviewer cycle.")
-            paper_review = state.get("last_theorem_frontier_paper_review")
-            nl_proof_review = state.get("last_theorem_frontier_nl_proof_review")
-            if isinstance(worker_frontier_update, dict) and theorem_frontier_requires_paper_verifier(worker_frontier_update):
-                if not (isinstance(paper_review, dict) and int(paper_review.get("cycle", 0) or 0) == cycle):
-                    paper_review = run_theorem_frontier_paper_verifier_review(
+            if isinstance(worker_frontier_update, dict):
+                requested_action = str(worker_frontier_update.get("requested_action") or "").strip().upper()
+                if requested_action in {"CLOSE", "REFACTOR"}:
+                    state["last_theorem_frontier_paper_review"] = None
+                    state["last_theorem_frontier_nl_proof_review"] = None
+                    auto_frontier_result = synthesize_deterministic_frontier_result(
                         config,
                         state,
-                        paper_verifier,
                         phase,
-                        worker_terminal_output,
-                        worker_handoff,
+                        cycle,
                         worker_frontier_update,
-                        cycle=cycle,
-                        policy=policy,
                     )
-                if paper_review.get("decision") in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
-                    if not (isinstance(nl_proof_review, dict) and int(nl_proof_review.get("cycle", 0) or 0) == cycle):
-                        nl_proof_review = run_theorem_frontier_nl_proof_verifier_review(
-                            config,
-                            state,
-                            nl_proof_verifier,
-                            phase,
-                            worker_terminal_output,
-                            worker_handoff,
-                            worker_frontier_update,
-                            paper_review,
-                            cycle=cycle,
-                            policy=policy,
-                        )
+                    close_error = str(auto_frontier_result.get("close_validation_error") or "").strip() if isinstance(auto_frontier_result, dict) else ""
+                    if close_error:
+                        state["last_theorem_frontier_close_validation_error"] = {
+                            "phase": phase,
+                            "cycle": cycle,
+                            "active_node_id": normalize_frontier_text(worker_frontier_update.get("active_node_id")),
+                            "error": close_error,
+                            "recorded_at": timestamp_now(),
+                        }
                 else:
-                    state["last_theorem_frontier_nl_proof_review"] = None
-            else:
-                state["last_theorem_frontier_paper_review"] = None
-                state["last_theorem_frontier_nl_proof_review"] = None
-        print(f"\n===== cycle {cycle}: reviewer | phase={phase} =====")
-        worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
-        reviewer_prompt = build_reviewer_prompt(
-            config,
-            state,
-            phase,
-            worker_terminal_output,
-            worker_handoff_text,
-            validation_summary,
-            reviewer.needs_initial_run(),
-            policy=policy,
-        )
-        reviewer_prompt_for_chat = build_reviewer_prompt(
-            config,
-            state,
-            phase,
-            worker_terminal_output,
-            worker_handoff_text,
-            validation_summary,
-            reviewer.needs_initial_run(),
-            include_terminal_output=False,
-            policy=policy,
-        )
-        record_chat_event(
-            config,
-            state,
-            cycle=cycle,
-            phase=phase,
-            kind="reviewer_prompt",
-            actor="supervisor",
-            target="reviewer",
-            content=reviewer_prompt_for_chat,
-            content_type="text",
-            summary=f"Supervisor -> reviewer prompt for cycle {cycle}",
-        )
-        def _validate_reviewer_burst(run: Dict[str, Any]) -> Dict[str, Any]:
-            output = run["captured_output"].strip()
-            cycle_review_path = reviewer_decision_path(config, cycle)
-            dec = load_json_artifact_with_fallback(
-                cycle_review_path,
-                output,
-                ("phase", "cycle", "decision"),
-                fallback_paths=artifact_fallback_paths(
-                    config,
-                    cycle_review_path,
-                    reviewer_decision_path(config),
-                    Path(run["artifact_path"]),
-                ),
-            )
-            dec = validate_reviewer_decision(phase, cycle, dec)
-            persist_supervisor_artifact(dec, cycle_review_path, reviewer_decision_path(config))
-            reviewer_result = validate_reviewer_cycle_artifacts(
+                    paper_review = state.get("last_theorem_frontier_paper_review")
+                    nl_proof_review = state.get("last_theorem_frontier_nl_proof_review")
+                    if theorem_frontier_requires_paper_verifier(worker_frontier_update):
+                        if not (isinstance(paper_review, dict) and int(paper_review.get("cycle", 0) or 0) == cycle):
+                            paper_review = run_theorem_frontier_paper_verifier_review(
+                                config,
+                                state,
+                                paper_verifier,
+                                phase,
+                                worker_terminal_output,
+                                worker_handoff,
+                                worker_frontier_update,
+                                cycle=cycle,
+                                policy=policy,
+                            )
+                        if paper_review.get("decision") in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
+                            if not (isinstance(nl_proof_review, dict) and int(nl_proof_review.get("cycle", 0) or 0) == cycle):
+                                nl_proof_review = run_theorem_frontier_nl_proof_verifier_review(
+                                    config,
+                                    state,
+                                    nl_proof_verifier,
+                                    phase,
+                                    worker_terminal_output,
+                                    worker_handoff,
+                                    worker_frontier_update,
+                                    paper_review,
+                                    cycle=cycle,
+                                    policy=policy,
+                                )
+                        else:
+                            state["last_theorem_frontier_nl_proof_review"] = None
+                    else:
+                        state["last_theorem_frontier_paper_review"] = None
+                        state["last_theorem_frontier_nl_proof_review"] = None
+                save_state(config, state)
+        reviewer_terminal_output = ""
+        if auto_frontier_result is None:
+            print(f"\n===== cycle {cycle}: reviewer | phase={phase} =====")
+            worker_handoff_text = json.dumps(worker_handoff, indent=2, ensure_ascii=False)
+            reviewer_prompt = build_reviewer_prompt(
                 config,
                 state,
                 phase,
-                cycle,
-                output,
-                dec,
+                worker_terminal_output,
+                worker_handoff_text,
+                validation_summary,
+                reviewer.needs_initial_run(),
+                policy=policy,
             )
-            if theorem_frontier_full_enabled(config, phase):
-                frontier_review = reviewer_result.get("frontier_review")
-                worker_frontier_update = state.get("last_theorem_frontier_worker_update")
-                if not isinstance(worker_frontier_update, dict):
-                    raise SupervisorError("Missing theorem-frontier worker update while validating reviewer application.")
-                if isinstance(frontier_review, dict):
-                    preflight_theorem_frontier_full_state_update(
-                        config,
-                        state,
-                        worker_frontier_update,
-                        frontier_review,
-                        cycle=cycle,
-                    )
-            return reviewer_result
-
-        reviewer_run, reviewer_result = run_burst_with_validation(
-            reviewer,
-            cycle,
-            reviewer_prompt,
-            config=config,
-            state=state,
-            phase=phase,
-            stage_label="reviewer burst",
-            artifact_path=reviewer_decision_path(config, cycle),
-            clear_paths=[
-                reviewer_decision_path(config, cycle),
-                reviewer_decision_path(config),
-                theorem_frontier_review_path(config, cycle),
-                theorem_frontier_review_path(config),
-            ],
-            policy=policy,
-            reuse_existing_window=not is_new_cycle,
-            validate=_validate_reviewer_burst,
-        )
-        reviewer.mark_initialized()
-        reviewer_terminal_output = reviewer_run["captured_output"].strip()
-        decision = reviewer_result["decision"]
-        frontier_review: Optional[Dict[str, Any]] = reviewer_result.get("frontier_review")
-        if theorem_frontier_enabled(config, phase):
-            state["last_theorem_frontier_review"] = frontier_review
-            review_event_content: Union[Dict[str, Any], Any] = frontier_review
-            worker_frontier_update = state.get("last_theorem_frontier_worker_update")
-            if not isinstance(worker_frontier_update, dict):
-                raise SupervisorError("Missing theorem-frontier worker update while applying frontier review.")
-            _dag_before_payload = theorem_frontier_payload(state) or {}
-            _dag_before_node_ids = set((_dag_before_payload.get("nodes") or {}).keys())
-            _dag_before_edge_ids = {
-                f"{str(edge.get('parent', ''))}->{str(edge.get('child', ''))}"
-                for edge in (_dag_before_payload.get("edges") or [])
-                if isinstance(edge, dict) and edge.get("parent") and edge.get("child")
-            }
-            current_frontier = update_theorem_frontier_full_state(
+            reviewer_prompt_for_chat = build_reviewer_prompt(
                 config,
                 state,
-                worker_frontier_update,
-                frontier_review,
-                state.get("last_theorem_frontier_paper_review") if isinstance(state.get("last_theorem_frontier_paper_review"), dict) else None,
-                state.get("last_theorem_frontier_nl_proof_review") if isinstance(state.get("last_theorem_frontier_nl_proof_review"), dict) else None,
-                cycle=cycle,
+                phase,
+                worker_terminal_output,
+                worker_handoff_text,
+                validation_summary,
+                reviewer.needs_initial_run(),
+                include_terminal_output=False,
+                policy=policy,
             )
-            ensure_dag_site(config)
-            export_dag_frontier_snapshot(config, state)
-            export_dag_frontier_cycle(
-                config,
-                state,
-                _dag_before_node_ids,
-                _dag_before_edge_ids,
-                current_frontier,
-                cycle=cycle,
-                outcome=frontier_review.get("outcome", ""),
-                reviewed_node_id=frontier_review.get("active_node_id", ""),
-                worker_directive=worker_directive_summary(state),
-            )
-            export_dag_meta(config, state)
-            metrics = current_frontier.get("metrics") if isinstance(current_frontier, dict) else {}
-            escalation = current_frontier.get("escalation") if isinstance(current_frontier, dict) else {}
-            review_event_content = {
-                **frontier_review,
-                "active_node_id": current_frontier.get("active_node_id"),
-                "active_node_age": (metrics or {}).get("active_node_age"),
-                "blocker_cluster_age": (metrics or {}).get("blocker_cluster_age"),
-                "cone_purity": frontier_review.get("cone_purity"),
-                "escalation_required": bool((escalation or {}).get("required")),
-            }
             record_chat_event(
                 config,
                 state,
                 cycle=cycle,
                 phase=phase,
-                kind="theorem_frontier_review",
-                actor="reviewer",
-                target="supervisor",
-                content=review_event_content,
-                content_type="json",
-            )
-        decision["cycle"] = cycle
-        decision["phase"] = phase
-        state["last_review"] = decision
-        state.setdefault("review_log", []).append(decision)
-        record_chat_event(
-            config,
-            state,
-            cycle=cycle,
-            phase=phase,
-            kind="reviewer_decision",
-            actor="reviewer",
-            target="supervisor",
-            content=decision,
-            content_type="json",
-        )
-        save_state(config, state)
-        append_jsonl(config.state_dir / "review_log.jsonl", decision)
-
-        print("\n===== reviewer decision =====")
-        print(json.dumps(decision, indent=2, ensure_ascii=False))
-
-        decision_value = decision["decision"]
-        if decision_value not in {"ADVANCE_PHASE", "DONE"} and state.get("last_transition_error") is not None:
-            state["last_transition_error"] = None
-            save_state(config, state)
-        try:
-            enforce_terminal_decision(phase, decision_value, validation_summary)
-        except SupervisorError as exc:
-            if decision_value in {"ADVANCE_PHASE", "DONE"}:
-                state["last_transition_error"] = {
-                    "cycle": cycle,
-                    "phase": phase,
-                    "decision": decision_value,
-                    "error": str(exc),
-                    "recorded_at": timestamp_now(),
-                }
-                save_state(config, state)
-                log_supervisor_warning(
-                    config,
-                    cycle=cycle,
-                    phase=phase,
-                    category="transition_blocked",
-                    message=str(exc),
-                    detail={
-                        "decision": decision_value,
-                        "validation_summary_path": str(validation_summary_path(config)),
-                    },
-                )
-                record_chat_event(
-                    config,
-                    state,
-                    cycle=cycle,
-                    phase=phase,
-                    kind="transition_blocked",
-                    actor="supervisor",
-                    target="workflow",
-                    content=state["last_transition_error"],
-                    content_type="json",
-                    summary=f"Blocked {decision_value} from {phase}",
-                )
-                save_state(config, state)
-                print(
-                    f"Phase transition blocked; staying in {phase} and continuing in the current phase: {exc}"
-                )
-                time.sleep(supervisor_sleep_seconds(config, policy))
-                continue
-            raise
-        if state.get("last_transition_error") is not None:
-            state["last_transition_error"] = None
-            save_state(config, state)
-        if should_consider_branching(config, state, phase, decision):
-            preflight_error = branch_episode_preflight_error(config)
-            if preflight_error:
-                print(f"Skipping branch consideration for cycle {cycle}: {preflight_error}.")
-            else:
-                branch_strategy = run_branch_strategy_review(
-                    config,
-                    state,
-                    reviewer,
-                    phase,
-                    decision,
-                    policy=policy,
-                )
-                state["last_branch_consideration_cycle"] = cycle
-                save_state(config, state)
-                print("\n===== branch strategy decision =====")
-                print(json.dumps(branch_strategy, indent=2, ensure_ascii=False))
-                if branch_strategy["branch_decision"] == "BRANCH":
-                    if branching_enabled(config):
-                        episode = create_branch_episode(
-                            config,
-                            state,
-                            phase,
-                            decision,
-                            branch_strategy,
-                            policy=policy,
-                        )
-                        write_completed_cycle_checkpoint(
-                            config,
-                            state,
-                            cycle=cycle,
-                            completed_phase=phase,
-                            decision=decision,
-                            validation_summary=validation_summary,
-                        )
-                        if honor_cycle_boundary_restart_request(
-                            config,
-                            state,
-                            cycle=cycle,
-                            phase=current_phase(config, state),
-                            decision=decision,
-                        ):
-                            break
-                        print(
-                            f"Created branch episode {episode['id']} with {len(episode['branches'])} branch(es). "
-                            "Parent supervisor will monitor child branches until selection."
-                        )
-                        continue
-                    if can_propose_branch_replacement(state, config):
-                        proposal = store_pending_branch_proposal(state, branch_strategy, cycle=cycle)
-                        save_state(config, state)
-                        write_completed_cycle_checkpoint(
-                            config,
-                            state,
-                            cycle=cycle,
-                            completed_phase=phase,
-                            decision=decision,
-                            validation_summary=validation_summary,
-                        )
-                        honor_cycle_boundary_restart_request(
-                            config,
-                            state,
-                            cycle=cycle,
-                            phase=current_phase(config, state),
-                            decision=decision,
-                            already_stopping=True,
-                        )
-                        print(
-                            "Queued a parent-coordinated branch replacement proposal with "
-                            f"{len(proposal.get('strategies', []))} strategy branch(es); "
-                            "stopping this branch supervisor so the parent frontier monitor can evaluate it."
-                        )
-                        break
-        if phase == "proof_formalization" and decision_value != "STUCK" and stuck_recovery_attempts(state):
-            clear_stuck_recovery(state)
-            save_state(config, state)
-        if decision_value == "ADVANCE_PHASE":
-            next_value = next_phase(phase)
-            state.setdefault("phase_history", []).append(
-                {
-                    "cycle": cycle,
-                    "phase": phase,
-                    "decision": decision_value,
-                    "reason": decision.get("reason", ""),
-                }
-            )
-            if next_value is None:
-                print("Reviewer advanced past the final phase; stopping as DONE.")
-                break
-            if (
-                phase == "theorem_stating"
-                and next_value == "proof_formalization"
-                and theorem_frontier_phase(config) == "full"
-            ):
-                manifest = load_validated_paper_main_results_manifest(config)
-                seeded_frontier = seed_theorem_frontier_from_main_results_manifest(
-                    config,
-                    state,
-                    manifest,
-                    cycle=cycle,
-                )
-            state["phase"] = next_value
-            save_state(config, state)
-            if (
-                phase == "theorem_stating"
-                and next_value == "proof_formalization"
-                and theorem_frontier_phase(config) == "full"
-            ):
-                ensure_dag_site(config)
-                export_dag_frontier_snapshot(config, state)
-                export_dag_frontier_seed(config, seeded_frontier, cycle=cycle)
-                export_dag_meta(config, state)
-                record_chat_event(
-                    config,
-                    state,
-                    cycle=cycle,
-                    phase=next_value,
-                    kind="theorem_frontier_seed",
-                    actor="supervisor",
-                    target="workflow",
-                    content={
-                        "initial_active_node_id": seeded_frontier.get("active_node_id"),
-                        "seed_node_ids": sorted(seeded_frontier.get("nodes", {}).keys()),
-                        "seed_edge_count": len(seeded_frontier.get("edges", []) or []),
-                        "source": str(paper_main_results_manifest_path(config)),
-                    },
-                    content_type="json",
-                )
-            if is_style_cleanup_phase(next_value):
-                update_cleanup_last_good_commit(config, state, validation_summary)
-            record_chat_event(
-                config,
-                state,
-                cycle=cycle,
-                phase=next_value,
-                kind="phase_transition",
+                kind="reviewer_prompt",
                 actor="supervisor",
-                target="workflow",
-                content={
-                    "from_phase": phase,
-                    "to_phase": next_value,
-                    "reason": decision.get("reason", ""),
-                },
-                content_type="json",
-            )
-            save_state(config, state)
-            write_completed_cycle_checkpoint(
-                config,
-                state,
-                cycle=cycle,
-                completed_phase=phase,
-                decision=decision,
-                validation_summary=validation_summary,
-            )
-            if honor_cycle_boundary_restart_request(
-                config,
-                state,
-                cycle=cycle,
-                phase=current_phase(config, state),
-                decision=decision,
-            ):
-                break
-            print(f"Advancing workflow phase: {phase} -> {next_value}")
-            time.sleep(supervisor_sleep_seconds(config, policy))
-            continue
-        if decision_value == "NEED_INPUT":
-            write_input_request(config, phase, worker_handoff, decision, validation_summary)
-            state["awaiting_human_input"] = True
-            record_chat_event(
-                config,
-                state,
-                cycle=cycle,
-                phase=phase,
-                kind="input_request",
-                actor="supervisor",
-                target="human",
-                content=read_text(config.workflow.input_request_path).strip(),
+                target="reviewer",
+                content=reviewer_prompt_for_chat,
                 content_type="text",
+                summary=f"Supervisor -> reviewer prompt for cycle {cycle}",
             )
-            save_state(config, state)
-            write_completed_cycle_checkpoint(
-                config,
-                state,
-                cycle=cycle,
-                completed_phase=phase,
-                decision=decision,
-                validation_summary=validation_summary,
-            )
-            honor_cycle_boundary_restart_request(
-                config,
-                state,
-                cycle=cycle,
-                phase=current_phase(config, state),
-                decision=decision,
-                already_stopping=True,
-            )
-            print(f"Stopping because reviewer requested human input. See {config.workflow.input_request_path}")
-            break
-        if decision_value == "STUCK":
-            if is_style_cleanup_phase(phase):
-                restore_cleanup_last_good_commit(
+            def _validate_reviewer_burst(run: Dict[str, Any]) -> Dict[str, Any]:
+                output = run["captured_output"].strip()
+                cycle_review_path = reviewer_decision_path(config, cycle)
+                dec = load_json_artifact_with_fallback(
+                    cycle_review_path,
+                    output,
+                    ("phase", "cycle", "decision"),
+                    fallback_paths=artifact_fallback_paths(
+                        config,
+                        cycle_review_path,
+                        reviewer_decision_path(config),
+                        Path(run["artifact_path"]),
+                    ),
+                )
+                dec = validate_reviewer_decision(phase, cycle, dec)
+                persist_supervisor_artifact(dec, cycle_review_path, reviewer_decision_path(config))
+                reviewer_result = validate_reviewer_cycle_artifacts(
                     config,
                     state,
-                    cycle=cycle,
-                    reason="cleanup reviewer decided the optional cleanup phase had stalled",
+                    phase,
+                    cycle,
+                    output,
+                    dec,
                 )
-                write_completed_cycle_checkpoint(
-                    config,
-                    state,
-                    cycle=cycle,
-                    completed_phase=phase,
-                    decision=decision,
-                    validation_summary=state.get("last_validation") if isinstance(state.get("last_validation"), dict) else validation_summary,
-                )
-                honor_cycle_boundary_restart_request(
-                    config,
-                    state,
-                    cycle=cycle,
-                    phase=current_phase(config, state),
-                    decision=decision,
-                    already_stopping=True,
-                )
-                print("Cleanup reviewer returned STUCK; restored last good commit and stopping as DONE.")
-                break
-            if can_attempt_stuck_recovery(state, policy):
-                suggestion = run_stuck_recovery_review(config, state, reviewer, phase, policy=policy)
-                attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
-                write_completed_cycle_checkpoint(
-                    config,
-                    state,
-                    cycle=cycle,
-                    completed_phase=phase,
-                    decision=decision,
-                    validation_summary=validation_summary,
-                )
-                if honor_cycle_boundary_restart_request(
-                    config,
-                    state,
-                    cycle=cycle,
-                    phase=current_phase(config, state),
-                    decision=decision,
-                ):
-                    break
-                print(
-                    f"Reviewer returned STUCK; queued stuck-recovery attempt "
-                    f"{suggestion['attempt']}/{attempt_limit}."
-                )
-                time.sleep(supervisor_sleep_seconds(config, policy))
-                continue
-            attempt_limit = stuck_recovery_attempt_limit(state, policy=policy)
-            write_completed_cycle_checkpoint(
-                config,
-                state,
-                cycle=cycle,
-                completed_phase=phase,
-                decision=decision,
-                validation_summary=validation_summary,
-            )
-            honor_cycle_boundary_restart_request(
-                config,
-                state,
-                cycle=cycle,
-                phase=current_phase(config, state),
-                decision=decision,
-                already_stopping=True,
-            )
-            print(
-                "Stopping because reviewer returned STUCK after exhausting "
-                f"{attempt_limit} stuck-recovery attempts."
-            )
-            break
-        if decision_value == "DONE":
-            if is_style_cleanup_phase(phase):
-                update_cleanup_last_good_commit(config, state, validation_summary)
-                save_state(config, state)
-            write_completed_cycle_checkpoint(
-                config,
-                state,
-                cycle=cycle,
-                completed_phase=phase,
-                decision=decision,
-                validation_summary=state.get("last_validation") if isinstance(state.get("last_validation"), dict) else validation_summary,
-            )
-            honor_cycle_boundary_restart_request(
-                config,
-                state,
-                cycle=cycle,
-                phase=current_phase(config, state),
-                decision=decision,
-                already_stopping=True,
-            )
-            print("Stopping because reviewer returned DONE.")
-            break
+                if theorem_frontier_full_enabled(config, phase):
+                    frontier_review = reviewer_result.get("frontier_review")
+                    worker_frontier_update = state.get("last_theorem_frontier_worker_update")
+                    if not isinstance(worker_frontier_update, dict):
+                        raise SupervisorError("Missing theorem-frontier worker update while validating reviewer application.")
+                    if theorem_frontier_review_requires_admission_preflight(frontier_review):
+                        preflight_theorem_frontier_full_state_update(
+                            config,
+                            state,
+                            worker_frontier_update,
+                            frontier_review,
+                            cycle=cycle,
+                        )
+                return reviewer_result
 
-        write_completed_cycle_checkpoint(
+            reviewer_run, reviewer_result = run_burst_with_validation(
+                reviewer,
+                cycle,
+                reviewer_prompt,
+                config=config,
+                state=state,
+                phase=phase,
+                stage_label="reviewer burst",
+                artifact_path=reviewer_decision_path(config, cycle),
+                clear_paths=[
+                    reviewer_decision_path(config, cycle),
+                    reviewer_decision_path(config),
+                    theorem_frontier_review_path(config, cycle),
+                    theorem_frontier_review_path(config),
+                ],
+                policy=policy,
+                reuse_existing_window=not is_new_cycle,
+                validate=_validate_reviewer_burst,
+            )
+            reviewer.mark_initialized()
+            reviewer_terminal_output = reviewer_run["captured_output"].strip()
+        else:
+            reviewer_result = auto_frontier_result
+            decision_path = reviewer_decision_path(config, cycle)
+            frontier_path = theorem_frontier_review_path(config, cycle)
+            persist_supervisor_artifact(reviewer_result["decision"], decision_path, reviewer_decision_path(config))
+            persist_supervisor_artifact(reviewer_result["frontier_review"], frontier_path, theorem_frontier_review_path(config))
+            auto_action = normalize_frontier_text(reviewer_result["frontier_review"].get("assessed_action"))
+            record_chat_event(
+                config,
+                state,
+                cycle=cycle,
+                phase=phase,
+                kind="reviewer_prompt",
+                actor="supervisor",
+                target="reviewer",
+                content=f"Supervisor auto-resolved this {auto_action or 'theorem-frontier'} cycle deterministically from the generated frontier checks.",
+                content_type="text",
+                summary=f"Supervisor auto-resolved {auto_action or 'theorem-frontier'} for cycle {cycle}",
+            )
+        if finalize_reviewer_cycle(
             config,
             state,
-            cycle=cycle,
-            completed_phase=phase,
-            decision=decision,
-            validation_summary=validation_summary,
-        )
-        if honor_cycle_boundary_restart_request(
-            config,
-            state,
-            cycle=cycle,
-            phase=current_phase(config, state),
-            decision=decision,
+            reviewer,
+            phase,
+            cycle,
+            reviewer_result,
+            validation_summary,
+            policy,
         ):
             break
-        time.sleep(supervisor_sleep_seconds(config, policy))
+        continue
 
     return 0
 

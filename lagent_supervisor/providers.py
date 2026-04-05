@@ -19,6 +19,9 @@ class ProviderAdapter:
     def scope_dir(self) -> Path:
         return role_scope_dir(self.config, self.cfg.provider, self.role)
 
+    def scope_resume_marker(self) -> Path:
+        return self.scope_dir() / ".provider-session-ready"
+
     def work_dir(self) -> Path:
         return self.scope_dir()
 
@@ -26,10 +29,15 @@ class ProviderAdapter:
         return {}
 
     def needs_initial_run(self) -> bool:
-        return not bool(self.role_state().get("initialized"))
+        role_state = self.role_state()
+        if not bool(role_state.get("initialized")):
+            return True
+        return not self.scope_resume_marker().exists()
 
     def mark_initialized(self) -> None:
-        self.role_state()["initialized"] = True
+        role_state = self.role_state()
+        role_state["initialized"] = True
+        self.scope_resume_marker().touch()
 
     def build_initial_command(self) -> List[str]:
         raise NotImplementedError
@@ -185,5 +193,3 @@ def make_adapter(role: str, config: Config, state: Dict[str, Any]) -> ProviderAd
     if cfg.provider == "gemini":
         return GeminiAdapter(cfg, role, config, state)
     raise AssertionError(cfg.provider)
-
-

@@ -4,11 +4,26 @@ from lagent_supervisor.shared import *
 from lagent_supervisor.storage import JsonFile, append_jsonl
 from lagent_supervisor.frontier import (
     load_validated_paper_main_results_manifest,
+    normalize_frontier_text,
     normalize_repo_relative_path,
     normalize_repo_relative_path_list,
+    theorem_frontier_payload,
+    theorem_frontier_node_children,
 )
 
 EXCLUDED_REPO_DIRS = {".git", ".lake", "build", "lake-packages", ".agent-supervisor"}
+
+
+class ValidationRoutingError(SupervisorError):
+    retry_role = "fatal"
+
+
+class WorkerFixableValidationError(ValidationRoutingError):
+    retry_role = "worker"
+
+
+class ReviewerFixableValidationError(ValidationRoutingError):
+    retry_role = "reviewer"
 
 def approved_axioms(config: Config) -> List[str]:
     raw = JsonFile.load(config.workflow.approved_axioms_path, {"approved_axioms": []})
@@ -221,6 +236,65 @@ def apply_theorem_frontier_cone_file_guard(
     return result
 
 
+def validate_theorem_frontier_generated_edit_policy(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    worker_update: Optional[Dict[str, Any]],
+    validation_summary: Dict[str, Any],
+) -> None:
+    if not theorem_frontier_full_enabled(config, phase) or not isinstance(worker_update, dict):
+        return
+    action = str(worker_update.get("requested_action") or "").strip().upper()
+    if action not in {"CLOSE", "REFACTOR"}:
+        return
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return
+    active_node_id = normalize_frontier_text(worker_update.get("active_node_id") or payload.get("active_node_id"))
+    if not active_node_id:
+        return
+    proof_rel = repo_relative_path(config, theorem_frontier_generated_proof_path(config, active_node_id))
+    statements_rel = repo_relative_path(config, theorem_frontier_generated_statements_path(config))
+    generated_proofs_prefix = theorem_frontier_generated_proofs_dir(config).relative_to(config.repo_path).as_posix() + "/"
+    allowed = normalize_repo_relative_path_list(
+        worker_update.get("allowed_edit_paths"),
+        label="theorem frontier worker update allowed_edit_paths",
+        required_suffix=".lean",
+        allow_empty=True,
+    )
+    cone = validation_summary.get("theorem_frontier_cone_files")
+    changed = cone.get("changed_lean_files") if isinstance(cone, dict) and isinstance(cone.get("changed_lean_files"), list) else []
+
+    if action == "CLOSE":
+        if allowed != [proof_rel]:
+            raise WorkerFixableValidationError(
+                f"Theorem-frontier CLOSE cycles may edit only `{proof_rel}`. "
+                f"Set allowed_edit_paths to exactly [{proof_rel!r}] and keep all other Lean files frozen."
+            )
+        unexpected = [path for path in changed if path != proof_rel]
+        if unexpected:
+            raise WorkerFixableValidationError(
+                f"Theorem-frontier CLOSE cycles may change only `{proof_rel}`; found additional Lean edits {unexpected!r}."
+            )
+        return
+
+    if proof_rel not in allowed:
+        raise WorkerFixableValidationError(
+            f"Theorem-frontier REFACTOR cycles must include the active generated proof file `{proof_rel}` in allowed_edit_paths."
+        )
+    forbidden = [
+        path
+        for path in changed
+        if path == statements_rel or (path.startswith(generated_proofs_prefix) and path != proof_rel)
+    ]
+    if forbidden:
+        raise WorkerFixableValidationError(
+            "Theorem-frontier REFACTOR cycles must keep generated statements frozen and may edit only the active node's "
+            f"generated proof file inside `{generated_proofs_prefix}`; found forbidden Lean edits {forbidden!r}."
+        )
+
+
 def validation_summary_path(config: Config) -> Path:
     return config.state_dir / "validation_summary.json"
 
@@ -266,6 +340,449 @@ def repo_lean_files(config: Config) -> List[Path]:
             if filename.endswith(".lean"):
                 results.append(Path(current_root) / filename)
     return sorted(results)
+
+
+def normalize_lean_source_text(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def lean_module_name_for_path(config: Config, path: Path) -> str:
+    rel = path.relative_to(config.repo_path).with_suffix("")
+    return ".".join(rel.parts)
+
+
+def collect_repo_lean_declarations(config: Config) -> Dict[str, Dict[str, Any]]:
+    namespace_pattern = re.compile(r"^\s*namespace\s+([A-Za-z0-9_'.]+)\s*$")
+    section_pattern = re.compile(r"^\s*section(?:\s+([A-Za-z0-9_'.]+))?\s*$")
+    end_pattern = re.compile(r"^\s*end(?:\s+([A-Za-z0-9_'.]+))?\s*$")
+    decl_pattern = re.compile(
+        r"^\s*(?:@[^\n]+\s+)*"
+        r"(?:(?:private|protected|noncomputable|unsafe|partial|scoped|mutual)\s+)*"
+        r"(def|abbrev|theorem|lemma|axiom|constant|opaque)\s+([A-Za-z0-9_'.]+)"
+    )
+    declarations: Dict[str, Dict[str, Any]] = {}
+    for path in repo_lean_files(config):
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+        masked_lines = _mask_lean_comments_and_strings(raw_text).splitlines()
+        namespace_parts: List[str] = []
+        frames: List[Tuple[str, int]] = []
+        for lineno, masked_line in enumerate(masked_lines, start=1):
+            namespace_match = namespace_pattern.match(masked_line)
+            if namespace_match:
+                parts = [part for part in namespace_match.group(1).split(".") if part]
+                namespace_parts.extend(parts)
+                frames.append(("namespace", len(parts)))
+                continue
+            if section_pattern.match(masked_line):
+                frames.append(("section", 0))
+                continue
+            end_match = end_pattern.match(masked_line)
+            if end_match:
+                if frames:
+                    kind, count = frames.pop()
+                    if kind == "namespace" and count > 0:
+                        del namespace_parts[-count:]
+                continue
+            decl_match = decl_pattern.match(masked_line)
+            if not decl_match:
+                continue
+            kind, raw_name = decl_match.groups()
+            if raw_name.startswith("_root_."):
+                full_name = raw_name[len("_root_.") :]
+            else:
+                pieces = [part for part in raw_name.split(".") if part]
+                full_name = ".".join([*namespace_parts, *pieces]) if namespace_parts else ".".join(pieces)
+            if not full_name:
+                continue
+            declarations[full_name] = {
+                "name": full_name,
+                "kind": kind,
+                "path": path,
+                "module": lean_module_name_for_path(config, path),
+                "line": lineno,
+            }
+    return declarations
+
+
+def theorem_frontier_statement_binding(
+    config: Config,
+    node: Dict[str, Any],
+    declaration_index: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    node_id = str(node.get("node_id") or "").strip() or "<unknown>"
+    anchor = normalize_frontier_text(node.get("lean_anchor"))
+    if not anchor:
+        raise SupervisorError(f"Theorem-frontier node {node_id!r} is missing lean_anchor.")
+    declaration = declaration_index.get(anchor)
+    if not isinstance(declaration, dict):
+        raise SupervisorError(
+            f"Theorem-frontier node {node_id!r} names missing Lean statement anchor {anchor!r}."
+        )
+    source_text = normalize_lean_source_text(read_text(Path(declaration["path"])))
+    expected_text = normalize_lean_source_text(node.get("lean_statement"))
+    if expected_text not in source_text:
+        raise SupervisorError(
+            f"Theorem-frontier node {node_id!r} has lean_statement text that does not appear in "
+            f"{relative_repo_label(config, Path(declaration['path']))} for anchor {anchor!r}."
+        )
+    return declaration
+
+
+def theorem_frontier_proof_check_path(config: Config, label: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label.strip() or "node")
+    return config.state_dir / "lean-frontier-checks" / f"{safe}.lean"
+
+
+_LEAN_DECL_RE = re.compile(
+    r"^\s*(?:@[^\n]+\s+)*"
+    r"(?:(?:private|protected|noncomputable|unsafe|partial|scoped|mutual)\s+)*"
+    r"(def|abbrev|theorem|lemma|axiom|constant|opaque)\s+([A-Za-z0-9_'.]+)"
+)
+_GENERATED_PROOF_SIGNATURE_RE = re.compile(r"frontier-signature:\s*([0-9a-f]{64})")
+
+
+def theorem_frontier_generated_statement_info(config: Config, node: Dict[str, Any]) -> Dict[str, str]:
+    node_id = normalize_frontier_text(node.get("node_id")) or "<unknown>"
+    statement_text = str(node.get("lean_statement") or "").strip()
+    match = _LEAN_DECL_RE.search(statement_text)
+    if not match:
+        raise SupervisorError(
+            f"Theorem-frontier node {node_id!r} has lean_statement that is not a standalone Lean declaration."
+        )
+    declaration_name = match.group(2).split(".")[-1]
+    slug = theorem_frontier_generated_node_slug(node_id)
+    module_root = theorem_frontier_generated_module_root(config)
+    statement_anchor = f"{module_root}.Statements.{slug}.{declaration_name}"
+    proof_module = f"{module_root}.Proofs.{slug}"
+    proof_anchor = f"{proof_module}.prove_from_children"
+    return {
+        "node_id": node_id,
+        "slug": slug,
+        "declaration_name": declaration_name,
+        "statement_anchor": statement_anchor,
+        "proof_module": proof_module,
+        "proof_anchor": proof_anchor,
+    }
+
+
+def _namespace_open_lines(parts: Sequence[str]) -> List[str]:
+    return [f"namespace {part}" for part in parts if part]
+
+
+def _namespace_close_lines(parts: Sequence[str]) -> List[str]:
+    return [f"end {part}" for part in reversed([part for part in parts if part])]
+
+
+def _generated_frontier_import_modules(config: Config) -> List[str]:
+    modules: List[str] = []
+    generated_root = theorem_frontier_generated_dir(config).resolve()
+    for path in repo_lean_files(config):
+        try:
+            path.resolve().relative_to(generated_root)
+            continue
+        except ValueError:
+            pass
+        modules.append(lean_module_name_for_path(config, path))
+    return sorted(dict.fromkeys(modules))
+
+
+def theorem_frontier_generated_proof_signature(
+    config: Config,
+    node: Dict[str, Any],
+    child_nodes: Sequence[Dict[str, Any]],
+) -> str:
+    info = theorem_frontier_generated_statement_info(config, node)
+    child_infos = [theorem_frontier_generated_statement_info(config, child) for child in child_nodes]
+    payload = {
+        "statement_anchor": info["statement_anchor"],
+        "child_statement_anchors": [entry["statement_anchor"] for entry in child_infos],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def theorem_frontier_generated_statements_source(config: Config, nodes: Dict[str, Dict[str, Any]]) -> str:
+    imports = _generated_frontier_import_modules(config)
+    lines: List[str] = [*(f"import {module}" for module in imports), ""]
+    namespace_parts = theorem_frontier_generated_module_root(config).split(".") + ["Statements"]
+    lines.extend([*_namespace_open_lines(namespace_parts), ""])
+    for node_id in sorted(nodes):
+        node = nodes[node_id]
+        if not isinstance(node, dict):
+            continue
+        info = theorem_frontier_generated_statement_info(config, node)
+        statement_text = str(node.get("lean_statement") or "").strip()
+        lines.extend(
+            [
+                f"namespace {info['slug']}",
+                "",
+                statement_text,
+                "",
+                f"end {info['slug']}",
+                "",
+            ]
+        )
+    lines.extend([*_namespace_close_lines(namespace_parts), ""])
+    return "\n".join(lines)
+
+
+def theorem_frontier_generated_proof_scaffold(
+    config: Config,
+    node: Dict[str, Any],
+    child_nodes: Sequence[Dict[str, Any]],
+) -> str:
+    info = theorem_frontier_generated_statement_info(config, node)
+    signature = theorem_frontier_generated_proof_signature(config, node, child_nodes)
+    child_infos = [theorem_frontier_generated_statement_info(config, child) for child in child_nodes]
+    theorem_lines = ["theorem prove_from_children"]
+    for index, child_info in enumerate(child_infos):
+        theorem_lines.append(f"  (h{index} : _root_.{child_info['statement_anchor']})")
+    theorem_lines.append(f"  : _root_.{info['statement_anchor']} := by")
+    theorem_lines.append("  ...")
+    theorem_block = "\n".join(theorem_lines)
+    namespace_parts = theorem_frontier_generated_module_root(config).split(".") + ["Proofs", info["slug"]]
+    return "\n".join(
+        [
+            f"import {theorem_frontier_generated_module_root(config)}.Statements",
+            "",
+            *_namespace_open_lines(namespace_parts),
+            "",
+            f"/- frontier-signature: {signature} -/",
+            "/-",
+            "Fill in the required theorem below and keep its name and type exact.",
+            "",
+            theorem_block,
+            "-/",
+            "",
+            *_namespace_close_lines(namespace_parts),
+            "",
+        ]
+    )
+
+
+def sync_theorem_frontier_generated_files(
+    config: Config,
+    state: Dict[str, Any],
+    *,
+    ensure_active_proof: bool = True,
+    ensure_proof_node_ids: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return {}
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    if not isinstance(nodes, dict) or not isinstance(edges, list):
+        return {}
+    statements_path = theorem_frontier_generated_statements_path(config)
+    statements_path.parent.mkdir(parents=True, exist_ok=True)
+    statements_path.write_text(theorem_frontier_generated_statements_source(config, nodes), encoding="utf-8")
+
+    active_node_id = normalize_frontier_text(payload.get("active_node_id"))
+    proof_node_ids: List[str] = []
+    seen_proof_node_ids: Set[str] = set()
+
+    def _queue_proof_node(node_id: str) -> None:
+        normalized = normalize_frontier_text(node_id)
+        if not normalized or normalized in seen_proof_node_ids:
+            return
+        if normalized not in nodes or not isinstance(nodes[normalized], dict):
+            return
+        seen_proof_node_ids.add(normalized)
+        proof_node_ids.append(normalized)
+
+    if ensure_active_proof:
+        _queue_proof_node(active_node_id)
+    for raw_node_id in ensure_proof_node_ids or ():
+        _queue_proof_node(str(raw_node_id))
+
+    proof_paths_by_node_id: Dict[str, str] = {}
+    proof_anchors_by_node_id: Dict[str, str] = {}
+    for proof_node_id in proof_node_ids:
+        proof_node = nodes[proof_node_id]
+        child_nodes = [
+            nodes[child_id]
+            for child_id in theorem_frontier_node_children(nodes, edges, proof_node_id)
+            if child_id in nodes and isinstance(nodes[child_id], dict)
+        ]
+        proof_path = theorem_frontier_generated_proof_path(config, proof_node_id)
+        proof_path.parent.mkdir(parents=True, exist_ok=True)
+        scaffold = theorem_frontier_generated_proof_scaffold(config, proof_node, child_nodes)
+        existing = proof_path.read_text(encoding="utf-8", errors="replace") if proof_path.exists() else ""
+        expected_signature = theorem_frontier_generated_proof_signature(config, proof_node, child_nodes)
+        match = _GENERATED_PROOF_SIGNATURE_RE.search(existing)
+        if match is None or match.group(1) != expected_signature:
+            proof_path.write_text(scaffold, encoding="utf-8")
+        info = theorem_frontier_generated_statement_info(config, proof_node)
+        proof_paths_by_node_id[proof_node_id] = relative_repo_label(config, proof_path)
+        proof_anchors_by_node_id[proof_node_id] = info["proof_anchor"]
+
+    active_proof_path = proof_paths_by_node_id.get(active_node_id, "")
+    active_proof_anchor = proof_anchors_by_node_id.get(active_node_id, "")
+    return {
+        "statements_path": relative_repo_label(config, statements_path),
+        "active_proof_path": active_proof_path,
+        "active_proof_anchor": active_proof_anchor,
+        "proof_paths_by_node_id": proof_paths_by_node_id,
+    }
+
+
+def validate_theorem_frontier_generated_local_proof(
+    config: Config,
+    node: Dict[str, Any],
+    child_nodes: Sequence[Dict[str, Any]],
+    *,
+    label: str,
+) -> Dict[str, Any]:
+    info = theorem_frontier_generated_statement_info(config, node)
+    child_infos = [theorem_frontier_generated_statement_info(config, child) for child in child_nodes]
+    proof_path = theorem_frontier_generated_proof_path(config, info["node_id"])
+    if not proof_path.exists():
+        raise SupervisorError(
+            f"Theorem-frontier generated proof file is missing for {info['node_id']!r}: {relative_repo_label(config, proof_path)}"
+        )
+    imports = [f"{theorem_frontier_generated_module_root(config)}.Statements", info["proof_module"]]
+    binders = [f"(h{index} : _root_.{child_info['statement_anchor']})" for index, child_info in enumerate(child_infos)]
+    args = " ".join(f"h{index}" for index in range(len(child_infos)))
+    exact_line = f"  exact _root_.{info['proof_anchor']}" if not args else f"  exact _root_.{info['proof_anchor']} {args}"
+    proof_source = "\n".join(
+        [
+            *[f"import {module}" for module in imports],
+            "",
+            f"example {' '.join(binders)} : _root_.{info['statement_anchor']} := by",
+            exact_line,
+            "",
+        ]
+    )
+    check_path = theorem_frontier_proof_check_path(config, label)
+    check_path.parent.mkdir(parents=True, exist_ok=True)
+    check_path.write_text(proof_source, encoding="utf-8")
+    result = run_command(["lake", "env", "lean", str(check_path.relative_to(config.repo_path))], cwd=config.repo_path)
+    if not result["ok"]:
+        raise SupervisorError(
+            "Theorem-frontier generated proof check failed for "
+            f"{info['node_id']!r} via {info['proof_anchor']!r}: {trim_text(result['output'], 4000)}"
+        )
+    return {
+        "node_id": info["node_id"],
+        "statement_anchor": info["statement_anchor"],
+        "proof_anchor": info["proof_anchor"],
+        "imports": imports,
+        "proof_path": relative_repo_label(config, proof_path),
+        "check_path": relative_repo_label(config, check_path),
+        "child_statement_anchors": [entry["statement_anchor"] for entry in child_infos],
+    }
+
+
+def verify_theorem_frontier_close_attempt(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+    *,
+    label: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not theorem_frontier_full_enabled(config, phase):
+        raise SupervisorError("Theorem-frontier CLOSE verification is only available in full theorem-frontier mode.")
+    if str(worker_update.get("requested_action") or "").strip().upper() != "CLOSE":
+        raise SupervisorError("Theorem-frontier CLOSE verification requires requested_action = 'CLOSE'.")
+
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        raise SupervisorError("Missing theorem-frontier payload in state.")
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    if not isinstance(nodes, dict) or not isinstance(edges, list):
+        raise SupervisorError("Theorem-frontier payload is missing node/edge data.")
+    active_node_id = normalize_frontier_text(worker_update.get("active_node_id"))
+    generated = sync_theorem_frontier_generated_files(
+        config,
+        state,
+        ensure_active_proof=False,
+        ensure_proof_node_ids=[active_node_id],
+    )
+
+    active_node = nodes.get(active_node_id) if active_node_id else None
+    if not isinstance(active_node, dict):
+        raise SupervisorError(
+            f"Theorem-frontier CLOSE verification requires an authoritative active node, got {active_node_id!r}."
+        )
+    child_nodes = [
+        nodes[child_id]
+        for child_id in theorem_frontier_node_children(nodes, edges, active_node_id)
+        if child_id in nodes and isinstance(nodes[child_id], dict)
+    ]
+    proof_check = validate_theorem_frontier_generated_local_proof(
+        config,
+        active_node,
+        child_nodes,
+        label=label or f"cycle-{cycle:04d}-{active_node_id.replace('.', '-')}",
+    )
+    return {
+        "phase": phase,
+        "cycle": int(cycle),
+        "active_node_id": active_node_id,
+        "statement_anchor": proof_check["statement_anchor"],
+        "proof_anchor": proof_check["proof_anchor"],
+        "proof_module": theorem_frontier_generated_statement_info(config, active_node)["proof_module"],
+        "child_node_ids": [str(child.get("node_id") or "") for child in child_nodes],
+        "child_statement_anchors": list(proof_check["child_statement_anchors"]),
+        "check_path": proof_check["check_path"],
+        "imports": list(proof_check["imports"]),
+        "statements_path": str(generated.get("statements_path") or ""),
+        "proof_path": str(proof_check["proof_path"] or ""),
+    }
+
+
+def verify_theorem_frontier_refactor_attempt(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    worker_update: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not theorem_frontier_full_enabled(config, phase):
+        raise SupervisorError("Theorem-frontier REFACTOR verification is only available in full theorem-frontier mode.")
+    if str(worker_update.get("requested_action") or "").strip().upper() != "REFACTOR":
+        raise SupervisorError("Theorem-frontier REFACTOR verification requires requested_action = 'REFACTOR'.")
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        raise SupervisorError("Missing theorem-frontier payload in state.")
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    if not isinstance(nodes, dict) or not isinstance(edges, list):
+        raise SupervisorError("Theorem-frontier payload is missing node/edge data.")
+    proved_node_ids = sorted(
+        node_id
+        for node_id, node in nodes.items()
+        if isinstance(node, dict) and str(node.get("lean_proof_status") or "").strip().lower() == "proved"
+    )
+    generated = sync_theorem_frontier_generated_files(
+        config,
+        state,
+        ensure_active_proof=True,
+        ensure_proof_node_ids=proved_node_ids,
+    )
+    for node_id in proved_node_ids:
+        child_nodes = [
+            nodes[child_id]
+            for child_id in theorem_frontier_node_children(nodes, edges, node_id)
+            if child_id in nodes and isinstance(nodes[child_id], dict)
+        ]
+        validate_theorem_frontier_generated_local_proof(
+            config,
+            nodes[node_id],
+            child_nodes,
+            label=f"refactor-{cycle:04d}-{node_id.replace('.', '-')}",
+        )
+    return {
+        "phase": phase,
+        "cycle": int(cycle),
+        "active_node_id": normalize_frontier_text(payload.get("active_node_id")),
+        "proved_node_ids": proved_node_ids,
+        "statements_path": str(generated.get("statements_path") or ""),
+        "active_proof_path": str(generated.get("active_proof_path") or ""),
+    }
 
 
 def run_command(command: Sequence[str], cwd: Path) -> Dict[str, Any]:

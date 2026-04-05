@@ -8,6 +8,15 @@ from lagent_supervisor.storage import JsonFile, append_jsonl
 
 _BACKTICK_REF_RE = re.compile(r"`([^`]+)`")
 _PAPER_LABEL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]*:[A-Za-z0-9_.-]+\b")
+_PLACEHOLDER_PROOF_PHRASES: Tuple[str, ...] = (
+    "leaf of the current coarse dag",
+    "direct statement target",
+    "proved directly at the coarse paper level",
+    "attacked directly from its current empty child set",
+    "attacked directly in the coarse paper dag",
+    "attacked directly for now",
+    "the current active proof target",
+)
 
 
 def _reject_pipe(text: str, *, label: str) -> None:
@@ -111,6 +120,14 @@ def theorem_frontier_node_kind(value: Any) -> str:
 
 def theorem_frontier_node_status(value: Any) -> str:
     return normalize_frontier_enum(value, THEOREM_FRONTIER_NODE_STATUSES, label="theorem frontier node status")
+
+
+def theorem_frontier_node_lean_proof_status(value: Any) -> str:
+    return normalize_frontier_enum(
+        value,
+        THEOREM_FRONTIER_LEAN_PROOF_STATUSES,
+        label="theorem frontier node lean_proof_status",
+    )
 
 
 def theorem_frontier_paper_decision(value: Any) -> str:
@@ -260,6 +277,111 @@ def theorem_frontier_node_parents(
     )
 
 
+def theorem_frontier_node_depth(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+    memo: Optional[Dict[str, int]] = None,
+) -> int:
+    if memo is None:
+        memo = {}
+    if node_id in memo:
+        return memo[node_id]
+    parents = theorem_frontier_node_parents(nodes, edges, node_id)
+    if not parents:
+        memo[node_id] = 0
+        return 0
+    depth = 1 + max(theorem_frontier_node_depth(nodes, edges, parent_id, memo) for parent_id in parents)
+    memo[node_id] = depth
+    return depth
+
+
+def theorem_frontier_can_activate_node(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+) -> bool:
+    normalized = normalize_frontier_text(node_id)
+    if not normalized:
+        return False
+    node = nodes.get(normalized)
+    if not isinstance(node, dict):
+        return False
+    raw_status = str(node.get("status") or "open")
+    if raw_status in {"refuted", "replaced", "frozen", "proposed"}:
+        return False
+    return theorem_frontier_effective_node_status(nodes, edges, normalized) in {"open", "active"}
+
+
+def theorem_frontier_ancestor_ids(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    node_id: str,
+) -> List[str]:
+    normalized = normalize_frontier_text(node_id)
+    if not normalized or normalized not in nodes:
+        return []
+    ordered: List[str] = []
+    queue = list(theorem_frontier_node_parents(nodes, edges, normalized))
+    seen: Set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        ordered.append(current)
+        queue.extend(theorem_frontier_node_parents(nodes, edges, current))
+    return ordered
+
+
+def ranked_open_theorem_frontier_node_ids(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+) -> List[str]:
+    depth_memo: Dict[str, int] = {}
+    candidates = [
+        node_id
+        for node_id in nodes
+        if theorem_frontier_can_activate_node(nodes, edges, node_id)
+    ]
+    return sorted(
+        candidates,
+        key=lambda node_id: (-theorem_frontier_node_depth(nodes, edges, node_id, depth_memo), node_id),
+    )
+
+
+def resolve_theorem_frontier_next_active_node_id(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    *,
+    preferred_node_ids: Sequence[str] = (),
+    anchor_node_ids: Sequence[str] = (),
+) -> str:
+    seen_preferred: Set[str] = set()
+    for node_id in preferred_node_ids:
+        normalized = normalize_frontier_text(node_id)
+        if not normalized or normalized in seen_preferred:
+            continue
+        seen_preferred.add(normalized)
+        if theorem_frontier_can_activate_node(nodes, edges, normalized):
+            return normalized
+
+    seen_ancestors: Set[str] = set()
+    for anchor_id in anchor_node_ids:
+        normalized_anchor = normalize_frontier_text(anchor_id)
+        if not normalized_anchor:
+            continue
+        for ancestor_id in theorem_frontier_ancestor_ids(nodes, edges, normalized_anchor):
+            if ancestor_id in seen_ancestors:
+                continue
+            seen_ancestors.add(ancestor_id)
+            if theorem_frontier_can_activate_node(nodes, edges, ancestor_id):
+                return ancestor_id
+
+    ranked = ranked_open_theorem_frontier_node_ids(nodes, edges)
+    return ranked[0] if ranked else ""
+
+
 def _proof_backticked_refs(text: str) -> Set[str]:
     return {
         normalize_frontier_text(match.group(1))
@@ -270,6 +392,11 @@ def _proof_backticked_refs(text: str) -> Set[str]:
 
 def _paper_label_refs(text: str) -> Set[str]:
     return {match.group(0).lower() for match in _PAPER_LABEL_RE.finditer(str(text or ""))}
+
+
+def _placeholder_proof_hits(text: str) -> List[str]:
+    lowered = normalize_frontier_text(text).lower()
+    return [phrase for phrase in _PLACEHOLDER_PROOF_PHRASES if phrase in lowered]
 
 
 def _assert_local_node_proof(
@@ -292,12 +419,6 @@ def _assert_local_node_proof(
             f"{context_label} node {node_id!r} natural_language_proof may cite only itself and its current children; "
             f"found out-of-scope node refs {extraneous_node_refs!r}."
         )
-    missing_child_refs = sorted(child_id for child_id in children if child_id not in proof_refs)
-    if missing_child_refs:
-        raise SupervisorError(
-            f"{context_label} node {node_id!r} natural_language_proof must explicitly cite every current child node id "
-            f"in backticks; missing {missing_child_refs!r}."
-        )
     allowed_labels = set(_paper_label_refs(node.get("paper_provenance")))
     for child_id in children:
         allowed_labels.update(_paper_label_refs(nodes[child_id].get("paper_provenance")))
@@ -306,6 +427,12 @@ def _assert_local_node_proof(
         raise SupervisorError(
             f"{context_label} node {node_id!r} natural_language_proof cites paper labels not represented by the node "
             f"or its current children: {extra_labels!r}. Add those dependencies as child nodes or refactor the proof."
+        )
+    placeholder_hits = _placeholder_proof_hits(proof)
+    if placeholder_hits:
+        raise SupervisorError(
+            f"{context_label} node {node_id!r} natural_language_proof contains placeholder/sketch language "
+            f"{placeholder_hits!r}. Replace it with a genuinely detailed local proof."
         )
 
 
@@ -336,6 +463,10 @@ def theorem_frontier_effective_node_status(
     if not isinstance(node, dict):
         raise SupervisorError(f"Unknown theorem-frontier node {node_id!r}.")
     raw_status = str(node.get("status", "open"))
+    lean_proof_status = str(
+        node.get("lean_proof_status")
+        or ("proved" if raw_status == "closed" else "unproved")
+    ).strip().lower()
     if raw_status in {"refuted", "replaced"}:
         memo[node_id] = raw_status
         return raw_status
@@ -349,7 +480,7 @@ def theorem_frontier_effective_node_status(
         for child_id in children
     )
     visiting.remove(node_id)
-    if raw_status == "closed" and all_children_closed:
+    if lean_proof_status == "proved" and all_children_closed and raw_status not in {"active", "frozen", "proposed"}:
         memo[node_id] = "closed"
     elif raw_status in {"active", "frozen", "proposed"}:
         memo[node_id] = raw_status
@@ -365,6 +496,13 @@ def theorem_frontier_node_closure_check(
 ) -> Tuple[bool, str]:
     if node_id not in nodes:
         raise SupervisorError(f"Unknown theorem-frontier node {node_id!r}.")
+    node = nodes[node_id]
+    lean_proof_status = str(
+        node.get("lean_proof_status")
+        or ("proved" if node.get("status") == "closed" else "unproved")
+    ).strip().lower()
+    if lean_proof_status != "proved":
+        return False, "local Lean proof from current children is not yet recorded"
     children = theorem_frontier_node_children(nodes, edges, node_id)
     unresolved = [
         child_id
@@ -380,22 +518,24 @@ def repair_theorem_frontier_closed_nodes(
     nodes: Dict[str, Dict[str, Any]],
     edges: Sequence[Dict[str, Any]],
 ) -> List[str]:
-    reopened: List[str] = []
-    while True:
-        changed = False
-        for node_id, node in nodes.items():
-            if not isinstance(node, dict) or node.get("status") != "closed":
-                continue
-            closable, _reason = theorem_frontier_node_closure_check(nodes, edges, node_id)
-            if closable:
-                continue
-            node["status"] = "open"
-            node["updated_at"] = timestamp_now()
-            reopened.append(node_id)
-            changed = True
-        if not changed:
-            break
-    return reopened
+    changed_nodes: List[str] = []
+    effective_statuses = {
+        node_id: theorem_frontier_effective_node_status(nodes, edges, node_id)
+        for node_id in nodes
+    }
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict):
+            continue
+        raw_status = str(node.get("status") or "open")
+        if raw_status in {"active", "frozen", "proposed", "refuted", "replaced"}:
+            continue
+        desired_status = "closed" if effective_statuses.get(node_id) == "closed" else "open"
+        if raw_status == desired_status:
+            continue
+        node["status"] = desired_status
+        node["updated_at"] = timestamp_now()
+        changed_nodes.append(node_id)
+    return changed_nodes
 
 
 def sync_theorem_frontier_metrics(payload: Dict[str, Any]) -> None:
@@ -464,6 +604,7 @@ def validate_theorem_frontier_node(
     validated["natural_language_proof"] = normalize_frontier_text(validated.get("natural_language_proof"))
     validated["lean_statement"] = normalize_frontier_text(validated.get("lean_statement"))
     validated["lean_anchor"] = normalize_frontier_text(validated.get("lean_anchor"))
+    validated["lean_proof_anchor"] = normalize_frontier_text(validated.get("lean_proof_anchor"))
     validated["paper_provenance"] = normalize_frontier_text(validated.get("paper_provenance"))
     validated["blocker_cluster"] = normalize_frontier_text(validated.get("blocker_cluster"))
     validated["acceptance_evidence"] = normalize_frontier_text(validated.get("acceptance_evidence"))
@@ -475,6 +616,15 @@ def validate_theorem_frontier_node(
         validated.pop("display_label", None)
     if require_status:
         validated["status"] = theorem_frontier_node_status(validated.get("status"))
+        raw_lean_proof_status = validated.get("lean_proof_status")
+        if raw_lean_proof_status in (None, ""):
+            validated["lean_proof_status"] = "proved" if validated["status"] == "closed" else "unproved"
+        else:
+            validated["lean_proof_status"] = theorem_frontier_node_lean_proof_status(raw_lean_proof_status)
+    elif "lean_proof_status" in validated and validated.get("lean_proof_status") not in (None, ""):
+        validated["lean_proof_status"] = theorem_frontier_node_lean_proof_status(validated.get("lean_proof_status"))
+    else:
+        validated.pop("lean_proof_status", None)
     if require_relationships:
         validated["parent_ids"] = normalize_frontier_text_list(validated.get("parent_ids"), label="node.parent_ids")
         validated["child_ids"] = normalize_frontier_text_list(validated.get("child_ids"), label="node.child_ids")
@@ -496,8 +646,11 @@ def validate_theorem_frontier_node(
         "natural_language_proof",
         "lean_statement",
         "lean_anchor",
+        "lean_proof_anchor",
         "paper_provenance",
     ):
+        if key == "lean_proof_anchor":
+            continue
         if not validated[key]:
             raise SupervisorError(f"Theorem-frontier node field {key} must be non-empty.")
     return validated
@@ -527,9 +680,14 @@ def theorem_frontier_node_record(
     status: str,
     parent_ids: Optional[Sequence[str]] = None,
     child_ids: Optional[Sequence[str]] = None,
+    lean_proof_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     record = dict(node)
     record["status"] = theorem_frontier_node_status(status)
+    if lean_proof_status not in (None, ""):
+        record["lean_proof_status"] = theorem_frontier_node_lean_proof_status(lean_proof_status)
+    else:
+        record["lean_proof_status"] = "proved" if record["status"] == "closed" else "unproved"
     record["parent_ids"] = list(dict.fromkeys(parent_ids or []))
     record["child_ids"] = list(dict.fromkeys(child_ids or []))
     record["updated_at"] = timestamp_now()
@@ -546,7 +704,22 @@ def upsert_theorem_frontier_node(
     parent_ids = existing.get("parent_ids", []) if isinstance(existing, dict) else []
     child_ids = existing.get("child_ids", []) if isinstance(existing, dict) else []
     status = existing.get("status", default_status) if isinstance(existing, dict) else default_status
-    record = theorem_frontier_node_record(node, status=status, parent_ids=parent_ids, child_ids=child_ids)
+    if isinstance(existing, dict):
+        existing_lean_proof_status = existing.get("lean_proof_status")
+        lean_proof_status = (
+            existing_lean_proof_status
+            if existing_lean_proof_status not in (None, "")
+            else ("proved" if status == "closed" else "unproved")
+        )
+    else:
+        lean_proof_status = "proved" if status == "closed" else "unproved"
+    record = theorem_frontier_node_record(
+        node,
+        status=status,
+        parent_ids=parent_ids,
+        child_ids=child_ids,
+        lean_proof_status=lean_proof_status,
+    )
     nodes[record["node_id"]] = record
     return record
 
@@ -908,12 +1081,15 @@ def theorem_frontier_context_text(config: Config, state: Dict[str, Any], provide
         "Theorem-frontier DAG discipline:",
         "- Proof formalization is controlled by an authoritative theorem-frontier DAG.",
         "- Each theorem node stores its current child decomposition and a fully rigorous natural-language proof from those children.",
-        "- Working on a node may happen anywhere in the DAG; closure still requires its current children to be closed.",
+        "- Working on a node may happen anywhere in the DAG.",
+        "- `CLOSE` records that the active node has been proved in Lean from its current children.",
+        "- A node becomes globally closed only after that local Lean proof exists and its current children are closed.",
         f"- The worker must write the theorem-frontier worker artifact to `{worker_artifact}`.",
         f"- Structural DAG edits are reviewed through `{paper_artifact}` and `{nl_proof_artifact}` before they enter the DAG.",
         f"- The reviewer must write the theorem-frontier review artifact to `{review_artifact}`.",
-        "- Each burst must act on one active theorem node via `CLOSE`, `EXPAND`, or `REFUTE_REPLACE`.",
+        "- Each burst must act on one active theorem node via `CLOSE`, `REFACTOR`, `EXPAND`, or `REFUTE_REPLACE`.",
         "- `EXPAND` means insert new nodes between the active node and its current children only.",
+        "- `REFACTOR` means keep the same active node and child interface, but reorganize proof/support code without changing the frontier.",
         "- `REFUTE_REPLACE` means replace the active node's current decomposition with a different one.",
         "- When choosing the next active node, prioritize leverage: prefer nodes whose clarification is most likely to force upstream refactors/restatements if the route is wrong. This usually means lower nodes or locally tricky/doubtful nodes, not routine wrappers.",
         "- Work outside the active node's local cone does not count as theorem-frontier progress.",
@@ -1075,6 +1251,7 @@ def validate_theorem_frontier_worker_update_full(phase: str, cycle: int, update:
                 "Theorem-frontier worker update active_node_after.node_id must match active_node_id."
             )
     validated["requested_action"] = validate_theorem_frontier_action(validated.get("requested_action"))
+    validated["lean_proof_anchor"] = normalize_frontier_text(validated.get("lean_proof_anchor"))
     validated["cone_scope"] = normalize_frontier_text(validated.get("cone_scope"))
     validated["allowed_edit_paths"] = normalize_repo_relative_path_list(
         validated.get("allowed_edit_paths"),
@@ -1107,11 +1284,13 @@ def validate_theorem_frontier_worker_update_full(phase: str, cycle: int, update:
     proposed_edge_pairs = [(edge["parent"], edge["child"]) for edge in validated["proposed_edges"]]
     if len(proposed_edge_pairs) != len(set(proposed_edge_pairs)):
         raise SupervisorError("Theorem-frontier worker update proposed_edges must have unique parent/child pairs.")
-    if validated["requested_action"] == "CLOSE" and (validated["proposed_nodes"] or validated["proposed_edges"]):
-        raise SupervisorError("Theorem-frontier CLOSE cycles may not propose structural node or edge changes.")
-    if validated["requested_action"] == "CLOSE" and validated["active_node_after"] is not None:
+    if validated["requested_action"] in {"CLOSE", "REFACTOR"} and (validated["proposed_nodes"] or validated["proposed_edges"]):
         raise SupervisorError(
-            "Theorem-frontier CLOSE cycles may not rewrite the active node. "
+            f"Theorem-frontier {validated['requested_action']} cycles may not propose structural node or edge changes."
+        )
+    if validated["requested_action"] in {"CLOSE", "REFACTOR"} and validated["active_node_after"] is not None:
+        raise SupervisorError(
+            f"Theorem-frontier {validated['requested_action']} cycles may not rewrite the active node. "
             "Change the node only through EXPAND or REFUTE_REPLACE."
         )
     if validated["requested_action"] in {"EXPAND", "REFUTE_REPLACE"} and not isinstance(validated["active_node_after"], dict):
