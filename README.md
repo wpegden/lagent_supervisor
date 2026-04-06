@@ -305,6 +305,7 @@ The intended policy is:
   - `shell_snapshots/`
   - `memories/`
   are normalized recursively so the burst user can read/write them
+- `/home/leanagent/.codex/history.jsonl` should also be writable by the burst user and is normalized to `664`
 
 The supervisor normalizes these before launching bursts.
 

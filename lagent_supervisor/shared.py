@@ -968,6 +968,11 @@ def normalize_burst_user_codex_permissions(config: Config) -> None:
                     path.chmod(expected_mode)
             except PermissionError:
                 pass
+    history_path = codex_dir / "history.jsonl"
+    if history_path.exists():
+        current_mode = history_path.stat().st_mode & 0o777
+        if current_mode != 0o664:
+            history_path.chmod(0o664)
 
 
 def append_supervisor_jsonl(path: Path, payload: Any, *, mode: int = SUPERVISOR_SHARED_STATE_LOG_MODE) -> None:
