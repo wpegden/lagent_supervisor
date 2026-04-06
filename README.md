@@ -1,33 +1,19 @@
 # LAgent Supervisor
 
-`lagent_supervisor` runs long-lived, mostly unattended formalization projects against a Lean repository. It is a control plane for provider CLIs such as Claude Code, Codex, and Gemini: it launches worker and reviewer bursts in `tmux`, validates the repo after every burst, maintains project state under `.agent-supervisor/`, exports web views, and optionally manages strategic branching.
+`lagent_supervisor` is a control plane for long-running Lean formalization projects. It runs worker and reviewer bursts in `tmux`, validates the repository after each burst, tracks project state under `.agent-supervisor/`, exports static web views, and can manage branching when a proof route genuinely splits.
 
-The current system is built around a multi-phase workflow and a proof DAG:
+The current system is built around a **node-centric theorem frontier**:
 
-- early phases read and organize the paper
-- theorem stating produces paper-facing Lean statements and a coarse paper-derived proof DAG
-- proof formalization works edge-by-edge on that DAG
-- cleanup runs only after a complete clean proof state is reached
+- each frontier node is a theorem statement
+- each node stores a rigorous natural-language proof from its current children
+- edges are only structural parent-child links in the current decomposition
+- a node is closed only when it has a Lean proof from its current children and all of those children are closed
 
 This README describes the project as it exists now.
 
-## What The Supervisor Does
+## High-Level Workflow
 
-At a high level, the supervisor:
-
-- loads a JSON config and an optional hot-reloadable policy file
-- creates a per-project state directory under `<repo>/.agent-supervisor/`
-- launches worker/reviewer bursts in real `tmux` windows
-- validates the repository after every worker burst
-- decides whether to continue, advance phase, stop, or branch
-- exports transcript and DAG state to static web directories
-- resumes cleanly after interruption
-
-The system is designed for Lean formalization projects driven by a paper, but most of the control-plane logic is provider-agnostic.
-
-## Workflow Phases
-
-The supported workflow phases are:
+The supervisor moves a project through five phases:
 
 1. `paper_check`
 2. `planning`
@@ -37,204 +23,396 @@ The supported workflow phases are:
 
 ### `paper_check`
 
-The worker reads the manuscript and records:
+The worker reads the paper and records:
 
-- proof corrections
+- proof hazards
+- notation mismatches
 - hidden assumptions
-- notation issues
-- likely formalization hazards
+- likely Lean pain points
 
-The main shared file is `PAPERNOTES.md`.
+The main shared artifact is `PAPERNOTES.md`.
 
 ### `planning`
 
-The worker writes a concrete formalization plan in `PLAN.md` and updates `TASKS.md`. This is where the proof route is mapped into a Lean work plan.
+The worker turns the paper into a concrete Lean work plan in `PLAN.md` and updates `TASKS.md`.
 
 ### `theorem_stating`
 
-The worker writes the statement layer:
+The worker writes the statement layer, typically in:
 
 - `PaperDefinitions.lean`
 - `PaperTheorems.lean`
 
-In full theorem-frontier mode, this phase must also produce:
+In full theorem-frontier mode, this phase must also produce `.agent-supervisor/paper_main_results.json`. That file is the coarse starting proof DAG for the project:
 
-- `.agent-supervisor/paper_main_results.json`
-
-This file is no longer just a “main results list”. It is a **coarse paper-DAG manifest**: a paper-derived proof spine with explicit theorem nodes and explicit dependency edges.
+- theorem nodes on the chosen proof route
+- exact Lean and natural-language statements for each node
+- structural parent-child links between those nodes
+- a rigorous natural-language proof on each node from its current children
+- an `initial_active_node_id`
 
 ### `proof_formalization`
 
-This is the main proving phase. In the current default system, proof formalization is controlled by an authoritative theorem-frontier DAG. Progress is edge-centric:
+This is the main proving phase. The supervisor maintains an authoritative theorem frontier and each cycle works on **one active node**.
 
-- close an existing open edge, or
-- expand an existing open edge into a finer local sub-DAG, or
-- refute/replace the current route
+Meaningful progress is one of:
+
+- `CLOSE`: prove the active node from its current children
+- `EXPAND`: insert new intermediate nodes between the active node and its current children, then rewrite the active node’s natural-language proof to use the refined child set
+- `REFUTE_REPLACE`: replace the active node’s current decomposition with a different one
+
+The system does not require bottom-up work. A cycle can work on any node in the DAG. Closure is still dependency-based: a node only becomes closed when its children are closed too.
+
+When choosing the next active node, the supervisor and reviewer should prefer **high-leverage nodes** over routine wrappers. In practice this means preferring lower nodes, or nodes whose local proof looks tricky or doubtful, when progress there is likely to force upstream refactors/restatements or reveal that the current route is wrong.
 
 ### `proof_complete_style_cleanup`
 
-This phase only starts after proof formalization has reached a complete clean proof state. Cleanup is optional polishing:
+Cleanup starts only after proof formalization reaches a complete clean proof state. This phase is for:
 
 - warning cleanup
-- moderate refactors
-- tidying theorem packaging
+- modest refactors
+- packaging and style improvements
 
-The supervisor preserves a last known good complete proof commit and will roll back cleanup if cleanup breaks proof completeness.
+The supervisor preserves a last known good complete-proof commit and rolls cleanup back if cleanup breaks proof completeness.
+
+## Core Architecture
+
+The repository has one orchestration module and several smaller support modules:
+
+- [supervisor.py](/home/leanagent/src/lagent_supervisor/supervisor.py): main orchestration loop, phase logic, tmux management, branching, exports
+- [lagent_supervisor/storage.py](/home/leanagent/src/lagent_supervisor/lagent_supervisor/storage.py): atomic JSON writes and file locking
+- [lagent_supervisor/validation.py](/home/leanagent/src/lagent_supervisor/lagent_supervisor/validation.py): repo validation, Lean scanning, theorem-stating edit policy
+- [lagent_supervisor/frontier.py](/home/leanagent/src/lagent_supervisor/lagent_supervisor/frontier.py): theorem-frontier schemas, invariants, status derivation, seeding, updates
+- [lagent_supervisor/web.py](/home/leanagent/src/lagent_supervisor/lagent_supervisor/web.py): manifest and export helpers
+- [lagent_supervisor/providers.py](/home/leanagent/src/lagent_supervisor/lagent_supervisor/providers.py): provider command assembly and provider-specific behavior
+- [lagent_supervisor/shared.py](/home/leanagent/src/lagent_supervisor/lagent_supervisor/shared.py): shared constants, default payloads, helper text
 
 ## Roles
-
-The supervisor currently uses these role families.
 
 ### Core roles
 
 - `worker`
 - `reviewer`
 
-The worker edits the repo and writes a handoff artifact. The reviewer judges the cycle and decides whether to continue, advance phase, stop, or branch.
+The worker edits the repo and produces a handoff artifact. The reviewer decides whether the cycle should continue, advance phase, stop, or branch.
 
 ### Theorem-frontier verifier roles
 
-In full theorem-frontier mode, structural proof-DAG edits are dual-gated by:
+In full theorem-frontier mode, structural node changes are dual-gated by:
 
 - `paper_verifier`
 - `nl_proof_verifier`
 
-The separation is intentional:
+The separation is deliberate:
 
-- `paper_verifier` checks that a proposed structural expansion is faithful to the paper or to an explicitly justified paper-faithful reformulation.
-- `nl_proof_verifier` checks that the natural-language proofs carried by the newly admitted edges and new leaf obligations are rigorous enough to justify admission into the authoritative DAG.
+- `paper_verifier` checks that the proposed decomposition is faithful to the paper or to an explicitly justified paper-faithful reformulation
+- `nl_proof_verifier` checks that every newly admitted or modified node carries a completely rigorous natural-language proof from its current children
 
 ### Branching roles
 
-When proof formalization reaches a genuine route split, the supervisor can invoke:
+When proof formalization reaches a genuine route split, the supervisor can run branch strategy and branch selection reviews. Branching is anchored to the current active node.
 
-- a branch strategy decision
-- branch selection / branch replacement review
+## Theorem Frontier
 
-Branching is anchored to the current active theorem-frontier obligation edge.
+### What a node means
 
-## Theorem-Frontier DAG
-
-The theorem-frontier DAG is the core proof-control structure in full mode.
-
-### Nodes
-
-Nodes are theorem statements. Each node stores:
+A theorem-frontier node is the fundamental proof object. It stores:
 
 - `node_id`
 - `kind`
 - `natural_language_statement`
-- `natural_language_proof`
 - `lean_statement`
+- `natural_language_proof`
 - `lean_anchor`
 - `paper_provenance`
-- `closure_mode`
 - `blocker_cluster`
 - `acceptance_evidence`
 - `notes`
 
-Important node kinds include:
-
-- `paper`
-- `paper_faithful_reformulation`
-- `support`
-
-### Edges
-
-Edges are proof obligations or reductions. Each edge has:
-
-- canonical `edge_id = parent|edge_type|child`
-- `edge_type`
-- `status`
-- `justification`
-- `natural_language_proof`
-- `paper_verifier_status` once admitted
-
-Important edge types include:
-
-- `direct_proof`
-- `reduction`
-- `case_split`
-- `all_of`
-- `any_of`
-- `equivalence`
-- `strengthening`
-- `replacement`
-
-### Active frontier
-
-The active frontier item is an **edge**, not a node.
-
-- `active_edge_id` names the current obligation
-- the active theorem node is derived from the parent of that edge
-
-This matters operationally: the unit of progress is the obligation edge.
-
-### Proof semantics
+Its outgoing edges are just its current children.
 
 The intended semantics are:
 
-- a green edge means the implication/reduction represented by that edge is proved
-- a green node means the theorem statement is proved
+- the children are the statements currently being used to prove the node
+- the node’s `natural_language_proof` is a rigorous proof of the node from exactly those children
+- node proofs should be at least as detailed as the corresponding paper argument, and often more detailed because they must be locally self-contained
+- node proofs may not appeal to named paper lemmas/cases that are not represented by the current child set
+- if the decomposition changes, the node’s proof must be rewritten to match
 
-Node proof status is derived from the proof state of its outgoing dependency edges and the proof status of the downstream child nodes.
+### What an edge means
 
-The system does not treat “workflow said closed” as enough. In full mode, proof closure is dependency-aware.
+An edge is only a structural parent-child link:
 
-### Direct proof edges
+- `parent`
+- `child`
 
-Direct theorem proving is represented explicitly by `direct_proof` self-edges. These are ordinary edges in the authoritative DAG. They are not synthesized silently by the supervisor.
+Edges do not carry proof status. They do not mean “this single child implies the parent.” They only mean “this child is part of the current decomposition of the parent.”
 
-If a theorem is to be proved directly at the current level of granularity, that direct-proof edge must exist explicitly and must carry a natural-language proof like any other edge.
+### Closure
 
-## Initial Coarse Paper-DAG
+A node is effectively closed only when:
 
-In full mode, the initial proof DAG is seeded from `paper_main_results.json` during the `theorem_stating -> proof_formalization` transition.
+- its raw status is `closed`
+- it has a Lean proof from its current children
+- all current children are effectively closed
 
-That manifest now contains:
+A leaf node is just a node with no children. It closes directly when its own Lean proof exists.
+
+### Active work
+
+The active frontier item is always a node:
+
+- `active_node_id`
+
+The worker may:
+
+- try to close that node directly
+- expand that node by refining its children
+- refactor that node’s decomposition
+
+The worker is not forced to work bottom-up; it may work on any active node the supervisor selects.
+
+### Expansion
+
+Expansion is local:
+
+- it inserts new nodes between the active node and its current children only
+- it preserves unaffected parts of the DAG
+- it requires a revised rigorous natural-language proof on the active node from the new child set
+
+### Refactor / replace
+
+If the current child set is the wrong route, the worker may replace it. This is the node-level refactor operation.
+
+## Initial Coarse Paper DAG
+
+The initial proof DAG is seeded from `paper_main_results.json` during the `theorem_stating -> proof_formalization` transition.
+
+That manifest contains:
 
 - `phase`
 - `nodes`
 - `edges`
-- `initial_active_edge_id`
+- `initial_active_node_id`
 
-The seed DAG is intended to be a **coarse paper-derived proof spine**, not a one-node placeholder. It should include:
+The seed DAG should be a coarse proof spine extracted from the paper, not a single top theorem with no structure. Every seeded node must already have:
 
-- the main theorem nodes on the chosen proof route
-- important paper lemmas/propositions/cases on that route
-- exact Lean and NL statements for every node
-- explicit edge-level natural-language proofs explaining the coarse manuscript reductions
+- an exact Lean statement
+- a natural-language statement
+- a rigorous natural-language proof from its seeded children
 
-This means proof formalization starts from a paper-extracted DAG rather than discovering the whole structure from scratch later.
+Those seed proofs should already be at least as detailed as the corresponding paper arguments, and often more detailed because they must stand on their own as local proof witnesses for the DAG. If the paper proof uses a named intermediate lemma or case, that dependency belongs in the seed DAG rather than being hidden in prose.
 
-## Full-Mode Progress Rule
+This means proof formalization starts from an explicit paper-derived decomposition instead of inventing the whole structure later.
 
-In the current system, a meaningful proof-formalization cycle should do one of:
+## Validation
 
-1. close one or more existing open edges
-2. expand one open edge into a finer local sub-DAG
-3. refute/replace the current route
+Validation runs after each worker burst.
 
-Structural expansion is proof-carrying:
+Current validation covers:
 
-- every newly admitted edge must include a rigorous `natural_language_proof`
-- every newly admitted leaf node must include a rigorous `natural_language_proof`
-- the `paper_verifier` and `nl_proof_verifier` must both approve the admitted subset
+- `lake` availability as a structured check rather than a crash
+- build success
+- `sorry` detection using token-aware scanning instead of regex-only matching
+- unapproved `axiom` detection with the same masking logic
+- clean git/worktree checks
+- theorem-stating edit policy, including the narrow root-import exception needed for Lean package wiring
+- proof-formalization cone checks against the current cycle baseline
 
-Existing authoritative nodes are immutable. If a theorem statement changes, the route should be replaced rather than silently edited in place.
+## Local Permissions Model
 
-## Branching Model
+The local multi-user setup is intentionally split between a **supervisor user** and a **burst user**.
 
-Branching is available during proof formalization.
+- `leanagent` runs the Python supervisor, owns the supervisor code, owns the control scripts under `/home/leanagent/.lagent-supervisor-control`, and performs supervisor-side git commit/push.
+- `lagentworker` runs worker/reviewer/verifier bursts via `sudo -n -u lagentworker -g leanagent ...`.
 
-The branch anchor is the current active obligation edge:
+The intended rule is:
 
-- branch proposals should be competing ways to resolve the same active obligation
-- branch selection compares which branch is more likely to close that obligation and then finish the paper
+- supervisor metadata is owned by `leanagent`
+- mutable Lean build state is written by `lagentworker`
+- workers may read many supervisor artifacts, but they must not be able to rewrite supervisor code or control scripts
 
-When a child branch is created, it inherits the current authoritative DAG but resets local runtime pressure:
+### Permission Classes
 
-- active-edge age
+There are four important filesystem classes.
+
+1. Supervisor control files
+
+- path: `/home/leanagent/.lagent-supervisor-control`
+- owner/group: `leanagent:leanagent`
+- directories: `755`
+- files: `644`
+- generated burst scripts: `755`
+
+Workers must be able to execute the generated burst scripts through `sudo`, but they must not be able to rewrite this control tree.
+
+2. Live supervisor state
+
+- path: `<repo>/.agent-supervisor`
+- owner/group: typically `leanagent:leanagent`
+- mutable artifact directories such as `cycles/`, `logs/`, `runtime/`, `prompts/`: `2775`
+- ordinary live artifact files in those trees: `664`
+- authoritative live state files:
+  - `state.json`
+  - `theorem_frontier.json`
+  use `640`
+- multi-writer summary/log files such as:
+  - `validation_summary.json`
+  - `paper_main_results.json`
+  - `validation_log.jsonl`
+  use `664`
+
+This lets the burst user read what it needs and write its own cycle artifacts, while keeping the main authoritative state files non-world-readable and non-world-writable.
+
+3. Checkpoints
+
+- path: `<repo>/.agent-supervisor/checkpoints`
+- owner/group: typically `leanagent:leanagent`
+- directories: `2755`
+- files: `644`
+
+Checkpoints are immutable snapshots. Workers may need to read them for context, but they should not be able to mutate them. A previous bug came from copying live files into checkpoints with `shutil.copy2`, which preserved restrictive `600` modes from source artifacts; checkpoint normalization now fixes this after checkpoint creation.
+
+4. Repo-local Lean state
+
+- main repo source tree: shared between users
+- generated frontier files:
+  - directories `2775`
+  - files `664`
+- `.lake` and other repo-local build state:
+  - owner should effectively be `lagentworker`
+  - group `leanagent`
+  - directories `2775`
+  - files `664`
+
+The important practical rule is:
+
+- repo-local `lake` commands should run as `lagentworker`
+- the supervisor should orchestrate and validate, but it should not be the normal writer for `.lake`
+
+### Codex Runtime Permissions
+
+When using Codex bursts with `HOME=/home/leanagent`, the worker must be able to read shared Codex config and mutate only the runtime subtrees it actually uses.
+
+The intended policy is:
+
+- `/home/leanagent/.codex/config.toml`: `640`
+- `/home/leanagent/.codex/auth.json`: `640`
+- mutable runtime directories such as:
+  - `sessions/`
+  - `tmp/`
+  - `log/`
+  - `shell_snapshots/`
+  - `memories/`
+  are normalized recursively so the burst user can read/write them
+
+The supervisor normalizes these before launching bursts.
+
+### Operational Rule of Thumb
+
+If you are deciding how a new file should be permissioned, ask:
+
+- Is this a supervisor-owned control artifact? Then it should be readable but not writable by `lagentworker`.
+- Is this a live burst artifact that the worker must write? Then it belongs in the shared live state class.
+- Is this an immutable checkpoint snapshot? Then it should be readable but not writable by `lagentworker`.
+- Is this mutable Lean build state? Then it should be writable by `lagentworker`.
+
+Do not rely on ad hoc `chmod` repairs after failures. New code paths that create files in these areas should normalize permissions immediately after writing them.
+
+Lean file discovery is repo-relative, so repositories are not accidentally skipped just because they live under directory names like `build`, `.git`, `.lake`, `lake-packages`, or `.agent-supervisor`.
+
+## Persistence and Safety
+
+Project state lives under `<repo>/.agent-supervisor/`.
+
+Important files include:
+
+- `state.json`
+- `validation_summary.json`
+- `worker_handoff.json`
+- `review_decision.json`
+- `paper_main_results.json`
+- `theorem_frontier.json`
+- logs under `.agent-supervisor/logs/`
+- runtime scripts under `.agent-supervisor/runtime/`
+- completed-cycle checkpoints under `.agent-supervisor/checkpoints/`
+
+Shared JSON writes use atomic replace plus file locking, so concurrent writers do not corrupt manifests or state files.
+
+### Completed-Cycle Checkpoints
+
+After every completed reviewer cycle, the supervisor now writes a checkpoint bundle keyed by cycle. A checkpoint records:
+
+- the validated git head for that completed cycle
+- `state.json`
+- validation and review logs
+- theorem-frontier state and history, if present
+- chat-event/export state needed to keep the web views coherent after a restore
+
+This supports rollback after a supervisor fix. The intended workflow is:
+
+1. decide the last completed cycle the bug could have affected
+2. restore that checkpoint
+3. restart the supervisor from there
+
+For example, after `paper_check` completes, a new run will have a checkpoint for cycle `1`, so a later control-plane fix can resume from just after that phase instead of rerunning the paper read.
+
+List checkpoints:
+
+```bash
+python3 scripts/restore_cycle_checkpoint.py --config configs/your_run.json --list
+```
+
+Restore a specific completed cycle:
+
+```bash
+python3 scripts/restore_cycle_checkpoint.py --config configs/your_run.json --cycle 1
+```
+
+Restore the latest checkpoint written after completing a named phase:
+
+```bash
+python3 scripts/restore_cycle_checkpoint.py --config configs/your_run.json --after-phase paper_check
+```
+
+The restore script stops the live supervisor, agent, and monitor tmux sessions for that run before restoring files. It does not auto-launch a new supervisor session; after restore, restart normally with:
+
+```bash
+python3 supervisor.py --config configs/your_run.json
+```
+
+## Web Exports
+
+The supervisor exports two static web views:
+
+- transcript/chat view
+- DAG view
+
+The DAG viewer is in:
+
+- [dag_viewer/index.html](/home/leanagent/src/lagent_supervisor/dag_viewer/index.html)
+- [dag_viewer/dag-browser.js](/home/leanagent/src/lagent_supervisor/dag_viewer/dag-browser.js)
+- [dag_viewer/dag-browser.css](/home/leanagent/src/lagent_supervisor/dag_viewer/dag-browser.css)
+- [dag_viewer/dag-layout-worker.js](/home/leanagent/src/lagent_supervisor/dag_viewer/dag-layout-worker.js)
+
+The viewer now mirrors the node-centric semantics:
+
+- green node: effectively closed theorem
+- yellow node: currently active theorem
+- gray node: open theorem
+- red/faded node: refuted or replaced theorem
+- edges are structural only; they are drawn green only when they belong to a closed parent decomposition
+
+Full `natural_language_proof` text remains stored in the authoritative frontier/export data. The web UI should treat those proofs as primary content, but collapse long statements and proofs by default and expand them on demand rather than truncating them in storage.
+
+The static viewers avoid unsafe `innerHTML` and unsafe-link sinks from unescaped data.
+
+## Branching
+
+Branching is optional and only for real route splits.
+
+When a child branch is created, it inherits the current theorem frontier but resets local runtime pressure such as:
+
 - active-node age
 - blocker age
 - failed-close streak
@@ -242,327 +420,58 @@ When a child branch is created, it inherits the current authoritative DAG but re
 - escalation state
 - last frontier artifacts
 
-This avoids carrying parent stagnation pressure into a fresh child route.
-
-## Runtime Architecture
-
-### `tmux`
-
-Bursts run in real `tmux` windows. This is the primary live-debugging surface.
-
-Typical sessions:
-
-- `<repo>-supervisor`
-- `<repo>-agents`
-
-The supervisor launches a worker burst, captures its handoff and terminal output, validates the repo, then launches the reviewer burst.
-
-### Per-role scope directories
-
-Each role gets its own scope directory under:
-
-```text
-<repo>/.agent-supervisor/scopes/<provider>-<role>/
-```
-
-Each scope contains symlinks:
-
-```text
-repo/        -> the real Lean repository
-supervisor/  -> <repo>/.agent-supervisor
-```
-
-This gives provider CLIs distinct working directories while still editing the same repository.
-
-## Project Files
-
-### Repository files managed during a run
-
-Always:
-
-- `GOAL.md`
-- `TASKS.md`
-
-From `paper_check` onward:
-
-- `PAPERNOTES.md`
-
-From `planning` onward:
-
-- `PLAN.md`
-
-From `theorem_stating` onward:
-
-- `PaperDefinitions.lean`
-- `PaperTheorems.lean`
-
-### Supervisor state files
-
-Under:
-
-```text
-<repo>/.agent-supervisor/
-```
-
-Important files include:
-
-- `state.json`
-- `validation_summary.json`
-- `validation_log.jsonl`
-- `review_log.jsonl`
-- `theorem_frontier.json`
-- `theorem_frontier_history.jsonl`
-- `paper_main_results.json`
-- `worker_handoff.json`
-- `review_decision.json`
-- `theorem_frontier_paper_verifier.json`
-- `theorem_frontier_nl_proof_verifier.json`
-- logs under `logs/`
-- runtime scripts under `runtime/`
-
-## Validation
-
-After every worker burst, the supervisor runs validation. Depending on config and phase, this can include:
-
-- build status
-- syntax checks
-- `sorry` policy
-- unapproved axiom checks
-- git cleanliness / head / branch / remote status
-- theorem-stating file-cone enforcement
-- theorem-frontier allowed-edit-path enforcement
-
-If a reviewer asks to advance phase or stop as done but validation blocks that transition, the supervisor records a `last_transition_error` in `state.json` and emits a `transition_blocked` warning.
-
-## Providers
-
-Supported CLIs:
-
-- Claude Code
-- Codex
-- Gemini CLI
-
-Mixed worker/reviewer pairs are supported.
-
-### Claude
-
-The supervisor uses Claude’s CLI in its role scope directory and resumes the role-local conversation across bursts.
-
-### Codex
-
-The supervisor uses `codex exec` and later `codex exec resume --last`, scoped to the role directory. Codex budget pauses are supported: when the configured threshold is crossed, the supervisor waits and polls rather than exiting.
-
-### Gemini
-
-The supervisor uses Gemini with `--approval-mode=yolo`. Gemini roles can specify a `fallback_model`; on Gemini rate-limit/capacity failures, the supervisor can immediately rerun the burst on the fallback model.
+Branch selection compares routes anchored to the same current node, rather than unrelated side work.
 
 ## Configuration
 
-Configs live in `configs/`. The initializer script can create one for you.
+Projects are launched from JSON configs under [configs/](/home/leanagent/src/lagent_supervisor/configs). A config chooses:
 
-Important config areas:
-
-- repo path and goal file
-- worker and reviewer provider/model settings
-- `tmux` session names
-- workflow start phase and paper `.tex` path
+- repository path
+- paper path
+- worker/reviewer providers and models
+- chat and DAG export roots
+- workflow start phase
+- branching policy
 - theorem-frontier mode
-- git settings
-- chat export settings
-- branching settings
-- optional hot-reloadable policy path
 
-The policy file is separate from the main config and is designed to be edited while a run is live.
+Policies can be hot-reloaded from separate JSON policy files.
 
-### Minimal command
+## Scripts
 
-```bash
-python3 supervisor.py --config configs/codex_worker_claude_reviewer.json
-```
+Useful scripts include:
 
-### Start in tmux
-
-```bash
-./scripts/start_in_tmux.sh configs/codex_worker_claude_reviewer.json lean-supervisor
-```
-
-### Start in screen
-
-```bash
-./scripts/start_in_screen.sh configs/codex_worker_claude_reviewer.json lean-supervisor
-```
-
-## Initializer
-
-To bootstrap a project:
-
-```bash
-python3 scripts/init_formalization_project.py
-```
-
-The initializer can:
-
-- copy or flatten a paper `.tex`
-- set up the repo path
-- create `GOAL.md`
-- create a config file
-- initialize a Lean package when appropriate
-- normalize package and session names
-
-## Monitoring And Debugging
-
-### Attach to agent windows
-
-```bash
-tmux attach -t <agents-session>
-```
-
-or:
-
-```bash
-./scripts/attach_agents_tmux.sh <agents-session>
-```
-
-### Watch logs
-
-```bash
-./scripts/watch_logs.sh /path/to/repo
-```
-
-Important log files:
-
-- `worker.latest.ansi.log`
-- `reviewer.latest.ansi.log`
-- `worker.all.ansi.log`
-- `reviewer.all.ansi.log`
-- `review_log.jsonl`
-
-### Hourly monitor
-
-The repository includes:
-
-- `scripts/monitor_supervisor_run.py`
-
-This script can monitor a run, classify failures, snapshot diagnostics, and restart the supervisor when that is the configured response.
-
-## Web Interfaces
-
-The project currently has two static web exports.
-
-### 1. Transcript viewer
-
-The transcript viewer lives under the configured chat root, by default:
-
-```text
-~/lagent-chats/
-```
-
-It exports:
-
-- prompts
-- worker/reviewer JSON artifacts
-- validation summaries
-- shared markdown files through a lightweight web markdown viewer
-
-It does **not** publish the raw terminal capture used for local debugging.
-
-The supervisor manages:
-
-- `~/lagent-chats/index.html`
-- `~/lagent-chats/_assets/`
-- `~/lagent-chats/repos.json`
-- `~/lagent-chats/<repo_name>/...`
-
-Install the viewer assets manually if needed:
-
-```bash
-python3 scripts/install_lagent_chats_user_files.py
-```
-
-### 2. DAG viewer
-
-The DAG viewer is exported beside the chat root, under:
-
-```text
-~/lagent-dags/
-```
-
-It displays the authoritative theorem-frontier DAG:
-
-- nodes
-- edges
-- active obligation
-- proof/edge statuses
-- cycle-by-cycle frontier deltas
-
-The DAG browser assets live in:
-
-- `dag_viewer/index.html`
-- `dag_viewer/dag-browser.js`
-- `dag_viewer/dag-layout-worker.js`
-- `dag_viewer/dag-browser.css`
-
-## Nginx Helper
-
-To generate an nginx config for the transcript viewer:
-
-```bash
-python3 scripts/render_lagent_chats_nginx_conf.py
-```
-
-The default generated site serves `/lagent-chats/` from `~/lagent-chats`.
-
-## Supporting Scripts
-
-Notable scripts in `scripts/`:
-
-- `init_formalization_project.py`
-- `start_in_tmux.sh`
-- `start_in_screen.sh`
-- `attach_agents_tmux.sh`
-- `watch_logs.sh`
-- `watch_worker.sh`
-- `monitor_supervisor_run.py`
-- `install_lagent_chats_user_files.py`
-- `install_provider_context_files.py`
-- `render_lagent_chats_nginx_conf.py`
-- `export_lean_cycle_stats.py`
-- `export_retrospective_bundle.py`
-- `replay_branching_candidates.py`
-- `reset_smoke_test.sh`
-
-## Provider Context Files
-
-Provider-specific context lives under `provider_context/`. The supervisor can install those files into the appropriate provider home directories or role scopes.
+- [scripts/init_formalization_project.py](/home/leanagent/src/lagent_supervisor/scripts/init_formalization_project.py)
+- [scripts/monitor_supervisor_run.py](/home/leanagent/src/lagent_supervisor/scripts/monitor_supervisor_run.py)
+- [scripts/restore_cycle_checkpoint.py](/home/leanagent/src/lagent_supervisor/scripts/restore_cycle_checkpoint.py)
+- [scripts/export_retrospective_bundle.py](/home/leanagent/src/lagent_supervisor/scripts/export_retrospective_bundle.py)
+- [scripts/start_in_tmux.sh](/home/leanagent/src/lagent_supervisor/scripts/start_in_tmux.sh)
+- [scripts/export_lean_cycle_stats.py](/home/leanagent/src/lagent_supervisor/scripts/export_lean_cycle_stats.py)
 
 ## Testing
 
-The main test suite is:
+The main regression suite is [tests/test_supervisor.py](/home/leanagent/src/lagent_supervisor/tests/test_supervisor.py).
+
+The suite covers:
+
+- storage and manifest safety
+- validation behavior
+- theorem-frontier schemas and invariants
+- node-centric proof-state transitions
+- branching behavior
+- export payloads
+- workflow transitions
+- retry and recovery behavior
+
+Run it with:
 
 ```bash
 python3 -m unittest tests.test_supervisor
 ```
 
-Useful local checks:
+Useful extra checks:
 
 ```bash
-python3 -m py_compile supervisor.py tests/test_supervisor.py scripts/monitor_supervisor_run.py
+python3 -m py_compile supervisor.py lagent_supervisor/*.py tests/test_supervisor.py
 node --check dag_viewer/dag-browser.js
 node --check dag_viewer/dag-layout-worker.js
 ```
-
-The more detailed theorem-frontier testing strategy is documented in:
-
-- [theorem_frontier_testing_strategy.md](theorem_frontier_testing_strategy.md)
-
-## Current Defaults And Expectations
-
-The current system assumes:
-
-- multi-phase runs are the normal mode
-- full theorem-frontier mode is the default proof-formalization mode
-- the initial proof DAG comes from a coarse paper-derived manifest
-- proof progress is tracked by obligation edges
-- structural expansion is proof-carrying and verifier-gated
-
-This is no longer a “vibes-only” loop. The supervisor is opinionated and stateful, and the theorem-frontier DAG is the authoritative proof-control object during proof formalization.

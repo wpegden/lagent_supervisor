@@ -1,4 +1,5 @@
 import json
+import stat
 import shlex
 import shutil
 import subprocess
@@ -250,6 +251,94 @@ class CommandTests(SupervisorTestCase):
         config = supervisor.load_config(config_path)
 
         self.assertEqual(config.tmux.session_name, "arxiv-1702_07325-agents")
+
+    def test_load_config_reads_tmux_burst_user_settings(self) -> None:
+        repo_path = self.make_repo()
+        config_path = repo_path.parent / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_path": str(repo_path),
+                    "goal_file": "GOAL.md",
+                    "worker": {"provider": "codex"},
+                    "reviewer": {"provider": "claude"},
+                    "tmux": {
+                        "burst_user": "lagentworker",
+                        "burst_group": "leanagent",
+                        "burst_home": "/home/leanagent",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = supervisor.load_config(config_path)
+
+        self.assertEqual(config.tmux.burst_user, "lagentworker")
+        self.assertEqual(config.tmux.burst_group, "leanagent")
+        self.assertEqual(config.tmux.burst_home, Path("/home/leanagent"))
+
+    def test_save_state_writes_group_readable_state_file(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+
+        supervisor.save_state(
+            config,
+            {
+                "phase": "planning",
+                "cycle": 1,
+                "roles": {},
+                "review_log": [],
+                "last_review": {"cycle": 1, "phase": "paper_check", "decision": "ADVANCE_PHASE"},
+                "last_validation": {"cycle": 1, "phase": "paper_check"},
+                "theorem_frontier": {"mode": "full", "active_node_id": "paper.main", "nodes": {}, "edges": []},
+            },
+        )
+
+        mode = stat.S_IMODE((config.state_dir / "state.json").stat().st_mode)
+        self.assertEqual(mode, supervisor.SUPERVISOR_SHARED_STATE_FILE_MODE)
+        written = supervisor.JsonFile.load(config.state_dir / "state.json", {})
+        self.assertEqual(written["last_review_cycle"], 1)
+        self.assertEqual(written["last_validation_cycle"], 1)
+        self.assertEqual(written["theorem_frontier_active_node_id"], "paper.main")
+
+    def test_write_shared_repo_text_writes_group_writable_file(self) -> None:
+        repo_path = self.make_repo()
+        target = repo_path / "Twobites" / "GeneratedFrontier" / "Statements.lean"
+
+        supervisor.write_shared_repo_text(target, "theorem x : True := by trivial\n")
+
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), supervisor.SUPERVISOR_SHARED_REPO_FILE_MODE)
+        self.assertEqual(stat.S_IMODE(target.parent.stat().st_mode), supervisor.SUPERVISOR_SHARED_REPO_DIR_MODE)
+
+    def test_normalize_repo_mutable_permissions_sets_setgid_dirs(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        lake_packages = repo_path / ".lake" / "packages"
+        generated_dir = supervisor.theorem_frontier_generated_dir(config)
+        for path in (repo_path, lake_packages, generated_dir):
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o775)
+
+        supervisor.normalize_repo_mutable_permissions(config)
+
+        self.assertEqual(stat.S_IMODE(repo_path.stat().st_mode), supervisor.SUPERVISOR_SHARED_REPO_DIR_MODE)
+        self.assertEqual(stat.S_IMODE(lake_packages.stat().st_mode), supervisor.SUPERVISOR_SHARED_REPO_DIR_MODE)
+        self.assertEqual(stat.S_IMODE(generated_dir.stat().st_mode), supervisor.SUPERVISOR_SHARED_REPO_DIR_MODE)
+
+    def test_normalize_checkpoint_tree_permissions_makes_files_worker_readable(self) -> None:
+        repo_path = self.make_repo()
+        checkpoint_root = repo_path / ".agent-supervisor" / "checkpoints" / "cycle-0009" / "state" / "cycles" / "cycle-0009" / "worker"
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        artifact = checkpoint_root / "theorem_frontier_update.json"
+        artifact.write_text("{}\n", encoding="utf-8")
+        checkpoint_root.chmod(0o2775)
+        artifact.chmod(0o600)
+
+        supervisor.normalize_checkpoint_tree_permissions(repo_path / ".agent-supervisor" / "checkpoints")
+
+        self.assertEqual(stat.S_IMODE(checkpoint_root.stat().st_mode), supervisor.SUPERVISOR_CHECKPOINT_DIR_MODE)
+        self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), supervisor.SUPERVISOR_CHECKPOINT_FILE_MODE)
 
     def test_load_config_uses_branching_defaults(self) -> None:
         repo_path = self.make_repo()
@@ -739,6 +828,7 @@ class PolicyTests(SupervisorTestCase):
                                     "plan_type": "pro",
                                     "primary": {"used_percent": 1.0, "window_minutes": 300},
                                     "secondary": {"used_percent": 2.0, "window_minutes": 10080, "resets_at": 1},
+                                    "credits": {"available": 1000.0, "spent": 0.0, "purchased_total": 1000.0},
                                 },
                             },
                         }
@@ -756,6 +846,9 @@ class PolicyTests(SupervisorTestCase):
         self.assertEqual(usage["source_path"], str(session_log))
         self.assertEqual(usage["input_tokens"], 100)
         self.assertEqual(usage["last_total_tokens"], 15)
+        self.assertEqual(usage["credits_available"], 1000.0)
+        self.assertEqual(usage["credits_spent"], 0.0)
+        self.assertEqual(usage["credits_limit"], 1000.0)
 
     def test_latest_codex_token_usage_for_scope_matches_session_meta(self) -> None:
         repo_path = self.make_repo()
@@ -1022,8 +1115,13 @@ class PolicyTests(SupervisorTestCase):
         script_text = script_path.read_text(encoding="utf-8")
         scope_dir = supervisor.role_scope_dir(config, "gemini", "worker")
 
+        self.assertEqual(script_path.parent, supervisor.supervisor_scripts_dir(config))
         self.assertIn(f"WORK_DIR={shlex.quote(str(repo_path))}", script_text)
         self.assertIn(f"export GEMINI_CLI_HOME={shlex.quote(str(scope_dir))}", script_text)
+        self.assertIn(
+            f"export GIT_CONFIG_GLOBAL={shlex.quote(str(supervisor.supervisor_git_config_path(config)))}",
+            script_text,
+        )
         self.assertLess(script_text.index("export GEMINI_CLI_HOME="), script_text.index("cmd=("))
 
     def test_prepare_gemini_cli_home_merges_fail_fast_setting_when_fallback_enabled(self) -> None:
@@ -1201,7 +1299,7 @@ class PolicyTests(SupervisorTestCase):
         self.assertIn("omitted from the web transcript", prompt)
         self.assertNotIn("very long terminal output", prompt)
 
-    def test_worker_prompt_mentions_commit_and_push_when_git_remote_is_configured(self) -> None:
+    def test_worker_prompt_says_supervisor_handles_commit_and_push_when_git_remote_is_configured(self) -> None:
         repo_path = self.make_repo()
         config = self.make_config(repo_path, git_remote_url="/tmp/example-remote.git")
         subprocess.run(["git", "init", "-b", "main"], cwd=repo_path, check=True, capture_output=True, text=True)
@@ -1209,8 +1307,26 @@ class PolicyTests(SupervisorTestCase):
 
         prompt = supervisor.build_worker_prompt(config, {}, "planning", True)
 
-        self.assertIn("create a non-empty git commit", prompt)
-        self.assertIn("git push origin HEAD:main", prompt)
+        self.assertIn("Do not create git commits and do not push from the worker account.", prompt)
+        self.assertIn("the supervisor validates the cycle, it will stage, commit, and push", prompt)
+        self.assertNotIn("git push origin HEAD:main", prompt)
+
+    def test_reviewer_prompt_no_longer_mentions_worker_git_push_requirements(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, git_remote_url="/tmp/example-remote.git")
+
+        prompt = supervisor.build_reviewer_prompt(
+            config,
+            {"review_log": []},
+            "planning",
+            "",
+            '{"status":"NOT_STUCK"}',
+            {"build": {"ok": True}, "sorries": {"count": 0}},
+            True,
+        )
+
+        self.assertNotIn("left the repo dirty", prompt)
+        self.assertNotIn("failed to push", prompt)
 
     def test_worker_prompt_mentions_provider_context_first(self) -> None:
         repo_path = self.make_repo()
@@ -3373,10 +3489,60 @@ worker output
             },
             "last_validation": {"cycle": 12, "build": {"ok": True}},
             "last_theorem_frontier_worker_update": None,
+            "theorem_frontier": {
+                "mode": "full",
+                "active_node_id": "paper.main",
+                "current_action": "CLOSE",
+                "nodes": {
+                    "paper.main": {
+                        "node_id": "paper.main",
+                        "kind": "paper",
+                        "status": "active",
+                        "lean_proof_status": "unproved",
+                        "natural_language_statement": "main",
+                        "natural_language_proof": "from children",
+                        "lean_statement": "def paperMainStatement : Prop := True",
+                        "lean_anchor": "PaperTheorems.paperMainStatement",
+                        "paper_provenance": "paper",
+                        "blocker_cluster": "main",
+                        "acceptance_evidence": "lean",
+                        "notes": "",
+                        "parent_ids": [],
+                        "child_ids": [],
+                    },
+                },
+                "edges": [],
+                "metrics": {"closed_nodes_count": 0, "failed_close_attempts": 0, "structural_churn": 0},
+                "escalation": {"required": False, "reasons": []},
+                "paper_verifier_history": [],
+                "nl_proof_verifier_history": [],
+                "current": None,
+            },
         }
 
         with (
-            mock.patch.object(supervisor, "run_validation", return_value={"cycle": 12, "build": {"ok": True}}) as validation_mock,
+            mock.patch.object(
+                supervisor,
+                "validate_worker_cycle_artifacts",
+                return_value={
+                    "worker_handoff": state["last_worker_handoff"],
+                    "frontier_update": {
+                        "phase": "proof_formalization",
+                        "cycle": 12,
+                        "active_node_id": "paper.main",
+                        "active_node_after": None,
+                        "requested_action": "CLOSE",
+                        "cone_scope": "Close the active theorem from its current children only.",
+                        "allowed_edit_paths": ["GeneratedFrontier/Proofs/node_paper_main.lean"],
+                        "result_summary": "Closed the active theorem locally.",
+                        "proposed_nodes": [],
+                        "proposed_edges": [],
+                        "next_candidate_node_ids": ["paper.next"],
+                        "structural_change_reason": "",
+                    },
+                    "validation_summary": {"cycle": 12, "build": {"ok": True}},
+                },
+            ) as validation_mock,
             mock.patch.object(supervisor, "record_chat_event") as record_mock,
         ):
             recovered = supervisor.recover_interrupted_worker_state(config, state, "proof_formalization")
@@ -3384,11 +3550,85 @@ worker output
         self.assertTrue(recovered)
         self.assertEqual(state["last_theorem_frontier_worker_update"]["requested_action"], "CLOSE")
         validation_mock.assert_called_once()
-        _, call_args, call_kwargs = validation_mock.mock_calls[0]
-        self.assertEqual(call_args, (config, "proof_formalization", 12))
-        self.assertEqual(call_kwargs["previous_validation"], {"cycle": 12, "build": {"ok": True}})
-        self.assertIsInstance(call_kwargs["cycle_baseline"], dict)
+        _, call_args, _, = validation_mock.mock_calls[0]
+        self.assertEqual(call_args[:4], (config, state, "proof_formalization", 12))
         self.assertEqual(record_mock.call_count, 2)
+
+    def test_recover_interrupted_worker_state_missing_handoff_schedules_worker_retry(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (config.state_dir / "logs" / "worker-cycle-0012.ansi.log").write_text("worker output", encoding="utf-8")
+        (config.state_dir / "theorem_frontier_update.json").write_text(
+            json.dumps(
+                {
+                    "phase": "proof_formalization",
+                    "cycle": 12,
+                    "active_node_id": "paper.main",
+                    "active_node_after": None,
+                    "requested_action": "REFACTOR",
+                    "lean_proof_anchor": "",
+                    "cone_scope": "Investigate the active cone.",
+                    "allowed_edit_paths": ["GeneratedFrontier/Proofs/node_paper_main.lean"],
+                    "result_summary": "Recorded the local blocker without structural changes.",
+                    "proposed_nodes": [],
+                    "proposed_edges": [],
+                    "next_candidate_node_ids": ["paper.main"],
+                    "structural_change_reason": "",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        state = {
+            "cycle": 12,
+            "last_review": {"cycle": 11, "decision": "CONTINUE"},
+            "last_worker_output": "worker output",
+            "last_worker_output_cycle": 12,
+            "last_validation": None,
+            "last_theorem_frontier_worker_update": None,
+            "theorem_frontier": {
+                "mode": "full",
+                "active_node_id": "paper.main",
+                "current_action": "REFACTOR",
+                "nodes": {
+                    "paper.main": {
+                        "node_id": "paper.main",
+                        "kind": "paper",
+                        "status": "active",
+                        "lean_proof_status": "unproved",
+                        "natural_language_statement": "main",
+                        "natural_language_proof": "from children",
+                        "lean_statement": "def paperMainStatement : Prop := True",
+                        "lean_anchor": "PaperTheorems.paperMainStatement",
+                        "paper_provenance": "paper",
+                        "blocker_cluster": "main",
+                        "acceptance_evidence": "lean",
+                        "notes": "",
+                        "parent_ids": [],
+                        "child_ids": [],
+                    },
+                },
+                "edges": [],
+                "metrics": {"closed_nodes_count": 0, "failed_close_attempts": 0, "structural_churn": 0},
+                "escalation": {"required": False, "reasons": []},
+                "paper_verifier_history": [],
+                "nl_proof_verifier_history": [],
+                "current": None,
+            },
+        }
+
+        with (
+            mock.patch.object(supervisor, "record_chat_event"),
+        ):
+            recovered = supervisor.recover_interrupted_worker_state(config, state, "proof_formalization")
+
+        self.assertFalse(recovered)
+        self.assertNotIn("last_worker_handoff", state)
+        self.assertIsNone(state["last_theorem_frontier_worker_update"])
+        self.assertIn("last_worker_protocol_error", state)
+        self.assertIn("required handoff", state["last_worker_protocol_error"]["error"].lower())
 
     def test_recover_interrupted_worker_state_invalid_frontier_update_forces_worker_rerun(self) -> None:
         repo_path = self.make_repo()
@@ -3790,6 +4030,34 @@ class BurstRetryTests(SupervisorTestCase):
 
         self.assertTrue(
             supervisor.burst_hit_productive_local_failure(
+                {
+                    "captured_output": "",
+                    "per_cycle_log": log_path,
+                    "exit_code": 1,
+                }
+            )
+        )
+
+    def test_burst_hit_productive_local_failure_detects_codex_config_permission_error(self) -> None:
+        repo_path = self.make_repo()
+        log_path = repo_path / "codex-config-failed.log"
+        log_path.write_text(
+            "WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1)\n"
+            "Error loading config.toml: Failed to read config file /home/leanagent/.codex/config.toml: Permission denied (os error 13)\n",
+            encoding="utf-8",
+        )
+
+        self.assertTrue(
+            supervisor.burst_hit_productive_local_failure(
+                {
+                    "captured_output": "",
+                    "per_cycle_log": log_path,
+                    "exit_code": 1,
+                }
+            )
+        )
+        self.assertFalse(
+            supervisor.burst_hit_budget_error(
                 {
                     "captured_output": "",
                     "per_cycle_log": log_path,
@@ -4864,12 +5132,32 @@ class WorkflowTests(SupervisorTestCase):
             "per_cycle_log": "/tmp/fake-worker-log.ansi",
             "exit_code": 0,
             "usage": {
-                "start": {"provider": "codex", "role": "worker", "available": True, "usage": {"source_path": "/tmp/session.jsonl"}},
+                "start": {
+                    "provider": "codex",
+                    "role": "worker",
+                    "available": True,
+                    "usage": {
+                        "source_path": "/tmp/session.jsonl",
+                        "weekly_used_percent": 101.0,
+                        "weekly_budget_exhausted": True,
+                        "credits_available": 1000.0,
+                        "credits_spent": 0.0,
+                        "credits_limit": 1000.0,
+                    },
+                },
                 "end": {
                     "provider": "codex",
                     "role": "worker",
                     "available": True,
-                    "usage": {"source_path": "/tmp/session.jsonl", "timestamp": "2026-04-05T12:00:00Z"},
+                    "usage": {
+                        "source_path": "/tmp/session.jsonl",
+                        "timestamp": "2026-04-05T12:00:00Z",
+                        "weekly_used_percent": 101.0,
+                        "weekly_budget_exhausted": True,
+                        "credits_available": 997.5,
+                        "credits_spent": 2.5,
+                        "credits_limit": 1000.0,
+                    },
                 },
                 "delta": {
                     "mode": "delta",
@@ -4878,6 +5166,15 @@ class WorkflowTests(SupervisorTestCase):
                     "output_tokens": 9,
                     "reasoning_output_tokens": 3,
                     "total_tokens": 129,
+                    "weekly_used_percent_start": 101.0,
+                    "weekly_used_percent_end": 101.0,
+                    "weekly_budget_exhausted_start": True,
+                    "weekly_budget_exhausted_end": True,
+                    "post_weekly_budget": True,
+                    "post_weekly_budget_total_tokens_exact": True,
+                    "post_weekly_budget_total_tokens": 129,
+                    "paid_credits_used": 2.5,
+                    "paid_credits_basis": "credits_available",
                 },
             },
         }
@@ -4901,7 +5198,14 @@ class WorkflowTests(SupervisorTestCase):
         self.assertTrue(summary["tracked"])
         self.assertEqual(summary["by_role"]["codex:worker"]["burst_count"], 1)
         self.assertEqual(summary["by_role"]["codex:worker"]["total_tokens"], 129)
+        self.assertEqual(summary["by_role"]["codex:worker"]["post_weekly_budget_burst_count"], 1)
+        self.assertEqual(summary["by_role"]["codex:worker"]["post_weekly_budget_total_tokens_exact"], 129)
+        self.assertEqual(summary["by_role"]["codex:worker"]["paid_credits_known_burst_count"], 1)
+        self.assertEqual(summary["by_role"]["codex:worker"]["paid_credits_used_known_total"], 2.5)
         self.assertEqual(summary["recent_bursts"][-1]["role"], "worker")
+        self.assertEqual(summary["recent_bursts"][-1]["paid_credits"]["used"], 2.5)
+        self.assertTrue(summary["recent_bursts"][-1]["weekly_budget"]["post_weekly_budget"])
+        self.assertEqual(summary["latest_credit_status"]["credits_available"], 997.5)
 
     def test_main_writes_completed_cycle_checkpoint_after_successful_review(self) -> None:
         repo_path = self.make_repo()
@@ -5370,6 +5674,16 @@ class WorkflowTests(SupervisorTestCase):
                 },
             ],
             validations=[
+                {
+                    "cycle": 1,
+                    "phase": "proof_formalization",
+                    "build": {"ok": True},
+                    "syntax_checks": [{"ok": True}, {"ok": True}],
+                    "sorry_policy": {"disallowed_entries": []},
+                    "sorries": {"count": 0},
+                    "axioms": {"unapproved": []},
+                    "git": {"head": "proof-head", "cycle_changed_lean_files": []},
+                },
                 {
                     "cycle": 1,
                     "phase": "proof_formalization",
@@ -6312,6 +6626,113 @@ class WorkflowTests(SupervisorTestCase):
         self.assertEqual(written["git_ok"], summary["git_ok"])
         self.assertEqual(written["head"], summary["head"])
 
+    def test_commit_and_push_validated_cycle_commits_worker_changes(self) -> None:
+        repo_path = self.make_repo()
+        remote_root = repo_path.parent / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote_root)], check=True, capture_output=True, text=True)
+        config = self.make_config(repo_path, git_remote_url=str(remote_root))
+        supervisor.ensure_git_repository(config)
+        (repo_path / "tracked.txt").write_text("seed\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "init")
+        self.git(repo_path, "push", "origin", "HEAD:main")
+
+        (repo_path / "tracked.txt").write_text("validated change\n", encoding="utf-8")
+        state = {
+            "last_worker_handoff": {
+                "summary_of_changes": "Added a validated proof-support change.",
+                "current_frontier": "paper.reveal_open_pairs",
+                "likely_next_step": "Close the repaired node.",
+            }
+        }
+        decision = {
+            "decision": "CONTINUE",
+            "reason": "The validated step should be preserved by the supervisor.",
+        }
+        validation_summary = {
+            "cycle": 8,
+            "phase": "proof_formalization",
+            "build": {"ok": True},
+        }
+        frontier_review = {
+            "active_node_id": "paper.reveal_open_pairs",
+            "assessed_action": "REFACTOR",
+            "outcome": "STILL_OPEN",
+        }
+
+        with mock.patch.object(supervisor, "record_chat_event"):
+            result = supervisor.commit_and_push_validated_cycle(
+                config,
+                state,
+                "proof_formalization",
+                8,
+                decision,
+                validation_summary,
+                frontier_review=frontier_review,
+            )
+
+        self.assertTrue(result["committed"])
+        self.assertIn("paper.reveal_open_pairs", result["subject"])
+        self.assertEqual(self.git(repo_path, "status", "--short").stdout.strip(), "")
+        local_head = self.git(repo_path, "rev-parse", "HEAD").stdout.strip()
+        remote_head = self.git(remote_root, "rev-parse", "refs/heads/main").stdout.strip()
+        self.assertEqual(local_head, remote_head)
+        self.assertEqual(validation_summary["git"]["head"], local_head)
+        self.assertTrue(validation_summary["git"]["worktree_clean"])
+
+    def test_commit_and_push_validated_cycle_force_pushes_once_after_restore(self) -> None:
+        repo_path = self.make_repo()
+        remote_root = repo_path.parent / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote_root)], check=True, capture_output=True, text=True)
+        config = self.make_config(repo_path, git_remote_url=str(remote_root))
+        supervisor.ensure_git_repository(config)
+        tracked = repo_path / "tracked.txt"
+        tracked.write_text("seed\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "init")
+        self.git(repo_path, "push", "origin", "HEAD:main")
+        base_head = self.git(repo_path, "rev-parse", "HEAD").stdout.strip()
+
+        tracked.write_text("discarded branch history\n", encoding="utf-8")
+        self.git(repo_path, "commit", "-am", "discarded")
+        self.git(repo_path, "push", "origin", "HEAD:main")
+
+        self.git(repo_path, "reset", "--hard", base_head)
+        tracked.write_text("restored validated change\n", encoding="utf-8")
+        state = {
+            "last_worker_handoff": {
+                "summary_of_changes": "Recovered validated progress after restore.",
+            },
+            "git_force_with_lease_required": True,
+            "git_force_with_lease_branch": "main",
+            "git_force_with_lease_reason": "restore_cycle_checkpoint:7",
+        }
+        decision = {
+            "decision": "CONTINUE",
+            "reason": "Validated after restore.",
+        }
+        validation_summary = {
+            "cycle": 9,
+            "phase": "proof_formalization",
+            "build": {"ok": True},
+        }
+
+        with mock.patch.object(supervisor, "record_chat_event"):
+            result = supervisor.commit_and_push_validated_cycle(
+                config,
+                state,
+                "proof_formalization",
+                9,
+                decision,
+                validation_summary,
+            )
+
+        self.assertEqual(result["push_mode"], "force-with-lease")
+        self.assertFalse(state.get("git_force_with_lease_required"))
+        local_head = self.git(repo_path, "rev-parse", "HEAD").stdout.strip()
+        remote_head = self.git(remote_root, "rev-parse", "refs/heads/main").stdout.strip()
+        self.assertEqual(local_head, remote_head)
+
     def test_cleanup_phase_stuck_review_does_not_trigger_stuck_recovery(self) -> None:
         state = {
             "last_review": {
@@ -6505,6 +6926,7 @@ class WorkflowTests(SupervisorTestCase):
         state["last_review"] = {"cycle": 4, "phase": "proof_formalization", "decision": "CONTINUE"}
         state["review_log"].append(state["last_review"])
         state["theorem_frontier"] = None
+        state["roles"] = {"codex:worker": {"initialized": True}}
         supervisor.save_state(config, state)
         supervisor.JsonFile.dump(
             supervisor.validation_summary_path(config),
@@ -6513,14 +6935,19 @@ class WorkflowTests(SupervisorTestCase):
         supervisor.theorem_frontier_state_path(config).write_text("{}", encoding="utf-8")
         (config.state_dir / "worker_handoff.json").write_text("{}", encoding="utf-8")
         (config.state_dir / "review_decision.json").write_text("{}", encoding="utf-8")
-        (config.state_dir / "prompts").mkdir(parents=True, exist_ok=True)
+        prompts_dir = supervisor.supervisor_prompts_dir(config)
+        scripts_dir = supervisor.supervisor_scripts_dir(config)
+        runtime_dir = supervisor.supervisor_runtime_markers_dir(config)
+        legacy_prompts_dir = config.state_dir / "prompts"
+        legacy_prompts_dir.mkdir(parents=True, exist_ok=True)
         (config.state_dir / "logs").mkdir(parents=True, exist_ok=True)
-        (config.state_dir / "runtime").mkdir(parents=True, exist_ok=True)
-        (config.state_dir / "prompts" / "worker-cycle-0004.txt").write_text("future prompt\n", encoding="utf-8")
+        (prompts_dir / "worker-cycle-0004.txt").write_text("future prompt\n", encoding="utf-8")
+        (legacy_prompts_dir / "worker-cycle-0004.txt").write_text("legacy future prompt\n", encoding="utf-8")
         (config.state_dir / "logs" / "worker-cycle-0004.ansi.log").write_text("future log\n", encoding="utf-8")
         (config.state_dir / "logs" / "worker.latest.ansi.log").write_text("latest log\n", encoding="utf-8")
         (config.state_dir / "logs" / "worker.all.ansi.log").write_text("aggregate log\n", encoding="utf-8")
-        (config.state_dir / "runtime" / "worker-cycle-0004.started").write_text("started\n", encoding="utf-8")
+        (runtime_dir / "worker-cycle-0004.started").write_text("started\n", encoding="utf-8")
+        (scripts_dir / "worker-cycle-0004.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         supervisor.chat_repo_events_path(config).write_text(
             json.dumps({"cycle": 4, "kind": "worker_handoff"}) + "\n",
             encoding="utf-8",
@@ -6542,17 +6969,60 @@ class WorkflowTests(SupervisorTestCase):
         self.assertEqual(restored_state["cycle"], 1)
         self.assertIsInstance(restored_state["theorem_frontier"], dict)
         self.assertEqual(restored_state["theorem_frontier"]["active_node_id"], "paper.main")
+        self.assertEqual(restored_state["roles"], {})
         self.assertFalse((config.state_dir / "worker_handoff.json").exists())
         self.assertFalse((config.state_dir / "review_decision.json").exists())
-        self.assertFalse((config.state_dir / "prompts" / "worker-cycle-0004.txt").exists())
+        self.assertFalse((prompts_dir / "worker-cycle-0004.txt").exists())
+        self.assertFalse((legacy_prompts_dir / "worker-cycle-0004.txt").exists())
         self.assertFalse((config.state_dir / "logs" / "worker-cycle-0004.ansi.log").exists())
         self.assertFalse((config.state_dir / "logs" / "worker.latest.ansi.log").exists())
         self.assertFalse((config.state_dir / "logs" / "worker.all.ansi.log").exists())
-        self.assertFalse((config.state_dir / "runtime" / "worker-cycle-0004.started").exists())
+        self.assertFalse((runtime_dir / "worker-cycle-0004.started").exists())
+        self.assertFalse((scripts_dir / "worker-cycle-0004.sh").exists())
         self.assertFalse(Path(str(future_checkpoint["checkpoint_dir"])).exists())
         self.assertEqual([entry["cycle"] for entry in supervisor.list_cycle_checkpoints(config)], [1])
         self.assertIn('"cycle": 1', supervisor.chat_repo_events_path(config).read_text(encoding="utf-8"))
         self.assertEqual(supervisor.determine_resume_cycle_and_stage(restored_state), (2, "worker"))
+
+    def test_completed_cycle_checkpoint_restore_marks_force_with_lease_when_git_enabled(self) -> None:
+        repo_path = self.make_repo()
+        remote_root = repo_path.parent / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote_root)], check=True, capture_output=True, text=True)
+        config = self.make_config(repo_path, start_phase="planning", git_remote_url=str(remote_root))
+        supervisor.ensure_git_repository(config)
+        (repo_path / "tracked.txt").write_text("cycle-1\n", encoding="utf-8")
+        self.git(repo_path, "add", ".")
+        self.git(repo_path, "commit", "-m", "cycle1")
+        self.git(repo_path, "push", "origin", "HEAD:main")
+        head_one = self.git(repo_path, "rev-parse", "HEAD").stdout.strip()
+
+        state = {
+            "phase": "planning",
+            "cycle": 1,
+            "roles": {},
+            "review_log": [{"cycle": 1, "phase": "paper_check", "decision": "ADVANCE_PHASE"}],
+            "last_review": {"cycle": 1, "phase": "paper_check", "decision": "ADVANCE_PHASE"},
+            "last_validation": {"cycle": 1, "phase": "paper_check", "git": {"head": head_one}},
+        }
+        supervisor.save_state(config, state)
+        checkpoint = supervisor.write_completed_cycle_checkpoint(
+            config,
+            state,
+            cycle=1,
+            completed_phase="paper_check",
+            decision=state["last_review"],
+            validation_summary={"cycle": 1, "phase": "paper_check", "git": {"head": head_one}},
+        )
+        self.assertEqual(checkpoint["cycle"], 1)
+
+        (repo_path / "tracked.txt").write_text("cycle-2\n", encoding="utf-8")
+        self.git(repo_path, "commit", "-am", "cycle2")
+
+        supervisor.restore_cycle_checkpoint(config, cycle=1)
+        restored_state = supervisor.load_state(config)
+        self.assertTrue(restored_state["git_force_with_lease_required"])
+        self.assertEqual(restored_state["git_force_with_lease_branch"], "main")
+        self.assertEqual(restored_state["git_force_with_lease_reason"], "restore_cycle_checkpoint:1")
 
     def test_human_input_is_only_consumed_after_new_request(self) -> None:
         repo_path = self.make_repo()
@@ -7343,7 +7813,7 @@ class TmuxBurstTests(SupervisorTestCase):
         )
 
         prompt_stem = "worker-cycle-0007"
-        runtime_dir = config.state_dir / "runtime"
+        runtime_dir = supervisor.supervisor_runtime_markers_dir(config)
         logs_dir = config.state_dir / "logs"
         start_file = runtime_dir / f"{prompt_stem}.started"
         exit_file = runtime_dir / f"{prompt_stem}.exit"
@@ -7371,6 +7841,20 @@ class TmuxBurstTests(SupervisorTestCase):
         latest_log = config.state_dir / "logs" / "worker.latest.ansi.log"
         self.assertTrue(latest_log.exists())
         self.assertIn("existing-output", latest_log.read_text(encoding="utf-8"))
+
+    def test_burst_launch_prefix_uses_configured_worker_user(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path)
+        config.tmux.burst_user = "lagentworker"
+        config.tmux.burst_group = "leanagent"
+        config.tmux.burst_home = Path("/home/leanagent")
+
+        prefix = supervisor._burst_launch_prefix(config)
+
+        self.assertEqual(
+            prefix,
+            ["sudo", "-n", "-u", "lagentworker", "-g", "leanagent"],
+        )
 
 
 class NodeCentricTheoremFrontierTests(SupervisorTestCase):
@@ -7556,7 +8040,7 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
         config, state = self.active_state()
         commands: list[list[str]] = []
 
-        def fake_run(command: list[str], cwd: Path) -> dict:
+        def fake_run(config: supervisor.Config, command: list[str], cwd: Path) -> dict:
             commands.append([str(part) for part in command])
             return {
                 "command": [str(part) for part in command],
@@ -7644,7 +8128,7 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
         config, state = self.active_state()
         commands: list[list[str]] = []
 
-        def fake_run(command: list[str], cwd: Path) -> dict:
+        def fake_run(config: supervisor.Config, command: list[str], cwd: Path) -> dict:
             commands.append([str(part) for part in command])
             return {
                 "command": [str(part) for part in command],
@@ -7887,6 +8371,8 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
         self.assertIn('"next_candidate_node_ids"', prompt)
         self.assertIn("GeneratedFrontier/Statements.lean", prompt)
         self.assertIn("edit only `repo/GeneratedFrontier/Proofs/<active-node>.lean`", prompt)
+        self.assertIn("Prefer the smallest rigorous structural refinement", prompt)
+        self.assertIn("incrementally admit the paper-approved and NL-approved subset", prompt)
         self.assertIn("prefer nodes whose clarification would be maximally informative", prompt)
         self.assertIn("at least as detailed as the paper", prompt)
         self.assertIn("placeholder or sketch prose", prompt)
@@ -7907,6 +8393,8 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
         self.assertIn("prioritize information gain", prompt)
         self.assertIn("knock-on refactor/restatement effects", prompt)
         self.assertIn("outside the declared local child set", prompt)
+        self.assertIn("do not treat admission as all-or-nothing", prompt)
+        self.assertIn("prefer a `STILL_OPEN` outcome with a rigorous approved subset", prompt)
 
     def test_worker_prompt_notes_when_requested_next_node_auto_closed(self) -> None:
         config, state = self.active_state()
@@ -7939,6 +8427,8 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
             "the authoritative frontier for that cycle resolved to `ri.local.top` instead",
             prompt,
         )
+        self.assertIn("- Next prompt: Continue proof formalization at `ri.local.top`.", prompt)
+        self.assertNotIn("Continue proof formalization from `ri.local.wrapper`.", prompt)
 
     def test_worker_prompt_includes_close_validation_note(self) -> None:
         config, state = self.active_state()
@@ -8004,6 +8494,7 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
         self.assertIn('"approved_node_ids"', prompt)
         self.assertNotIn('"approved_edges"', prompt)
         self.assertIn("include that active node id in `approved_node_ids`", prompt)
+        self.assertIn("incrementally admit that approved subset", prompt)
 
     def test_paper_verifier_prompt_mentions_rewritten_active_node_approval(self) -> None:
         repo_path = self.make_repo()
@@ -8017,6 +8508,7 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
         )
 
         self.assertIn("include that active node id in `approved_node_ids`", prompt)
+        self.assertIn("approve the rigorous paper-faithful subset", prompt)
 
     @mock.patch.object(supervisor, "append_jsonl")
     @mock.patch.object(supervisor, "save_state")
@@ -8326,6 +8818,226 @@ class NodeCentricTheoremFrontierTests(SupervisorTestCase):
                 ),
                 cycle=5,
             )
+
+    def test_update_theorem_frontier_full_state_partially_admits_expand_subset_on_still_open(self) -> None:
+        config, state = self.active_state()
+        payload = state["theorem_frontier"]
+        payload["nodes"]["ri.local.base"] = supervisor.theorem_frontier_node_record(
+            self.node("ri.local.base"),
+            status="open",
+            parent_ids=["ri.local.graph_pair"],
+            child_ids=[],
+        )
+        payload["edges"] = [self.edge("ri.local.graph_pair", "ri.local.base")]
+        payload["nodes"]["ri.local.graph_pair"]["child_ids"] = ["ri.local.base"]
+
+        result = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                5,
+                self.worker_update(
+                    cycle=5,
+                    requested_action="EXPAND",
+                    active_node_after=self.node(
+                        natural_language_proof=(
+                            "Assume the child node `ri.local.mid`. From `ri.local.mid` we recover the active theorem "
+                            "along the refined local route."
+                        ),
+                        notes="Refined locally but only one new child is fully justified this cycle.",
+                    ),
+                    proposed_nodes=[
+                        self.node("ri.local.mid"),
+                        self.node("ri.local.weak"),
+                    ],
+                    proposed_edges=[
+                        self.edge("ri.local.graph_pair", "ri.local.mid"),
+                        self.edge("ri.local.mid", "ri.local.base"),
+                        self.edge("ri.local.mid", "ri.local.weak"),
+                    ],
+                    next_candidate_node_ids=["ri.local.mid"],
+                    structural_change_reason="Insert one rigorous intermediate now and leave the weaker sibling for a later cycle.",
+                ),
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                5,
+                self.review(
+                    cycle=5,
+                    assessed_action="EXPAND",
+                    outcome="STILL_OPEN",
+                    next_active_node_id="ri.local.mid",
+                    open_hypotheses=["justify the remaining weak leaf before the whole refinement is complete"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                5,
+                self.paper_review(
+                    cycle=5,
+                    approved_node_ids=["ri.local.graph_pair", "ri.local.mid", "ri.local.weak"],
+                    approved_edges=[
+                        self.edge("ri.local.graph_pair", "ri.local.mid"),
+                        self.edge("ri.local.mid", "ri.local.base"),
+                        self.edge("ri.local.mid", "ri.local.weak"),
+                    ],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                5,
+                self.nl_proof_review(
+                    cycle=5,
+                    decision="APPROVE_WITH_CAVEAT",
+                    approved_node_ids=["ri.local.graph_pair", "ri.local.mid"],
+                    justification="The active rewrite and the `ri.local.mid` node are rigorous, but `ri.local.weak` still needs another cycle.",
+                    caveat="Do not admit `ri.local.weak` yet.",
+                ),
+            ),
+            cycle=5,
+        )
+
+        self.assertEqual(result["active_node_id"], "ri.local.mid")
+        self.assertIn("ri.local.mid", result["nodes"])
+        self.assertNotIn("ri.local.weak", result["nodes"])
+        self.assertCountEqual(result["nodes"]["ri.local.graph_pair"]["child_ids"], ["ri.local.mid"])
+        self.assertCountEqual(result["nodes"]["ri.local.mid"]["child_ids"], ["ri.local.base"])
+        self.assertEqual(
+            [(edge["parent"], edge["child"]) for edge in result["edges"]],
+            [("ri.local.graph_pair", "ri.local.mid"), ("ri.local.mid", "ri.local.base")],
+        )
+
+    def test_update_theorem_frontier_full_state_allows_nl_to_approve_active_node_without_admitting_new_child(self) -> None:
+        config, state = self.active_state()
+        payload = state["theorem_frontier"]
+        original_edges = supervisor.deep_copy_jsonish(payload["edges"])
+        original_active = supervisor.deep_copy_jsonish(payload["nodes"]["ri.local.graph_pair"])
+
+        result = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                5,
+                self.worker_update(
+                    cycle=5,
+                    requested_action="EXPAND",
+                    active_node_after=self.node(
+                        natural_language_proof=(
+                            "Assume the child node `ri.local.budget`. From `ri.local.budget` and the existing local bookkeeping "
+                            "we recover the active theorem."
+                        ),
+                        notes="Expose the missing local bridge as one new support node.",
+                    ),
+                    proposed_nodes=[self.node("ri.local.budget")],
+                    proposed_edges=[self.edge("ri.local.graph_pair", "ri.local.budget")],
+                    next_candidate_node_ids=["ri.local.budget"],
+                    structural_change_reason="Separate the missing bridge into its own support node.",
+                ),
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                5,
+                self.review(
+                    cycle=5,
+                    assessed_action="EXPAND",
+                    outcome="STILL_OPEN",
+                    next_active_node_id="ri.local.graph_pair",
+                    open_hypotheses=["justify the new support child locally"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                5,
+                self.paper_review(
+                    cycle=5,
+                    approved_node_ids=["ri.local.budget"],
+                    approved_edges=[self.edge("ri.local.graph_pair", "ri.local.budget")],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                5,
+                self.nl_proof_review(
+                    cycle=5,
+                    decision="APPROVE_WITH_CAVEAT",
+                    approved_node_ids=["ri.local.graph_pair"],
+                    justification="The rewritten active proof is rigorous relative to the proposed new child, but the child is not yet locally rigorous.",
+                    caveat="Do not admit the new support child yet.",
+                ),
+            ),
+            cycle=5,
+        )
+
+        self.assertEqual(result["active_node_id"], "ri.local.graph_pair")
+        self.assertNotIn("ri.local.budget", result["nodes"])
+        self.assertEqual(result["edges"], original_edges)
+        self.assertEqual(
+            result["nodes"]["ri.local.graph_pair"]["natural_language_statement"],
+            original_active["natural_language_statement"],
+        )
+
+    def test_update_theorem_frontier_full_state_keeps_active_node_on_still_open_without_admission(self) -> None:
+        config, state = self.active_state()
+
+        result = supervisor.update_theorem_frontier_full_state(
+            config,
+            state,
+            supervisor.validate_theorem_frontier_worker_update_full(
+                "proof_formalization",
+                5,
+                self.worker_update(
+                    cycle=5,
+                    requested_action="EXPAND",
+                    active_node_after=self.node(
+                        natural_language_proof=(
+                            "Assume the child node `ri.local.budget`. From `ri.local.budget` and the existing local bookkeeping "
+                            "we recover the active theorem."
+                        ),
+                    ),
+                    proposed_nodes=[self.node("ri.local.budget")],
+                    proposed_edges=[self.edge("ri.local.graph_pair", "ri.local.budget")],
+                    next_candidate_node_ids=["ri.local.budget"],
+                    structural_change_reason="Separate the missing bridge into its own support node.",
+                ),
+            ),
+            supervisor.validate_theorem_frontier_review_full(
+                "proof_formalization",
+                5,
+                self.review(
+                    cycle=5,
+                    assessed_action="EXPAND",
+                    outcome="STILL_OPEN",
+                    next_active_node_id="ri.local.budget",
+                    open_hypotheses=["justify the proposed support child locally"],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_paper_verifier_review(
+                "proof_formalization",
+                5,
+                self.paper_review(
+                    cycle=5,
+                    approved_node_ids=["ri.local.budget"],
+                    approved_edges=[self.edge("ri.local.graph_pair", "ri.local.budget")],
+                ),
+            ),
+            supervisor.validate_theorem_frontier_nl_proof_verifier_review(
+                "proof_formalization",
+                5,
+                self.nl_proof_review(
+                    cycle=5,
+                    decision="REJECT",
+                    approved_node_ids=[],
+                    justification="The proposed support child is still missing the local bridge proof.",
+                ),
+            ),
+            cycle=5,
+        )
+
+        self.assertEqual(result["active_node_id"], "ri.local.graph_pair")
+        self.assertEqual(result["current"]["requested_next_active_node_id"], "ri.local.budget")
+        self.assertEqual(result["current"]["next_active_node_id"], "ri.local.graph_pair")
 
     def test_update_theorem_frontier_full_state_refute_replace_prunes_detached_subtree(self) -> None:
         config, state = self.active_state()
@@ -9381,6 +10093,110 @@ class NodeCentricDagExportTests(SupervisorTestCase):
         self.assertEqual(cycle_two_entry["frontier"]["nodes"]["lemma_a"]["status"], "closed")
         self.assertEqual(cycle_two_entry["frontier"]["active_node_id"], "main_thm")
         self.assertEqual((cycle_two_entry["run_status"] or {}).get("current_cycle"), 2)
+
+    def test_build_dag_cycle_history_entries_recovers_missing_manifest_checkpoints_from_dirs(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+
+        for cycle, completed_phase, phase in [
+            (1, "paper_check", "planning"),
+            (2, "planning", "theorem_stating"),
+            (3, "theorem_stating", "proof_formalization"),
+        ]:
+            checkpoint_dir = supervisor.cycle_checkpoint_dir(config, cycle)
+            (checkpoint_dir / "state").mkdir(parents=True, exist_ok=True)
+            supervisor.JsonFile.dump(
+                checkpoint_dir / "state" / "state.json",
+                {
+                    "phase": phase,
+                    "cycle": cycle,
+                    "last_review": {"cycle": cycle, "phase": completed_phase, "decision": "CONTINUE"},
+                },
+            )
+            supervisor.JsonFile.dump(
+                checkpoint_dir / "metadata.json",
+                {
+                    "cycle": cycle,
+                    "completed_phase": completed_phase,
+                    "created_at": f"2026-04-03T10:0{cycle}:00-04:00",
+                    "checkpoint_dir": str(checkpoint_dir),
+                },
+            )
+
+        supervisor.JsonFile.dump(
+            supervisor.cycle_checkpoint_manifest_path(config),
+            {
+                "checkpoints": [
+                    {
+                        "cycle": 3,
+                        "completed_phase": "theorem_stating",
+                        "created_at": "2026-04-03T10:03:00-04:00",
+                        "checkpoint_dir": str(supervisor.cycle_checkpoint_dir(config, 3)),
+                    }
+                ]
+            },
+        )
+
+        live_state = {
+            "phase": "proof_formalization",
+            "cycle": 4,
+            "last_review": {
+                "cycle": 3,
+                "phase": "theorem_stating",
+                "decision": "CONTINUE",
+                "next_prompt": "Continue proof work.",
+            },
+        }
+
+        entries = supervisor.build_dag_cycle_history_entries(config, live_state)
+
+        self.assertEqual([entry["cycle"] for entry in entries], [1, 2, 3, 4])
+
+    def test_fallback_dag_history_includes_pre_frontier_review_log_cycles(self) -> None:
+        repo_path = self.make_repo()
+        config = self.make_config(repo_path, theorem_frontier_phase="full")
+        config.state_dir.mkdir(parents=True, exist_ok=True)
+
+        state = self._make_frontier_state()
+        state["cycle"] = 9
+        state["phase"] = "proof_formalization"
+        state["review_log"] = [
+            {
+                "phase": "paper_check",
+                "cycle": 1,
+                "decision": "ADVANCE_PHASE",
+                "reason": "paper checked",
+                "next_prompt": "Advance to planning.",
+            },
+            {
+                "phase": "planning",
+                "cycle": 2,
+                "decision": "ADVANCE_PHASE",
+                "reason": "plan complete",
+                "next_prompt": "Advance to theorem stating.",
+            },
+        ]
+        state["last_review"] = {
+            "phase": "proof_formalization",
+            "cycle": 8,
+            "decision": "CONTINUE",
+            "reason": "cycle 8 done",
+            "next_prompt": "Continue proof formalization at main_thm.",
+        }
+
+        history_path = supervisor.theorem_frontier_history_path(config)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_entries = [
+            {"cycle": 3, "event": "seed", "active_node_id": "main_thm", "updated_at": "2026-04-03T10:03:00-04:00"},
+            {"cycle": 4, "assessed_action": "REFACTOR", "outcome": "STILL_OPEN", "active_node_id": "main_thm"},
+            {"cycle": 4, "assessed_action": "REFACTOR", "outcome": "STILL_OPEN", "active_node_id": "main_thm"},
+        ]
+        supervisor.write_jsonl(history_path, history_entries)
+
+        entries = supervisor.build_dag_cycle_history_entries(config, state)
+
+        self.assertEqual([entry["cycle"] for entry in entries], [1, 2, 3, 4, 9])
 
 
 if __name__ == "__main__":

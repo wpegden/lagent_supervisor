@@ -430,6 +430,26 @@ TOKEN_USAGE_TOTAL_FIELDS: Tuple[str, ...] = (
 )
 
 
+def _exact_paid_credit_delta(start_usage: Dict[str, Any], end_usage: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    for decreasing_field in ("credits_available", "credits_remaining"):
+        start_value = start_usage.get(decreasing_field)
+        end_value = end_usage.get(decreasing_field)
+        if start_value is None or end_value is None:
+            continue
+        delta = float(start_value) - float(end_value)
+        if delta >= 0:
+            return delta, decreasing_field
+    for increasing_field in ("credits_spent", "credits_used"):
+        start_value = start_usage.get(increasing_field)
+        end_value = end_usage.get(increasing_field)
+        if start_value is None or end_value is None:
+            continue
+        delta = float(end_value) - float(start_value)
+        if delta >= 0:
+            return delta, increasing_field
+    return None, ""
+
+
 def _provider_usage_snapshot(adapter: ProviderAdapter) -> Dict[str, Any]:
     if adapter.cfg.provider == "codex":
         usage = latest_codex_token_usage_for_scope(adapter.work_dir())
@@ -461,23 +481,46 @@ def _provider_usage_delta(start: Dict[str, Any], end: Dict[str, Any]) -> Optiona
         return {
             "mode": "end_total_new_session",
             **{field: int(end_usage.get(field) or 0) for field in TOKEN_USAGE_TOTAL_FIELDS},
+            "weekly_used_percent_start": start_usage.get("weekly_used_percent"),
+            "weekly_used_percent_end": end_usage.get("weekly_used_percent"),
+            "weekly_budget_exhausted_start": bool(start_usage.get("weekly_budget_exhausted")),
+            "weekly_budget_exhausted_end": bool(end_usage.get("weekly_budget_exhausted")),
+            "post_weekly_budget": bool(end_usage.get("weekly_budget_exhausted")),
+            "post_weekly_budget_total_tokens_exact": False,
+            "post_weekly_budget_total_tokens": 0,
+            "paid_credits_used": None,
+            "paid_credits_basis": "",
         }
     delta: Dict[str, Any] = {"mode": "delta"}
     for field in TOKEN_USAGE_TOTAL_FIELDS:
         delta[field] = max(0, int(end_usage.get(field) or 0) - int(start_usage.get(field) or 0))
+    start_weekly_exhausted = bool(start_usage.get("weekly_budget_exhausted"))
+    end_weekly_exhausted = bool(end_usage.get("weekly_budget_exhausted"))
+    delta["weekly_used_percent_start"] = start_usage.get("weekly_used_percent")
+    delta["weekly_used_percent_end"] = end_usage.get("weekly_used_percent")
+    delta["weekly_budget_exhausted_start"] = start_weekly_exhausted
+    delta["weekly_budget_exhausted_end"] = end_weekly_exhausted
+    delta["post_weekly_budget"] = end_weekly_exhausted
+    delta["post_weekly_budget_total_tokens_exact"] = start_weekly_exhausted and end_weekly_exhausted
+    delta["post_weekly_budget_total_tokens"] = delta["total_tokens"] if delta["post_weekly_budget_total_tokens_exact"] else 0
+    paid_credits_used, paid_credits_basis = _exact_paid_credit_delta(start_usage, end_usage)
+    delta["paid_credits_used"] = paid_credits_used
+    delta["paid_credits_basis"] = paid_credits_basis
     return delta
 
 
 def agent_token_usage_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     payload = state.get("agent_token_usage")
     if not isinstance(payload, dict):
-        return {"tracked": False, "by_role": {}, "recent_bursts": []}
+        return {"tracked": False, "by_role": {}, "recent_bursts": [], "latest_credit_status": None}
     by_role = payload.get("by_role")
     recent = payload.get("recent_bursts")
+    latest_credit_status = payload.get("latest_credit_status")
     return {
         "tracked": bool(by_role),
         "by_role": by_role if isinstance(by_role, dict) else {},
         "recent_bursts": recent[-10:] if isinstance(recent, list) else [],
+        "latest_credit_status": latest_credit_status if isinstance(latest_credit_status, dict) else None,
     }
 
 
@@ -495,8 +538,11 @@ def record_agent_burst_usage(
     usage = run.get("usage")
     if not isinstance(usage, dict):
         return
-    end_usage = usage.get("end")
-    if not (isinstance(end_usage, dict) and end_usage.get("available")):
+    end_payload = usage.get("end")
+    if not (isinstance(end_payload, dict) and end_payload.get("available")):
+        return
+    end_usage = end_payload.get("usage")
+    if not isinstance(end_usage, dict):
         return
     delta = usage.get("delta")
     if not isinstance(delta, dict):
@@ -511,17 +557,47 @@ def record_agent_burst_usage(
             "provider": adapter.cfg.provider,
             "role": adapter.role,
             "burst_count": 0,
+            "post_weekly_budget_burst_count": 0,
+            "post_weekly_budget_total_tokens_exact": 0,
+            "paid_credits_known_burst_count": 0,
+            "paid_credits_used_known_total": 0.0,
             **{field: 0 for field in TOKEN_USAGE_TOTAL_FIELDS},
         },
     )
     role_entry["burst_count"] = int(role_entry.get("burst_count") or 0) + 1
     for field in TOKEN_USAGE_TOTAL_FIELDS:
         role_entry[field] = int(role_entry.get(field) or 0) + int(delta.get(field) or 0)
+    if bool(delta.get("post_weekly_budget")):
+        role_entry["post_weekly_budget_burst_count"] = int(role_entry.get("post_weekly_budget_burst_count") or 0) + 1
+    if bool(delta.get("post_weekly_budget_total_tokens_exact")):
+        role_entry["post_weekly_budget_total_tokens_exact"] = int(role_entry.get("post_weekly_budget_total_tokens_exact") or 0) + int(delta.get("post_weekly_budget_total_tokens") or 0)
+    if delta.get("paid_credits_used") is not None:
+        role_entry["paid_credits_known_burst_count"] = int(role_entry.get("paid_credits_known_burst_count") or 0) + 1
+        role_entry["paid_credits_used_known_total"] = float(role_entry.get("paid_credits_used_known_total") or 0.0) + float(delta.get("paid_credits_used") or 0.0)
     role_entry["last_timestamp"] = end_usage.get("timestamp")
     role_entry["last_cycle"] = int(cycle)
     role_entry["last_phase"] = phase
     role_entry["last_stage"] = stage_label
     role_entry["source_path"] = end_usage.get("source_path")
+    role_entry["last_weekly_used_percent"] = end_usage.get("weekly_used_percent")
+    role_entry["last_weekly_budget_exhausted"] = bool(end_usage.get("weekly_budget_exhausted"))
+    role_entry["last_credits_available"] = end_usage.get("credits_available")
+    role_entry["last_credits_remaining"] = end_usage.get("credits_remaining")
+    role_entry["last_credits_used"] = end_usage.get("credits_used")
+    role_entry["last_credits_spent"] = end_usage.get("credits_spent")
+    role_entry["last_credits_limit"] = end_usage.get("credits_limit")
+    latest_credit_status = {
+        "timestamp": end_usage.get("timestamp"),
+        "source_path": end_usage.get("source_path"),
+        "weekly_used_percent": end_usage.get("weekly_used_percent"),
+        "weekly_budget_exhausted": bool(end_usage.get("weekly_budget_exhausted")),
+        "credits_available": end_usage.get("credits_available"),
+        "credits_remaining": end_usage.get("credits_remaining"),
+        "credits_used": end_usage.get("credits_used"),
+        "credits_spent": end_usage.get("credits_spent"),
+        "credits_limit": end_usage.get("credits_limit"),
+    }
+    totals["latest_credit_status"] = latest_credit_status
     burst_entry = {
         "timestamp": timestamp_now(),
         "cycle": int(cycle),
@@ -534,6 +610,22 @@ def record_agent_burst_usage(
         "mode": str(delta.get("mode") or ""),
         "source_path": end_usage.get("source_path"),
         "burst_tag": run.get("burst_tag"),
+        "weekly_budget": {
+            "used_percent_start": delta.get("weekly_used_percent_start"),
+            "used_percent_end": delta.get("weekly_used_percent_end"),
+            "post_weekly_budget": bool(delta.get("post_weekly_budget")),
+            "post_weekly_budget_total_tokens_exact": bool(delta.get("post_weekly_budget_total_tokens_exact")),
+            "post_weekly_budget_total_tokens": int(delta.get("post_weekly_budget_total_tokens") or 0),
+        },
+        "paid_credits": {
+            "used": delta.get("paid_credits_used"),
+            "basis": str(delta.get("paid_credits_basis") or ""),
+            "available_end": end_usage.get("credits_available"),
+            "remaining_end": end_usage.get("credits_remaining"),
+            "used_end": end_usage.get("credits_used"),
+            "spent_end": end_usage.get("credits_spent"),
+            "limit_end": end_usage.get("credits_limit"),
+        },
     }
     recent.append(burst_entry)
     if len(recent) > 200:
@@ -569,6 +661,20 @@ def theorem_frontier_reviewer_resolution_note(state: Dict[str, Any]) -> str:
         f"the reviewer requested `{requested}`, but the authoritative frontier for that cycle "
         f"resolved to `{resolved}` instead; continue from `{resolved}`."
     )
+
+
+def theorem_frontier_authoritative_next_prompt(
+    state: Dict[str, Any],
+    *,
+    fallback: str = "",
+) -> str:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return fallback
+    active_node_id = normalize_frontier_text(payload.get("active_node_id"))
+    if not active_node_id:
+        return fallback
+    return f"Continue proof formalization at `{active_node_id}`."
 
 
 def theorem_frontier_close_validation_note(state: Dict[str, Any], phase: str) -> str:
@@ -645,13 +751,22 @@ def dag_cycle_history_entry_from_state(
     last_review = state.get("last_review") if isinstance(state.get("last_review"), dict) else {}
     run_status = run_status_for_meta(config, state)
     payload = theorem_frontier_payload(state)
+    current_payload = payload.get("current") if isinstance(payload, dict) and isinstance(payload.get("current"), dict) else {}
+    last_review_cycle = int(last_review.get("cycle", 0) or 0) if isinstance(last_review, dict) else 0
+    carry_review = not (entry_type == "live_snapshot" and last_review_cycle < int(cycle))
     entry: Dict[str, Any] = {
         "cycle": int(cycle),
         "type": entry_type,
         "phase": phase,
         "completed_phase": completed_phase or phase,
-        "decision": str(last_review.get("decision", "")).strip(),
-        "decision_reason": str(last_review.get("reason", "")).strip(),
+        "decision": str(last_review.get("decision", "")).strip() if carry_review else "",
+        "decision_reason": str(last_review.get("reason", "")).strip() if carry_review else "",
+        "current_action": (
+            str(current_payload.get("assessed_action") or (payload.get("current_action") if isinstance(payload, dict) else "") or "").strip()
+            if carry_review
+            else ""
+        ),
+        "outcome": str(current_payload.get("outcome", "") or "").strip() if carry_review else "",
         "worker_directive": str(run_status.get("current_task_full") or ""),
         "timestamp": timestamp,
         "run_status": run_status,
@@ -781,6 +896,191 @@ def _rebuild_cycle_history_state_from_bundle(
     return state
 
 
+def _load_internal_theorem_frontier_history(config: Config) -> List[Dict[str, Any]]:
+    path = theorem_frontier_history_path(config)
+    if not path.exists():
+        return []
+    entries: List[Dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            entries.append(item)
+    entries.sort(key=lambda item: int(item.get("cycle", 0) or 0))
+    return entries
+
+
+def _reset_frontier_for_history_seed(payload: Dict[str, Any], active_node_id: str) -> Dict[str, Any]:
+    seed_payload = deep_copy_jsonish(payload)
+    nodes = seed_payload.get("nodes")
+    if isinstance(nodes, dict):
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                continue
+            node["status"] = "open"
+            node["lean_proof_status"] = "unproved"
+    if active_node_id and isinstance(nodes, dict) and isinstance(nodes.get(active_node_id), dict):
+        nodes[active_node_id]["status"] = "active"
+    seed_payload["active_node_id"] = active_node_id or seed_payload.get("active_node_id")
+    seed_payload["current_action"] = ""
+    current = seed_payload.get("current")
+    if isinstance(current, dict):
+        current["cycle"] = int(seed_payload.get("current", {}).get("cycle", 0) or 0)
+        current["assessed_action"] = ""
+        current["outcome"] = ""
+    return seed_payload
+
+
+def _fallback_dag_cycle_history_entries_from_frontier_log(
+    config: Config,
+    state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    payload = theorem_frontier_payload(state)
+    if not isinstance(payload, dict):
+        return []
+    internal_history = _load_internal_theorem_frontier_history(config)
+    if not internal_history:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    deduped_history: List[Dict[str, Any]] = []
+    by_cycle: Dict[int, Dict[str, Any]] = {}
+    for item in internal_history:
+        try:
+            cycle = int(item.get("cycle", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if cycle <= 0:
+            continue
+        by_cycle[cycle] = item
+    for cycle in sorted(by_cycle):
+        deduped_history.append(by_cycle[cycle])
+
+    first_frontier_cycle = int(deduped_history[0].get("cycle", 0) or 0) if deduped_history else 0
+    review_log = state.get("review_log") if isinstance(state.get("review_log"), list) else []
+    for item in review_log:
+        if not isinstance(item, dict):
+            continue
+        try:
+            cycle = int(item.get("cycle", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if cycle <= 0 or (first_frontier_cycle > 0 and cycle >= first_frontier_cycle):
+            continue
+        completed_phase = str(item.get("phase") or "").strip()
+        if completed_phase not in PHASES:
+            continue
+        phase = completed_phase
+        if str(item.get("decision") or "").strip().upper() == "ADVANCE_PHASE":
+            phase = next_phase(completed_phase) or completed_phase
+        synthetic_state = {
+            "phase": phase,
+            "cycle": cycle,
+            "last_review": dict(item),
+        }
+        entries.append(
+            dag_cycle_history_entry_from_state(
+                config,
+                synthetic_state,
+                cycle=cycle,
+                timestamp=str(item.get("updated_at") or ""),
+                entry_type="cycle_snapshot",
+                completed_phase=completed_phase,
+            )
+        )
+
+    working_payload: Optional[Dict[str, Any]] = None
+    last_cycle = 0
+    for item in deduped_history:
+        cycle = int(item.get("cycle", 0) or 0)
+        if cycle <= 0:
+            continue
+        last_cycle = max(last_cycle, cycle)
+        event = str(item.get("event") or "").strip().lower()
+        outcome = str(item.get("outcome") or "").strip().upper()
+        active_node_id = normalize_frontier_text(item.get("active_node_id"))
+        reviewed_node_id = normalize_frontier_text(item.get("reviewed_node_id"))
+        next_active_node_id = normalize_frontier_text(item.get("next_active_node_id"))
+        timestamp = str(item.get("updated_at") or timestamp_now())
+        if event == "seed" or working_payload is None:
+            working_payload = _reset_frontier_for_history_seed(payload, active_node_id)
+            entries.append(
+                dag_cycle_history_entry_from_state(
+                    config,
+                    {"phase": state.get("phase"), "cycle": cycle, "theorem_frontier": working_payload},
+                    cycle=cycle,
+                    timestamp=timestamp,
+                    entry_type="cycle_snapshot",
+                    completed_phase="theorem_stating",
+                )
+            )
+            continue
+
+        working_payload = deep_copy_jsonish(working_payload)
+        nodes = working_payload.get("nodes")
+        if isinstance(nodes, dict):
+            for node_id, node in nodes.items():
+                if not isinstance(node, dict):
+                    continue
+                if node.get("status") == "active":
+                    node["status"] = "open"
+            if outcome == "CLOSED" and reviewed_node_id and isinstance(nodes.get(reviewed_node_id), dict):
+                nodes[reviewed_node_id]["status"] = "closed"
+                nodes[reviewed_node_id]["lean_proof_status"] = "proved"
+            if next_active_node_id and isinstance(nodes.get(next_active_node_id), dict):
+                if str(nodes[next_active_node_id].get("status") or "").strip().lower() != "closed":
+                    nodes[next_active_node_id]["status"] = "active"
+        working_payload["active_node_id"] = next_active_node_id or active_node_id or working_payload.get("active_node_id")
+        working_payload["current_action"] = str(item.get("assessed_action") or "")
+        current = working_payload.get("current")
+        if not isinstance(current, dict):
+            current = {}
+            working_payload["current"] = current
+        current["cycle"] = cycle
+        current["assessed_action"] = str(item.get("assessed_action") or "")
+        current["outcome"] = outcome
+        working_state = {
+            "phase": state.get("phase"),
+            "cycle": cycle,
+            "theorem_frontier": working_payload,
+            "last_review": {
+                "cycle": cycle,
+                "phase": state.get("phase"),
+                "decision": "CONTINUE",
+                "reason": str(item.get("justification") or ""),
+                "next_prompt": "",
+            },
+        }
+        entries.append(
+            dag_cycle_history_entry_from_state(
+                config,
+                working_state,
+                cycle=cycle,
+                timestamp=timestamp,
+                entry_type="cycle_snapshot",
+                completed_phase=str(state.get("phase") or ""),
+            )
+        )
+
+    current_cycle = int(state.get("cycle", 0) or 0)
+    if current_cycle > 0 and current_cycle > last_cycle:
+        entries.append(
+            dag_cycle_history_entry_from_state(
+                config,
+                state,
+                cycle=current_cycle,
+                timestamp=timestamp_now(),
+                entry_type="live_snapshot",
+            )
+        )
+    return entries
+
+
 def build_dag_cycle_history_entries(config: Config, state: Dict[str, Any]) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     checkpoints = sorted(list_cycle_checkpoints(config), key=lambda item: int(item.get("cycle", 0) or 0))
@@ -830,6 +1130,9 @@ def build_dag_cycle_history_entries(config: Config, state: Dict[str, Any]) -> Li
                 entry_type="live_snapshot",
             )
         )
+    fallback_entries = _fallback_dag_cycle_history_entries_from_frontier_log(config, state)
+    if len(fallback_entries) > len(entries):
+        return fallback_entries
     return entries
 
 
@@ -933,7 +1236,10 @@ def worker_directive_summary(state: Dict[str, Any]) -> str:
     if resolution_note:
         parts.append(f"Supervisor note: {resolution_note}")
     if isinstance(last_review, dict):
-        next_prompt = str(last_review.get("next_prompt", "")).strip()
+        next_prompt = theorem_frontier_authoritative_next_prompt(
+            state,
+            fallback=str(last_review.get("next_prompt", "")).strip(),
+        )
         if next_prompt:
             parts.append(next_prompt)
     recovery = state.get("stuck_recovery")
@@ -1619,15 +1925,26 @@ def load_state(config: Config) -> Dict[str, Any]:
         raw_frontier = JsonFile.load(theorem_frontier_state_path(config), None)
         state["theorem_frontier"] = validate_loaded_theorem_frontier_payload(raw_frontier)
         if state["theorem_frontier"] != raw_frontier:
-            JsonFile.dump(theorem_frontier_state_path(config), state["theorem_frontier"])
+            JsonFile.dump(
+                theorem_frontier_state_path(config),
+                state["theorem_frontier"],
+                mode=SUPERVISOR_SHARED_STATE_FILE_MODE,
+            )
     elif state["theorem_frontier"] is not None:
         state["theorem_frontier"] = validate_loaded_theorem_frontier_payload(state["theorem_frontier"])
+    state["last_review_cycle"] = last_review_cycle(state)
+    state["last_validation_cycle"] = last_validation_cycle(state)
+    state["theorem_frontier_active_node_id"] = theorem_frontier_active_node_id(state)
     current_phase(config, state)
     return state
 
 
 def save_state(config: Config, state: Dict[str, Any]) -> None:
-    JsonFile.dump(config.state_dir / "state.json", state)
+    state["last_review_cycle"] = last_review_cycle(state)
+    state["last_validation_cycle"] = last_validation_cycle(state)
+    state["theorem_frontier_active_node_id"] = theorem_frontier_active_node_id(state)
+    JsonFile.dump(config.state_dir / "state.json", state, mode=SUPERVISOR_SHARED_STATE_FILE_MODE)
+    normalize_worker_readable_state_permissions(config)
     sync_chat_state_metadata(config, state)
 
 
@@ -1818,6 +2135,7 @@ def update_theorem_frontier_full_state(
     paper_approved_node_ids: Set[str] = set()
     paper_approved_edge_pairs: Set[Tuple[str, str]] = set()
     nl_proof_approved_node_ids: Set[str] = set()
+    active_node_nl_approved = False
     admitted_node_ids: Set[str] = set()
     admitted_edge_pairs: Set[Tuple[str, str]] = set()
 
@@ -1972,24 +2290,55 @@ def update_theorem_frontier_full_state(
                 "NL-proof verifier change_kind does not match the structural theorem-frontier action being applied: "
                 f"expected {expected_change_kind!r}, got {nl_proof_review.get('change_kind')!r}."
             )
-        if not nl_proof_approved_node_ids.issubset(paper_approved_node_ids):
+        allowed_nl_approved_node_ids = set(paper_approved_node_ids)
+        if active_node_id:
+            allowed_nl_approved_node_ids.add(active_node_id)
+        if not nl_proof_approved_node_ids.issubset(allowed_nl_approved_node_ids):
             raise SupervisorError(
-                "NL-proof verifier approved_node_ids must be a subset of the paper-verifier-approved node ids."
+                "NL-proof verifier approved_node_ids must be a subset of the paper-verifier-approved node ids, "
+                "except that it may additionally approve the unchanged active node."
             )
+        active_node_nl_approved = active_node_id in nl_proof_approved_node_ids
 
-    admitted_node_ids = set(nl_proof_approved_node_ids) if isinstance(nl_proof_review, dict) else set()
-    admitted_edge_pairs = set(paper_approved_edge_pairs) if isinstance(paper_review, dict) else set()
+    admitted_node_ids = (
+        set(paper_approved_node_ids).intersection(nl_proof_approved_node_ids)
+        if isinstance(nl_proof_review, dict)
+        else set()
+    )
+    admitted_edge_pairs = set()
+    if isinstance(paper_review, dict):
+        for edge in proposed_edges:
+            pair = (edge["parent"], edge["child"])
+            if pair not in paper_approved_edge_pairs:
+                continue
+            parent_id = edge["parent"]
+            child_id = edge["child"]
+            parent_ok = parent_id == active_node_id or parent_id in admitted_node_ids
+            child_ok = child_id in old_children or child_id in admitted_node_ids or child_id in nodes
+            if parent_ok and child_ok:
+                admitted_edge_pairs.add(pair)
 
-    if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and paper_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
+    full_structural_admission = outcome in {"EXPANDED", "REFUTED_REPLACED"}
+    partial_expand_admission = (
+        requested_action == "EXPAND"
+        and outcome == "STILL_OPEN"
+        and isinstance(paper_review, dict)
+        and isinstance(nl_proof_review, dict)
+        and paper_decision in {"APPROVE", "APPROVE_WITH_CAVEAT"}
+        and nl_proof_decision in {"APPROVE", "APPROVE_WITH_CAVEAT"}
+        and active_node_nl_approved
+    )
+
+    if requires_paper_verifier and full_structural_admission and paper_decision not in {"APPROVE", "APPROVE_WITH_CAVEAT"}:
         raise SupervisorError("Cannot accept a structural theorem-frontier outcome without paper-verifier approval.")
-    if requires_paper_verifier and outcome in {"EXPANDED", "REFUTED_REPLACED"} and nl_proof_decision != "APPROVE":
+    if requires_paper_verifier and full_structural_admission and nl_proof_decision != "APPROVE":
         raise SupervisorError(
             "Cannot accept a structural theorem-frontier outcome without a clean APPROVE from the NL-proof verifier."
         )
 
-    if paper_decision == "REJECT" and outcome in {"EXPANDED", "REFUTED_REPLACED"}:
+    if paper_decision == "REJECT" and full_structural_admission:
         raise SupervisorError("Paper-verifier rejected the structural change, so the structural outcome cannot be accepted.")
-    if nl_proof_decision == "REJECT" and outcome in {"EXPANDED", "REFUTED_REPLACED"}:
+    if nl_proof_decision == "REJECT" and full_structural_admission:
         raise SupervisorError("NL-proof verifier rejected the structural change, so the structural outcome cannot be accepted.")
 
     assert_theorem_frontier_review_matches_node(review, active_record)
@@ -2005,7 +2354,9 @@ def update_theorem_frontier_full_state(
         if isinstance(history, list):
             history.append(dict(nl_proof_review))
 
-    if outcome in {"EXPANDED", "REFUTED_REPLACED"}:
+    should_apply_partial_expand = False
+    approved_edge_records: List[Dict[str, Any]] = []
+    if full_structural_admission:
         if active_node_id not in admitted_node_ids:
             raise SupervisorError(
                 "Structural theorem-frontier admission must explicitly approve the changed active node."
@@ -2015,6 +2366,21 @@ def update_theorem_frontier_full_state(
             approved_nodes=admitted_node_ids,
             approved_edges=admitted_edge_pairs,
         )
+    elif partial_expand_admission:
+        try:
+            approved_edge_records = validate_local_structure(
+                change_kind="EXPAND",
+                approved_nodes=admitted_node_ids,
+                approved_edges=admitted_edge_pairs,
+            )
+        except SupervisorError:
+            approved_edge_records = []
+        else:
+            should_apply_partial_expand = bool(
+                admitted_node_ids.difference({active_node_id}) or approved_edge_records
+            )
+
+    if full_structural_admission or should_apply_partial_expand:
         replace_active_node_after(active_record, active_node_after)
         for node in proposed_nodes:
             if node["node_id"] not in admitted_node_ids:
@@ -2032,15 +2398,19 @@ def update_theorem_frontier_full_state(
         repair_theorem_frontier_closed_nodes(nodes, edges)
 
     requested_next_active_node_id = normalize_frontier_text(review.get("next_active_node_id"))
-    next_active_node_id = requested_next_active_node_id
-    if outcome in {"EXPANDED", "REFUTED_REPLACED"} and not next_active_node_id and worker_update.get("next_candidate_node_ids"):
+    next_active_node_id = ""
+    if full_structural_admission or should_apply_partial_expand:
+        next_active_node_id = requested_next_active_node_id
+    elif outcome == "CLOSED":
+        next_active_node_id = requested_next_active_node_id
+    elif outcome in {"STILL_OPEN", "NO_FRONTIER_PROGRESS"}:
+        next_active_node_id = active_node_id
+    if (full_structural_admission or should_apply_partial_expand) and not next_active_node_id and worker_update.get("next_candidate_node_ids"):
         for candidate in worker_update["next_candidate_node_ids"]:
             candidate_id = normalize_frontier_text(candidate)
             if candidate_id:
                 next_active_node_id = candidate_id
                 break
-    elif outcome in {"STILL_OPEN", "NO_FRONTIER_PROGRESS"} and not next_active_node_id:
-        next_active_node_id = active_node_id
     if outcome == "CLOSED" and next_active_node_id == active_node_id:
         next_active_node_id = ""
 
@@ -2057,7 +2427,11 @@ def update_theorem_frontier_full_state(
         nodes,
         edges,
         preferred_node_ids=[next_active_node_id],
-        anchor_node_ids=[requested_next_active_node_id, next_active_node_id, active_node_id],
+        anchor_node_ids=(
+            [requested_next_active_node_id, next_active_node_id, active_node_id]
+            if (full_structural_admission or should_apply_partial_expand or outcome == "CLOSED")
+            else [active_node_id]
+        ),
     )
     current_node = set_active_node(resolved_next_active_node_id)
 
@@ -2124,7 +2498,7 @@ def update_theorem_frontier_full_state(
     state["theorem_frontier"] = payload
     state["last_theorem_frontier_review"] = review
     if persist:
-        JsonFile.dump(theorem_frontier_state_path(config), payload)
+        JsonFile.dump(theorem_frontier_state_path(config), payload, mode=SUPERVISOR_SHARED_STATE_FILE_MODE)
         append_jsonl(
             theorem_frontier_history_path(config),
             {
@@ -2647,6 +3021,32 @@ def cleanup_last_good_commit(state: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def git_force_with_lease_required(state: Dict[str, Any], *, branch: Optional[str] = None) -> bool:
+    if not bool(state.get("git_force_with_lease_required")):
+        return False
+    saved_branch = str(state.get("git_force_with_lease_branch") or "").strip()
+    if branch and saved_branch and saved_branch != branch:
+        return False
+    return True
+
+
+def mark_git_force_with_lease_required(
+    state: Dict[str, Any],
+    *,
+    branch: str,
+    reason: str,
+) -> None:
+    state["git_force_with_lease_required"] = True
+    state["git_force_with_lease_branch"] = branch
+    state["git_force_with_lease_reason"] = reason
+
+
+def clear_git_force_with_lease_required(state: Dict[str, Any]) -> None:
+    state.pop("git_force_with_lease_required", None)
+    state.pop("git_force_with_lease_branch", None)
+    state.pop("git_force_with_lease_reason", None)
+
+
 def update_cleanup_last_good_commit(
     config: Config,
     state: Dict[str, Any],
@@ -2788,21 +3188,68 @@ def _checkpoint_git_head(config: Config, validation_summary: Optional[Dict[str, 
 def list_cycle_checkpoints(config: Config) -> List[Dict[str, Any]]:
     manifest = JsonFile.load(cycle_checkpoint_manifest_path(config), {"checkpoints": []})
     checkpoints = manifest.get("checkpoints") if isinstance(manifest, dict) else []
-    if not isinstance(checkpoints, list):
-        return []
-    normalized: List[Dict[str, Any]] = []
-    for item in checkpoints:
-        if not isinstance(item, dict):
-            continue
-        try:
-            cycle = int(item.get("cycle", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if cycle <= 0:
-            continue
-        payload = dict(item)
-        payload["cycle"] = cycle
-        normalized.append(payload)
+    normalized_by_cycle: Dict[int, Dict[str, Any]] = {}
+    if isinstance(checkpoints, list):
+        for item in checkpoints:
+            if not isinstance(item, dict):
+                continue
+            try:
+                cycle = int(item.get("cycle", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if cycle <= 0:
+                continue
+            payload = dict(item)
+            payload["cycle"] = cycle
+            normalized_by_cycle[cycle] = payload
+
+    checkpoints_dir = cycle_checkpoints_dir(config)
+    if checkpoints_dir.exists():
+        for path in checkpoints_dir.iterdir():
+            if not path.is_dir() or not path.name.startswith("cycle-"):
+                continue
+            metadata_path = path / "metadata.json"
+            metadata: Optional[Dict[str, Any]] = None
+            if metadata_path.exists():
+                loaded = JsonFile.load(metadata_path, None)
+                if isinstance(loaded, dict):
+                    metadata = dict(loaded)
+
+            state_path = path / "state" / "state.json"
+            inferred_cycle: Optional[int] = None
+            if metadata is not None:
+                try:
+                    inferred_cycle = int(metadata.get("cycle", 0) or 0)
+                except (TypeError, ValueError):
+                    inferred_cycle = None
+            if (inferred_cycle is None or inferred_cycle <= 0) and state_path.exists():
+                checkpoint_state = JsonFile.load(state_path, None)
+                if isinstance(checkpoint_state, dict):
+                    try:
+                        inferred_cycle = int(checkpoint_state.get("cycle", 0) or 0)
+                    except (TypeError, ValueError):
+                        inferred_cycle = None
+            if inferred_cycle is None or inferred_cycle <= 0:
+                match = re.fullmatch(r"cycle-(\d{4})", path.name)
+                if match:
+                    inferred_cycle = int(match.group(1))
+            if inferred_cycle is None or inferred_cycle <= 0:
+                continue
+
+            payload = dict(metadata or {})
+            payload["cycle"] = inferred_cycle
+            payload.setdefault("checkpoint_dir", str(path))
+            if "completed_phase" not in payload and state_path.exists():
+                checkpoint_state = JsonFile.load(state_path, None)
+                if isinstance(checkpoint_state, dict):
+                    last_review = checkpoint_state.get("last_review")
+                    if isinstance(last_review, dict) and str(last_review.get("phase") or "").strip():
+                        payload["completed_phase"] = str(last_review.get("phase") or "").strip()
+                    elif str(checkpoint_state.get("phase") or "").strip():
+                        payload["completed_phase"] = str(checkpoint_state.get("phase") or "").strip()
+            normalized_by_cycle[inferred_cycle] = payload
+
+    normalized = list(normalized_by_cycle.values())
     normalized.sort(key=lambda entry: int(entry.get("cycle", 0) or 0), reverse=True)
     return normalized
 
@@ -2815,8 +3262,10 @@ def _ephemeral_cycle_number_from_path(path: Path) -> Optional[int]:
 
 
 def clear_future_cycle_ephemera(config: Config, completed_cycle: int) -> None:
-    prompts_dir = config.state_dir / "prompts"
-    if prompts_dir.exists():
+    prompt_dirs = [supervisor_prompts_dir(config), config.state_dir / "prompts"]
+    for prompts_dir in prompt_dirs:
+        if not prompts_dir.exists():
+            continue
         for path in prompts_dir.iterdir():
             if not path.is_file():
                 continue
@@ -2838,9 +3287,18 @@ def clear_future_cycle_ephemera(config: Config, completed_cycle: int) -> None:
                 if cycle_num is not None and cycle_num > completed_cycle:
                     path.unlink(missing_ok=True)  # type: ignore[arg-type]
 
-    runtime_dir = config.state_dir / "runtime"
+    runtime_dir = supervisor_runtime_markers_dir(config)
     if runtime_dir.exists():
         for path in runtime_dir.iterdir():
+            if not path.is_file():
+                continue
+            cycle_num = _ephemeral_cycle_number_from_path(path)
+            if cycle_num is not None and cycle_num > completed_cycle:
+                path.unlink(missing_ok=True)  # type: ignore[arg-type]
+
+    scripts_dir = supervisor_scripts_dir(config)
+    if scripts_dir.exists():
+        for path in scripts_dir.iterdir():
             if not path.is_file():
                 continue
             cycle_num = _ephemeral_cycle_number_from_path(path)
@@ -2936,6 +3394,7 @@ def write_completed_cycle_checkpoint(
         "files": files,
     }
     JsonFile.dump(checkpoint_dir / "metadata.json", entry)
+    normalize_checkpoint_tree_permissions(checkpoint_dir)
 
     def _update_manifest(current: Dict[str, Any]) -> Dict[str, Any]:
         checkpoints = current.get("checkpoints") if isinstance(current, dict) else None
@@ -3089,7 +3548,21 @@ def restore_cycle_checkpoint(
 
         JsonFile.update(cycle_checkpoint_manifest_path(config), {"checkpoints": []}, _restore_manifest_entry)
         clear_future_cycle_ephemera(config, int(checkpoint.get("cycle", 0) or 0))
+        shutil.rmtree(scope_root_dir(config), ignore_errors=True)
+        shutil.rmtree(supervisor_control_root_dir(config), ignore_errors=True)
+        normalize_repo_mutable_permissions(config)
+        normalize_worker_readable_state_permissions(config)
         state = load_state(config)
+        if git_is_enabled(config):
+            mark_git_force_with_lease_required(
+                state,
+                branch=current_git_branch(config),
+                reason=f"restore_cycle_checkpoint:{int(checkpoint.get('cycle', 0) or 0)}",
+            )
+        else:
+            clear_git_force_with_lease_required(state)
+        state["roles"] = {}
+        save_state(config, state)
         ensure_chat_site(config)
         if chat_repo_events_path(config).exists():
             rebuild_chat_event_chunks_from_legacy_log(config)
@@ -3314,10 +3787,9 @@ def git_worker_instructions(config: Config) -> str:
         f"""\
         Git requirements:
         - This repo is configured with remote `{config.git.remote_name}` -> `{config.git.remote_url}`.
-        - If you made meaningful progress in this burst, create a non-empty git commit before ending the burst.
-        - Push that commit before ending the burst. Use `{git_push_command(config)}` if no upstream is configured.
-        - Leave the worktree clean after a productive burst.
-        - If you made no meaningful changes, do not create an empty commit.
+        - Do not create git commits and do not push from the worker account.
+        - Leave the repo edits in place; after the supervisor validates the cycle, it will stage, commit, and push the accepted state itself.
+        - Use `summary_of_changes` in your worker handoff to describe the commit-worthy progress clearly.
         """
     ).strip()
 
@@ -3350,14 +3822,143 @@ def provider_context_worker_instructions(config: Config) -> str:
 
 
 def git_reviewer_instructions(config: Config) -> str:
+    return ""
+
+
+def refresh_validation_git_summary(config: Config, validation_summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(validation_summary, dict) or not git_is_enabled(config):
+        return validation_summary
+    git_summary = git_validation_summary(config)
+    validation_summary["git"] = git_summary
+    validation_summary["git_ok"] = bool(
+        git_summary.get("enabled")
+        and git_summary.get("repo_ok")
+        and git_summary.get("worktree_clean")
+        and git_summary.get("remote_matches_config")
+    )
+    validation_summary["head"] = git_summary.get("head")
+    return validation_summary
+
+
+def build_supervisor_cycle_commit_message(
+    phase: str,
+    cycle: int,
+    decision: Dict[str, Any],
+    *,
+    worker_handoff: Optional[Dict[str, Any]] = None,
+    frontier_review: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    decision_value = str(decision.get("decision") or "").strip().upper() or "CONTINUE"
+    active_node_id = ""
+    assessed_action = ""
+    frontier_outcome = ""
+    if isinstance(frontier_review, dict):
+        active_node_id = normalize_frontier_text(frontier_review.get("active_node_id"))
+        assessed_action = normalize_frontier_text(frontier_review.get("assessed_action"))
+        frontier_outcome = normalize_frontier_text(frontier_review.get("outcome"))
+    subject_parts = [f"supervisor: {phase} cycle {cycle}"]
+    if assessed_action:
+        subject_parts.append(assessed_action.lower())
+    elif decision_value:
+        subject_parts.append(decision_value.lower())
+    if active_node_id:
+        subject_parts.append(active_node_id)
+    subject = trim_text(" ".join(subject_parts), 120)
+
+    summary_of_changes = ""
+    current_frontier = ""
+    likely_next_step = ""
+    if isinstance(worker_handoff, dict):
+        summary_of_changes = str(worker_handoff.get("summary_of_changes") or "").strip()
+        current_frontier = str(worker_handoff.get("current_frontier") or "").strip()
+        likely_next_step = str(worker_handoff.get("likely_next_step") or "").strip()
+    lines = [
+        f"phase: {phase}",
+        f"cycle: {cycle}",
+        f"decision: {decision_value}",
+    ]
+    if assessed_action:
+        lines.append(f"frontier_action: {assessed_action}")
+    if frontier_outcome:
+        lines.append(f"frontier_outcome: {frontier_outcome}")
+    if active_node_id:
+        lines.append(f"active_node: {active_node_id}")
+    if summary_of_changes:
+        lines.extend(["", "Worker summary:", summary_of_changes])
+    reason = str(decision.get("reason") or "").strip()
+    if reason:
+        lines.extend(["", "Reviewer/supervisor reason:", reason])
+    if current_frontier:
+        lines.extend(["", "Current frontier:", current_frontier])
+    if likely_next_step:
+        lines.extend(["", "Likely next step:", likely_next_step])
+    return subject, "\n".join(lines).strip()
+
+
+def commit_and_push_validated_cycle(
+    config: Config,
+    state: Dict[str, Any],
+    phase: str,
+    cycle: int,
+    decision: Dict[str, Any],
+    validation_summary: Dict[str, Any],
+    *,
+    frontier_review: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     if not git_is_enabled(config):
-        return ""
-    return textwrap.dedent(
-        """\
-        Also check the git summary in the validation output.
-        If the worker made progress but left the repo dirty or failed to push the resulting commit, require another burst.
-        """
-    ).strip()
+        return None
+    ensure_git_repository(config)
+    worker_handoff = state.get("last_worker_handoff") if isinstance(state.get("last_worker_handoff"), dict) else None
+    current_branch = current_git_branch(config)
+    use_force_with_lease = git_force_with_lease_required(state, branch=current_branch)
+    subject, body = build_supervisor_cycle_commit_message(
+        phase,
+        cycle,
+        decision,
+        worker_handoff=worker_handoff,
+        frontier_review=frontier_review,
+    )
+    status_before = git_output(config, ["status", "--short"]).strip()
+    committed = False
+    commit_head: Optional[str] = None
+    if status_before:
+        ensure_git_command_ok(config, ["add", "-A"])
+        staged = git_output(config, ["diff", "--cached", "--name-only"]).strip()
+        if staged:
+            ensure_git_command_ok(config, ["commit", "-m", subject, "-m", body])
+            committed = True
+            commit_head = current_git_head(config)
+    push_args = ["push", config.git.remote_name, f"HEAD:{current_branch}"]
+    if use_force_with_lease:
+        push_args = ["push", "--force-with-lease", config.git.remote_name, f"HEAD:{current_branch}"]
+    push_output = ensure_git_command_ok(config, push_args)
+    clear_git_force_with_lease_required(state)
+    refresh_validation_git_summary(config, validation_summary)
+    state["last_validation"] = validation_summary
+    result = {
+        "cycle": cycle,
+        "phase": phase,
+        "committed": committed,
+        "head": current_git_head(config),
+        "subject": subject,
+        "push_mode": "force-with-lease" if use_force_with_lease else "fast-forward",
+        "push_output": trim_text(push_output, 4000),
+    }
+    if commit_head:
+        result["commit_head"] = commit_head
+    record_chat_event(
+        config,
+        state,
+        cycle=cycle,
+        phase=phase,
+        kind="git_sync",
+        actor="supervisor",
+        target="repo",
+        content=result,
+        content_type="json",
+        summary=f"Supervisor git sync for cycle {cycle}",
+    )
+    return result
 
 
 def prompt_notes_block(title: str, note: str) -> str:
@@ -3433,6 +4034,8 @@ def theorem_frontier_worker_instructions(config: Config, state: Dict[str, Any], 
         - Only submit a theorem-frontier update if that script succeeds.
         - `EXPAND` means refine the active node by inserting new nodes between it and its current children only.
         - `REFUTE_REPLACE` means replace the active node's current decomposition with a different route.
+        - Prefer the smallest rigorous structural refinement that is likely to be admitted this cycle. Do not batch many delicate new leaves into one `EXPAND` when a smaller admitted subset would move the frontier forward more reliably.
+        - For `EXPAND`, it is acceptable if some newly proposed nodes remain too weak to admit this cycle. The supervisor may incrementally admit the paper-approved and NL-approved subset while leaving the active node open.
         - Every node in the DAG carries a complete publication-grade natural-language proof from its current children. Do not leave those proof texts implicit.
         - Write each node proof at least as detailed as the paper's corresponding argument, and often more detailed because the proof must be locally self-contained relative to the current children.
         - Do not submit placeholder or sketch prose such as "leaf of the DAG", "direct target", "formalizes", "packages", "routine", or "by the paper" in place of an actual proof.
@@ -3480,6 +4083,8 @@ def theorem_frontier_reviewer_instructions(config: Config, state: Dict[str, Any]
         - `CLOSE` and `REFACTOR` are now supervisor-deterministic actions and should not reach you; focus on structural actions only.
         - Count real progress here only when the burst refined/replaced the active node's local decomposition.
         - Do not accept an `EXPANDED` or `REFUTED_REPLACED` outcome if the rewritten node proof or newly admitted nodes lack complete natural-language proofs.
+        - For `EXPAND`, do not treat admission as all-or-nothing. If the geometry is sound but only a subset of the proposed new nodes is ready, approve that subset through the verifier `approved_node_ids` / `approved_edges` and keep the overall outcome `STILL_OPEN`.
+        - Use full `EXPANDED` only when the whole proposed local refinement is ready to enter the authoritative DAG now. Otherwise prefer a `STILL_OPEN` outcome with a rigorous approved subset.
         - Treat the overall proof-writing impression as a calibration signal: in a healthy proof-carrying DAG, the aggregate natural-language proof text for the active proof spine should usually feel at least as substantial as the corresponding paper argument, and often longer because each node proof must be locally self-contained.
         - If the node proofs feel much sketchier or shorter than the paper's local arguments, treat that as evidence that the DAG is too coarse or the proofs are not yet rigorous enough to admit.
         - Pay attention to whether the declared children really seem to be the route being used. If some children look unnecessary or the proof seems to rely on an unstated intermediate instead, require a refactor rather than admitting the node.
@@ -3520,6 +4125,7 @@ def theorem_frontier_paper_verifier_instructions(config: Config, state: Dict[str
         - Trigger approval only for structural changes that are paper-exact, paper-faithful reformulations, conservative strengthenings, or explicit exploratory detours.
         - Reject any structural edit that is paper-incompatible, hides a necessary split, or silently changes the proof spine.
         - If you are approving a rewritten active node itself, include that active node id in `approved_node_ids` along with any newly admitted nodes.
+        - For `EXPAND`, approve the rigorous paper-faithful subset even when the full worker proposal is not ready for atomic admission. The supervisor may use your approved subset incrementally while leaving the cycle `STILL_OPEN`.
 
         Your paper-verifier JSON must have exactly these keys:
         {{
@@ -3551,6 +4157,7 @@ def theorem_frontier_nl_proof_verifier_instructions(config: Config, state: Dict[
         - Use the paper's own level of detail as a floor, not a ceiling: these local node proofs should usually be at least as detailed as the corresponding paper argument, and often longer because they must be self-contained relative to the declared children.
         - Treat suspiciously short or high-level proofs as a warning sign that the decomposition is too coarse or the proof is still a sketch.
         - Approve only the subset of paper-approved nodes whose natural-language proofs are genuinely rigorous. Reject or withhold approval from anything with gaps, handwaving, missing case analysis, or placeholder/sketch language.
+        - For `EXPAND`, use `approved_node_ids` to mark the rigorous subset even when some proposed leaves still need another cycle. The supervisor may incrementally admit that approved subset while keeping the overall cycle `STILL_OPEN`.
         - Copying sections of the paper verbatim or near-verbatim is completely acceptable when the resulting node proof is the right rigorous local proof from the declared children.
         - If you are approving a rewritten active node itself, include that active node id in `approved_node_ids` along with any newly admitted nodes.
 
@@ -3565,7 +4172,7 @@ def theorem_frontier_nl_proof_verifier_instructions(config: Config, state: Dict[
           "justification": "brief rigor judgment",
           "caveat": "leave empty unless APPROVE_WITH_CAVEAT"
         }}
-        Structural admission into the authoritative DAG requires `decision = "APPROVE"` from this verifier. Use `APPROVE_WITH_CAVEAT` only when the cycle should continue without admitting the rewritten node set yet.
+        Full structural admission into the authoritative DAG requires `decision = "APPROVE"` from this verifier. Use `APPROVE_WITH_CAVEAT` when only a subset is ready to admit or when the cycle should continue after admitting the rigorous subset.
         """
     ).strip()
 
@@ -3585,7 +4192,10 @@ def build_worker_prompt(
     preface = "This is the first burst for this role." if is_initial else "Continue from the current session state."
     review_guidance = ""
     if not is_initial:
-        next_prompt = normalize_saved_reviewer_next_prompt(last_review.get("next_prompt") or "")
+        next_prompt = theorem_frontier_authoritative_next_prompt(
+            state,
+            fallback=normalize_saved_reviewer_next_prompt(last_review.get("next_prompt") or ""),
+        )
         resolution_note = theorem_frontier_reviewer_resolution_note(state)
         resolution_line = f"- Supervisor note: {resolution_note}\n" if resolution_note else ""
         review_guidance = textwrap.dedent(
@@ -3631,6 +4241,21 @@ def build_worker_prompt(
                 - {close_note}
                 """
             )
+    protocol_retry_notes = ""
+    if not is_initial:
+        protocol_retry = state.get("last_worker_protocol_error")
+        if isinstance(protocol_retry, dict):
+            retry_phase = str(protocol_retry.get("phase", "")).strip()
+            retry_cycle = int(protocol_retry.get("cycle", 0) or 0)
+            if retry_phase == phase and retry_cycle == cycle:
+                protocol_retry_notes = textwrap.dedent(
+                    f"""\
+                    Supervisor worker-protocol correction:
+                    - Your previous burst exited without the required worker handoff JSON.
+                    - Fix the exact protocol error below before ending this burst.
+                    - Error: {str(protocol_retry.get('error', '')).strip()}
+                    """
+                )
     provider_notes = provider_context_worker_instructions(config)
     git_notes = git_worker_instructions(config)
     frontier_notes = theorem_frontier_worker_instructions(config, state, phase, config.worker.provider)
@@ -3650,7 +4275,7 @@ def build_worker_prompt(
 
         {phase_context_text(config, state, phase, config.worker.provider)}
 
-        {review_guidance}{transition_blocker_notes}{close_validation_notes}{stuck_recovery_notes}{provider_notes}
+        {review_guidance}{transition_blocker_notes}{close_validation_notes}{protocol_retry_notes}{stuck_recovery_notes}{provider_notes}
         {phase_worker_instructions(config, phase, config.worker.provider)}
         {frontier_notes}
         {git_notes}
@@ -4464,17 +5089,20 @@ def build_burst_script(
     *,
     script_tag: Optional[str] = None,
 ) -> Path:
-    runtime_dir = adapter.config.state_dir / "runtime"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir = supervisor_scripts_dir(adapter.config)
     safe_script_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", script_tag).strip("-") if script_tag else None
     script_stem = f"{adapter.role}-{safe_script_tag}" if safe_script_tag else f"{adapter.role}-cycle-{cycle:04d}"
-    script_path = runtime_dir / f"{script_stem}.sh"
+    script_path = scripts_dir / f"{script_stem}.sh"
     work_dir = adapter.work_dir()
     env_vars = adapter.burst_env()
+    script_home = adapter.config.tmux.burst_home
+    script_path_env = os.environ.get("PATH", "")
+    git_config_path = supervisor_git_config_path(adapter.config)
 
     lines = [
         "#!/usr/bin/env bash",
         "set -u",
+        "umask 0002",
         f"START_FILE={shlex.quote(str(start_file))}",
         f"EXIT_FILE={shlex.quote(str(exit_file))}",
         f"PROMPT_FILE={shlex.quote(str(prompt_file))}",
@@ -4485,6 +5113,9 @@ def build_burst_script(
         "  exit \"$ec\"",
         "}",
         "trap cleanup EXIT",
+        f"export HOME={shlex.quote(str(script_home))}" if script_home is not None else "",
+        f"export PATH={shlex.quote(script_path_env)}" if script_path_env else "",
+        f"export GIT_CONFIG_GLOBAL={shlex.quote(str(git_config_path))}",
         "cd \"$WORK_DIR\"",
         "printf '%s\n' \"$(date -Is)\" > \"$START_FILE\"",
         "PROMPT_CONTENT=$(cat \"$PROMPT_FILE\")",
@@ -4514,9 +5145,20 @@ def build_burst_script(
         "echo '[agent-burst] end='$(date -Is) ' exit_code='\"$ec\"",
         "exit \"$ec\"",
     ]
-    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    rendered_lines = [line for line in lines if line]
+    script_path.write_text("\n".join(rendered_lines) + "\n", encoding="utf-8")
     script_path.chmod(0o755)
     return script_path
+
+
+def _burst_launch_prefix(config: Config) -> List[str]:
+    burst_user = config.tmux.burst_user
+    if not burst_user:
+        return []
+    command = ["sudo", "-n", "-u", burst_user]
+    if config.tmux.burst_group:
+        command.extend(["-g", config.tmux.burst_group])
+    return command
 
 
 def write_log_header(path: Path, header: str) -> None:
@@ -4705,14 +5347,16 @@ def launch_tmux_burst(
     burst_tag: Optional[str] = None,
     reuse_existing_window: bool = False,
 ) -> Dict[str, Any]:
+    normalize_burst_user_codex_permissions(adapter.config)
     state_dir = adapter.config.state_dir
-    prompts_dir = state_dir / "prompts"
+    prompts_dir = supervisor_prompts_dir(adapter.config)
     logs_dir = state_dir / "logs"
-    runtime_dir = state_dir / "runtime"
+    runtime_dir = supervisor_runtime_markers_dir(adapter.config)
     safe_burst_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", burst_tag).strip("-") if burst_tag else None
     prompt_stem = f"{adapter.role}-{safe_burst_tag}" if safe_burst_tag else f"{adapter.role}-cycle-{cycle:04d}"
     prompt_file = prompts_dir / f"{prompt_stem}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
+    prompt_file.chmod(0o644)
 
     if artifact_path is not None:
         artifact_path = Path(artifact_path)
@@ -4793,7 +5437,8 @@ def launch_tmux_burst(
     )
     pipe_cmd = shlex.join(["bash", "-lc", pipe_inner_cmd])
     tmux_cmd("pipe-pane", "-o", "-t", pane_id, pipe_cmd)
-    launch_cmd = f"{shlex.quote(str(script_path))}; exit"
+    launch_parts = _burst_launch_prefix(adapter.config) + [str(script_path)]
+    launch_cmd = f"{shlex.join(launch_parts)}; exit"
     tmux_cmd("send-keys", "-t", pane_id, launch_cmd, "C-m")
     tmux_cmd("select-window", "-t", window_id)
 
@@ -5919,9 +6564,37 @@ def recover_interrupted_worker_state(config: Config, state: Dict[str, Any], phas
                 ("phase", "cycle", "status", "summary_of_changes", "current_frontier", "likely_next_step", "input_request"),
                 fallback_paths=fallback_paths,
             )
-        except SupervisorError:
+            worker_handoff = validate_worker_handoff(phase, cycle, worker_handoff)
+        except SupervisorError as handoff_exc:
+            detail = f"Recovered worker burst ended without the required handoff JSON: {str(handoff_exc).strip()}"
+            if theorem_frontier_enabled(config, phase):
+                try:
+                    load_validated_theorem_frontier_worker_update(
+                        config,
+                        phase,
+                        cycle,
+                        worker_terminal_output,
+                    )
+                    detail += " A theorem-frontier update artifact survived; the next worker retry may keep or rewrite it, but it must end by writing worker_handoff.json."
+                except SupervisorError:
+                    pass
+            state["last_worker_protocol_error"] = {
+                "phase": phase,
+                "cycle": cycle,
+                "error": detail,
+                "recorded_at": timestamp_now(),
+            }
+            log_supervisor_warning(
+                config,
+                cycle=cycle,
+                phase=phase,
+                category="worker_noncompliance_recovery",
+                message="Recovered a worker burst that exited without the required handoff; scheduling a corrected worker retry.",
+                detail={"artifact_path": str(artifact_path)},
+            )
+            clear_incomplete_current_cycle_worker_state(config, state, cycle)
+            save_state(config, state)
             return False
-        worker_handoff = validate_worker_handoff(phase, cycle, worker_handoff)
         state["last_worker_output"] = worker_terminal_output
         state["last_worker_output_cycle"] = cycle
         state["last_worker_handoff"] = worker_handoff
@@ -6224,7 +6897,7 @@ def run_stuck_recovery_review(
         content_type="json",
     )
     save_state(config, state)
-    append_jsonl(config.state_dir / "stuck_recovery_log.jsonl", suggestion)
+    append_supervisor_jsonl(config.state_dir / "stuck_recovery_log.jsonl", suggestion)
     return suggestion
 
 
@@ -6319,7 +6992,7 @@ def run_theorem_frontier_paper_verifier_review(
         content_type="json",
     )
     save_state(config, state)
-    append_jsonl(config.state_dir / "theorem_frontier_paper_verifier_log.jsonl", review)
+    append_supervisor_jsonl(config.state_dir / "theorem_frontier_paper_verifier_log.jsonl", review)
     return review
 
 
@@ -6418,7 +7091,7 @@ def run_theorem_frontier_nl_proof_verifier_review(
         content_type="json",
     )
     save_state(config, state)
-    append_jsonl(config.state_dir / "theorem_frontier_nl_proof_verifier_log.jsonl", review)
+    append_supervisor_jsonl(config.state_dir / "theorem_frontier_nl_proof_verifier_log.jsonl", review)
     return review
 
 
@@ -6770,7 +7443,7 @@ def create_branch_episode(
     state["active_branch_episode"] = episode
     state["last_branch_consideration_cycle"] = episode["trigger_cycle"]
     save_state(config, state)
-    append_jsonl(episode_dir / "branch_strategy_log.jsonl", branch_strategy)
+    append_supervisor_jsonl(episode_dir / "branch_strategy_log.jsonl", branch_strategy)
     return episode
 
 
@@ -6866,7 +7539,7 @@ def run_branch_strategy_review(
         content=strategy,
         content_type="json",
     )
-    append_jsonl(config.state_dir / "branch_strategy_log.jsonl", strategy)
+    append_supervisor_jsonl(config.state_dir / "branch_strategy_log.jsonl", strategy)
     save_state(config, state)
     return strategy
 
@@ -6947,7 +7620,7 @@ def run_branch_selection_review(
         content=selection,
         content_type="json",
     )
-    append_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
+    append_supervisor_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
     save_state(config, state)
     return selection
 
@@ -7034,7 +7707,7 @@ def run_branch_replacement_review(
         content=decision,
         content_type="json",
     )
-    append_jsonl(config.state_dir / "branch_replacement_log.jsonl", decision)
+    append_supervisor_jsonl(config.state_dir / "branch_replacement_log.jsonl", decision)
     save_state(config, state)
     return decision
 
@@ -7139,8 +7812,8 @@ def record_automatic_branch_selection(
         content=selection,
         content_type="json",
     )
-    append_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
-    append_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
+    append_supervisor_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
+    append_supervisor_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
     save_state(config, state)
     return selection
 
@@ -7171,8 +7844,8 @@ def record_branch_selection_decision(
         content=selection,
         content_type="json",
     )
-    append_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
-    append_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
+    append_supervisor_jsonl(config.state_dir / "branch_selection_log.jsonl", selection)
+    append_supervisor_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
     save_state(config, state)
     return selection
 
@@ -7483,7 +8156,7 @@ def monitor_active_branch_episode(
                 proposal_snapshot,
                 policy=policy,
             )
-            append_jsonl(
+            append_supervisor_jsonl(
                 branch_episode_dir(config, str(episode.get("id", ""))) / "branch_replacement_log.jsonl",
                 replacement,
             )
@@ -7551,7 +8224,7 @@ def monitor_active_branch_episode(
             active_snapshots,
             policy=policy,
         )
-        append_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
+        append_supervisor_jsonl(branch_episode_dir(config, str(episode.get("id", ""))) / "branch_selection_log.jsonl", selection)
         print("\n===== branch selection decision =====")
         print(json.dumps(selection, indent=2, ensure_ascii=False))
 
@@ -7725,9 +8398,18 @@ def finalize_reviewer_cycle(
             content=decision,
             content_type="json",
         )
+    commit_and_push_validated_cycle(
+        config,
+        state,
+        phase,
+        cycle,
+        decision,
+        validation_summary,
+        frontier_review=frontier_review,
+    )
     save_state(config, state)
     if not decision_already_recorded:
-        append_jsonl(config.state_dir / "review_log.jsonl", decision)
+        append_supervisor_jsonl(config.state_dir / "review_log.jsonl", decision)
 
     print("\n===== reviewer decision =====")
     print(json.dumps(decision, indent=2, ensure_ascii=False))
@@ -8279,18 +8961,41 @@ def main() -> int:
             def _validate_worker_burst(run: Dict[str, Any]) -> Dict[str, Any]:
                 output = run["captured_output"].strip()
                 cycle_handoff_path = worker_handoff_path(config, cycle)
-                handoff = load_json_artifact_with_fallback(
-                    cycle_handoff_path,
-                    output,
-                    ("phase", "cycle", "status"),
-                    fallback_paths=artifact_fallback_paths(
-                        config,
+                try:
+                    handoff = load_json_artifact_with_fallback(
                         cycle_handoff_path,
-                        worker_handoff_path(config),
-                        Path(run["artifact_path"]),
-                    ),
-                )
-                handoff = validate_worker_handoff(phase, cycle, handoff)
+                        output,
+                        ("phase", "cycle", "status"),
+                        fallback_paths=artifact_fallback_paths(
+                            config,
+                            cycle_handoff_path,
+                            worker_handoff_path(config),
+                            Path(run["artifact_path"]),
+                        ),
+                    )
+                    handoff = validate_worker_handoff(phase, cycle, handoff)
+                except SupervisorError as handoff_exc:
+                    frontier_update_present = False
+                    if theorem_frontier_enabled(config, phase):
+                        try:
+                            load_validated_theorem_frontier_worker_update(
+                                config,
+                                phase,
+                                cycle,
+                                output,
+                            )
+                            frontier_update_present = True
+                        except SupervisorError:
+                            frontier_update_present = False
+                    raise SupervisorError(
+                        "Worker exited without the required handoff JSON. "
+                        f"{str(handoff_exc).strip()} "
+                        + (
+                            "A theorem-frontier update artifact was present; keep it or rewrite it as needed, but do not end the burst again without writing worker_handoff.json."
+                            if frontier_update_present
+                            else "Do not end the burst again without writing worker_handoff.json."
+                        )
+                    ) from handoff_exc
                 persist_supervisor_artifact(handoff, cycle_handoff_path, worker_handoff_path(config))
                 return validate_worker_cycle_artifacts(
                     config,
@@ -8325,6 +9030,7 @@ def main() -> int:
             worker_handoff = worker_result["worker_handoff"]
             frontier_update = worker_result.get("frontier_update")
             validation_summary = worker_result["validation_summary"]
+            state.pop("last_worker_protocol_error", None)
             state["last_worker_output"] = worker_terminal_output
             state["last_worker_output_cycle"] = cycle
             state["last_worker_handoff"] = worker_handoff

@@ -106,6 +106,14 @@ SUPERVISOR_GITIGNORE_START = "# >>> lagent-supervisor >>>"
 SUPERVISOR_GITIGNORE_END = "# <<< lagent-supervisor <<<"
 DEFAULT_BRANCH_EVALUATION_CYCLES = 20
 DEFAULT_BRANCH_POLL_SECONDS = 300.0
+SUPERVISOR_SHARED_STATE_DIR_MODE = 0o2775
+SUPERVISOR_SHARED_STATE_FILE_MODE = 0o640
+SUPERVISOR_SHARED_MULTIWRITER_FILE_MODE = 0o664
+SUPERVISOR_SHARED_STATE_LOG_MODE = SUPERVISOR_SHARED_MULTIWRITER_FILE_MODE
+SUPERVISOR_CHECKPOINT_DIR_MODE = 0o2755
+SUPERVISOR_CHECKPOINT_FILE_MODE = 0o644
+SUPERVISOR_SHARED_REPO_DIR_MODE = 0o2775
+SUPERVISOR_SHARED_REPO_FILE_MODE = 0o664
 
 
 class SupervisorError(RuntimeError):
@@ -149,6 +157,9 @@ class TmuxConfig:
     session_name: str
     dashboard_window_name: str
     kill_windows_after_capture: bool
+    burst_user: Optional[str] = None
+    burst_group: Optional[str] = None
+    burst_home: Optional[Path] = None
 
 
 @dataclass
@@ -297,6 +308,9 @@ PRODUCTIVE_LOCAL_FAILURE_PATTERNS: Tuple[str, ...] = (
     "error: twobites/",
     "error: repo/",
     "lake build",
+    "error loading config.toml",
+    "permission denied (os error 13)",
+    "operation not permitted (os error 1)",
 )
 
 
@@ -556,7 +570,7 @@ class PolicyManager:
             if state is not None and not isinstance(state.get("policy"), dict):
                 state["policy"] = self._state_payload(self._policy)
                 if persist:
-                    JsonFile.dump(self.config.state_dir / "state.json", state)
+                    _persist_state(self.config, state)
             return self._policy
 
         try:
@@ -570,7 +584,7 @@ class PolicyManager:
             if state is not None:
                 state["policy"] = self._state_payload(policy)
                 if persist:
-                    JsonFile.dump(self.config.state_dir / "state.json", state)
+                    _persist_state(self.config, state)
             return policy
         except (SupervisorError, json.JSONDecodeError) as exc:
             if self._policy is None:
@@ -582,7 +596,7 @@ class PolicyManager:
             if state is not None:
                 state["policy"] = self._state_payload(self._policy, warning=str(exc))
                 if persist:
-                    JsonFile.dump(self.config.state_dir / "state.json", state)
+                    _persist_state(self.config, state)
             return self._policy
 
 
@@ -637,6 +651,72 @@ def latest_codex_token_count_event_in_file(path: Path) -> Optional[Dict[str, Any
     return None
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def codex_credit_status_from_rate_limits(rate_limits: Dict[str, Any]) -> Dict[str, Any]:
+    credits = rate_limits.get("credits")
+    status: Dict[str, Any] = {
+        "credits_raw": credits,
+        "credits_available": None,
+        "credits_remaining": None,
+        "credits_used": None,
+        "credits_spent": None,
+        "credits_limit": None,
+    }
+    if credits is None:
+        return status
+    if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+        status["credits_available"] = float(credits)
+        return status
+    if not isinstance(credits, dict):
+        return status
+
+    def _pick(*keys: str) -> Optional[float]:
+        for key in keys:
+            parsed = _optional_float(credits.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    status["credits_available"] = _pick("available", "balance")
+    status["credits_remaining"] = _pick("remaining")
+    status["credits_used"] = _pick("used", "consumed")
+    status["credits_spent"] = _pick("spent", "charges")
+    status["credits_limit"] = _pick("limit", "total", "purchased", "purchased_total")
+    return status
+
+
+def codex_budget_status_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        return None
+    secondary = rate_limits.get("secondary")
+    if not isinstance(secondary, dict):
+        return None
+    used_percent = float(secondary.get("used_percent") or 0.0)
+    percent_left = max(0.0, 100.0 - used_percent)
+    return {
+        "timestamp": str(record.get("timestamp") or ""),
+        "plan_type": rate_limits.get("plan_type"),
+        "used_percent": used_percent,
+        "percent_left": percent_left,
+        "window_minutes": int(secondary.get("window_minutes") or 0),
+        "resets_at": secondary.get("resets_at"),
+        "weekly_budget_exhausted": used_percent >= 100.0,
+        **codex_credit_status_from_rate_limits(rate_limits),
+    }
+
+
 def codex_token_usage_from_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     payload = record.get("payload")
     if not isinstance(payload, dict) or payload.get("type") != "token_count":
@@ -648,6 +728,7 @@ def codex_token_usage_from_record(record: Dict[str, Any]) -> Optional[Dict[str, 
     last = info.get("last_token_usage")
     if not isinstance(total, dict) or not isinstance(last, dict):
         return None
+    budget = codex_budget_status_from_record(record) or {}
     return {
         "input_tokens": int(total.get("input_tokens") or 0),
         "cached_input_tokens": int(total.get("cached_input_tokens") or 0),
@@ -660,6 +741,18 @@ def codex_token_usage_from_record(record: Dict[str, Any]) -> Optional[Dict[str, 
         "last_reasoning_output_tokens": int(last.get("reasoning_output_tokens") or 0),
         "last_total_tokens": int(last.get("total_tokens") or 0),
         "model_context_window": int(info.get("model_context_window") or 0),
+        "plan_type": budget.get("plan_type"),
+        "weekly_used_percent": budget.get("used_percent"),
+        "weekly_percent_left": budget.get("percent_left"),
+        "weekly_window_minutes": budget.get("window_minutes"),
+        "weekly_resets_at": budget.get("resets_at"),
+        "weekly_budget_exhausted": bool(budget.get("weekly_budget_exhausted")),
+        "credits_raw": budget.get("credits_raw"),
+        "credits_available": budget.get("credits_available"),
+        "credits_remaining": budget.get("credits_remaining"),
+        "credits_used": budget.get("credits_used"),
+        "credits_spent": budget.get("credits_spent"),
+        "credits_limit": budget.get("credits_limit"),
     }
 
 
@@ -722,25 +815,12 @@ def latest_codex_weekly_budget_status() -> Optional[Dict[str, Any]]:
             latest_path = path
     if latest_record is None or latest_path is None:
         return None
-    payload = latest_record.get("payload")
-    if not isinstance(payload, dict):
+    status = codex_budget_status_from_record(latest_record)
+    if status is None:
         return None
-    rate_limits = payload.get("rate_limits")
-    if not isinstance(rate_limits, dict):
-        return None
-    secondary = rate_limits.get("secondary")
-    if not isinstance(secondary, dict):
-        return None
-    used_percent = float(secondary.get("used_percent") or 0.0)
-    percent_left = max(0.0, 100.0 - used_percent)
     return {
-        "timestamp": str(latest_record.get("timestamp") or ""),
+        **status,
         "source_path": str(latest_path),
-        "plan_type": rate_limits.get("plan_type"),
-        "used_percent": used_percent,
-        "percent_left": percent_left,
-        "window_minutes": int(secondary.get("window_minutes") or 0),
-        "resets_at": secondary.get("resets_at"),
     }
 
 
@@ -756,7 +836,163 @@ def _persist_state(config: Config, state: Dict[str, Any]) -> None:
     if callable(save):
         save(config, state)
         return
-    JsonFile.dump(config.state_dir / "state.json", state)
+    JsonFile.dump(config.state_dir / "state.json", state, mode=SUPERVISOR_SHARED_STATE_FILE_MODE)
+
+
+def normalize_worker_readable_state_permissions(config: Config) -> None:
+    def _normalize_tree(root: Path, *, dir_mode: int, file_mode: int) -> None:
+        if not root.exists():
+            return
+        for path in [root, *root.rglob("*")]:
+            try:
+                current_mode = path.stat().st_mode & (0o7777 if path.is_dir() else 0o777)
+                expected_mode = dir_mode if path.is_dir() else file_mode
+                if current_mode != expected_mode:
+                    path.chmod(expected_mode)
+            except PermissionError:
+                pass
+
+    for path in (
+        config.state_dir,
+        config.state_dir / "cycles",
+        config.state_dir / "logs",
+        config.state_dir / "runtime",
+        config.state_dir / "prompts",
+    ):
+        _normalize_tree(path, dir_mode=SUPERVISOR_SHARED_STATE_DIR_MODE, file_mode=SUPERVISOR_SHARED_MULTIWRITER_FILE_MODE)
+    for path in (
+        config.state_dir / "state.json",
+        theorem_frontier_state_path(config),
+    ):
+        if path.exists():
+            current_mode = path.stat().st_mode & 0o777
+            if current_mode != SUPERVISOR_SHARED_STATE_FILE_MODE:
+                try:
+                    path.chmod(SUPERVISOR_SHARED_STATE_FILE_MODE)
+                except PermissionError:
+                    pass
+    for path in (
+        config.state_dir / "validation_summary.json",
+        paper_main_results_manifest_path(config),
+        config.state_dir / "validation_log.jsonl",
+    ):
+        if path.exists():
+            current_mode = path.stat().st_mode & 0o777
+            if current_mode != SUPERVISOR_SHARED_MULTIWRITER_FILE_MODE:
+                try:
+                    path.chmod(SUPERVISOR_SHARED_MULTIWRITER_FILE_MODE)
+                except PermissionError:
+                    pass
+    normalize_checkpoint_tree_permissions(cycle_checkpoints_dir(config))
+
+
+def normalize_checkpoint_tree_permissions(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in [root, *root.rglob("*")]:
+        try:
+            expected_mode = SUPERVISOR_CHECKPOINT_DIR_MODE if path.is_dir() else SUPERVISOR_CHECKPOINT_FILE_MODE
+            current_mode = path.stat().st_mode & (0o7777 if path.is_dir() else 0o777)
+            if current_mode != expected_mode:
+                path.chmod(expected_mode)
+        except PermissionError:
+            pass
+
+
+def ensure_shared_repo_dir(path: Path) -> None:
+    path.mkdir(mode=SUPERVISOR_SHARED_REPO_DIR_MODE, parents=True, exist_ok=True)
+    current_mode = path.stat().st_mode & 0o7777
+    if current_mode != SUPERVISOR_SHARED_REPO_DIR_MODE:
+        path.chmod(SUPERVISOR_SHARED_REPO_DIR_MODE)
+
+
+def write_shared_repo_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    ensure_shared_repo_dir(path.parent)
+    path.write_text(content, encoding=encoding)
+    current_mode = path.stat().st_mode & 0o777
+    if current_mode != SUPERVISOR_SHARED_REPO_FILE_MODE:
+        path.chmod(SUPERVISOR_SHARED_REPO_FILE_MODE)
+
+
+def normalize_repo_mutable_permissions(config: Config) -> None:
+    mutable_dirs = [
+        config.repo_path,
+        config.repo_path / ".lake",
+        config.repo_path / ".lake" / "packages",
+        config.repo_path / "build",
+        theorem_frontier_generated_dir(config),
+        theorem_frontier_generated_proofs_dir(config),
+    ]
+    for path in mutable_dirs:
+        if path.exists():
+            ensure_shared_repo_dir(path)
+
+
+def normalize_burst_user_codex_permissions(config: Config) -> None:
+    burst_home = config.tmux.burst_home
+    burst_group = str(config.tmux.burst_group or "").strip()
+    if burst_home is None or not burst_group:
+        return
+    codex_dir = burst_home / ".codex"
+    if codex_dir.exists():
+        current_mode = codex_dir.stat().st_mode & 0o777
+        if current_mode != 0o775:
+            codex_dir.chmod(0o775)
+    for path in (
+        codex_dir / "config.toml",
+        codex_dir / "auth.json",
+    ):
+        if path.exists():
+            current_mode = path.stat().st_mode & 0o777
+            if current_mode != 0o640:
+                path.chmod(0o640)
+    sessions_dir = codex_dir / "sessions"
+    if sessions_dir.exists():
+        current_mode = sessions_dir.stat().st_mode & 0o777
+        if current_mode != 0o775:
+            sessions_dir.chmod(0o775)
+    for mutable_dir in (
+        codex_dir / "sessions",
+        codex_dir / "tmp",
+        codex_dir / "log",
+        codex_dir / "shell_snapshots",
+        codex_dir / "memories",
+    ):
+        if not mutable_dir.exists():
+            continue
+        for path in [mutable_dir, *mutable_dir.rglob("*")]:
+            try:
+                expected_mode = 0o775 if path.is_dir() else 0o664
+                current_mode = path.stat().st_mode & (0o777 if not path.is_dir() else 0o777)
+                if current_mode != expected_mode:
+                    path.chmod(expected_mode)
+            except PermissionError:
+                pass
+
+
+def append_supervisor_jsonl(path: Path, payload: Any, *, mode: int = SUPERVISOR_SHARED_STATE_LOG_MODE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    if not path.exists():
+        path.write_text(line, encoding="utf-8")
+        path.chmod(mode)
+        return
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+        current_mode = path.stat().st_mode & 0o777
+        if current_mode != mode:
+            path.chmod(mode)
+        return
+    except PermissionError:
+        existing = read_text(path)
+    temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        temp_path.write_text(existing + line, encoding="utf-8")
+        temp_path.chmod(mode)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)  # type: ignore[arg-type]
 
 
 def set_codex_budget_pause_state(
@@ -905,10 +1141,29 @@ def load_config(path: Path) -> Config:
         )
 
     tmux_block = raw.get("tmux", {})
+    burst_user_raw = tmux_block.get("burst_user")
+    burst_user = str(burst_user_raw).strip() if burst_user_raw is not None else None
+    if burst_user == "":
+        burst_user = None
+    burst_group_raw = tmux_block.get("burst_group")
+    burst_group = str(burst_group_raw).strip() if burst_group_raw is not None else None
+    if burst_group == "":
+        burst_group = None
+    burst_home_raw = tmux_block.get("burst_home")
+    burst_home: Optional[Path] = None
+    if burst_home_raw is not None:
+        burst_home = Path(str(burst_home_raw)).expanduser()
+        if not burst_home.is_absolute():
+            burst_home = (repo_path / burst_home).resolve()
+        else:
+            burst_home = burst_home.resolve()
     tmux_cfg = TmuxConfig(
         session_name=sanitize_tmux_session_name(str(tmux_block.get("session_name", "lean-agents"))),
         dashboard_window_name=str(tmux_block.get("dashboard_window_name", "dashboard")),
         kill_windows_after_capture=bool(tmux_block.get("kill_windows_after_capture", True)),
+        burst_user=burst_user,
+        burst_group=burst_group,
+        burst_home=burst_home,
     )
 
     workflow_block = raw.get("workflow", {})
@@ -1690,13 +1945,18 @@ def update_supervisor_tasks_file(config: Config, phase: str) -> None:
 
 
 def ensure_repo_files(config: Config, phase: str) -> None:
+    normalize_repo_mutable_permissions(config)
     config.state_dir.mkdir(parents=True, exist_ok=True)
     for name in ("logs", "runtime", "prompts"):
         (config.state_dir / name).mkdir(parents=True, exist_ok=True)
     if theorem_frontier_enabled(config, phase) and not theorem_frontier_state_path(config).exists():
         from lagent_supervisor.frontier import default_theorem_frontier_payload
 
-        JsonFile.dump(theorem_frontier_state_path(config), default_theorem_frontier_payload("full"))
+        JsonFile.dump(
+            theorem_frontier_state_path(config),
+            default_theorem_frontier_payload("full"),
+            mode=SUPERVISOR_SHARED_STATE_FILE_MODE,
+        )
 
     if not config.goal_file.exists():
         raise SupervisorError(
@@ -1759,7 +2019,12 @@ def ensure_repo_files(config: Config, phase: str) -> None:
     if phase == "theorem_stating" and theorem_frontier_phase(config) == "full":
         manifest_path = paper_main_results_manifest_path(config)
         if not manifest_path.exists():
-            JsonFile.dump(manifest_path, paper_main_results_manifest_stub(config))
+            JsonFile.dump(
+                manifest_path,
+                paper_main_results_manifest_stub(config),
+                mode=SUPERVISOR_SHARED_MULTIWRITER_FILE_MODE,
+            )
+    normalize_worker_readable_state_permissions(config)
 
 
 def git_is_enabled(config: Config) -> bool:
@@ -1883,6 +2148,51 @@ def scope_root_dir(config: Config) -> Path:
     root = Path(tempfile.gettempdir()) / "lagent-supervisor-scopes" / f"{label}-{digest}"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def supervisor_control_root_dir(config: Config) -> Path:
+    identity = f"{config.repo_path.resolve()}::{config.state_dir.resolve()}::supervisor-control"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    label = sanitize_repo_name(config.repo_path.name)
+    root = Path.home() / ".lagent-supervisor-control" / f"{label}-{digest}"
+    root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    root.chmod(0o755)
+    return root
+
+
+def supervisor_prompts_dir(config: Config) -> Path:
+    path = supervisor_control_root_dir(config) / "prompts"
+    path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    path.chmod(0o755)
+    return path
+
+
+def supervisor_scripts_dir(config: Config) -> Path:
+    path = supervisor_control_root_dir(config) / "scripts"
+    path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    path.chmod(0o755)
+    return path
+
+
+def supervisor_git_config_path(config: Config) -> Path:
+    path = supervisor_control_root_dir(config) / "gitconfig"
+    content = "\n".join(
+        [
+            "[safe]",
+            f"\tdirectory = {config.repo_path}",
+            "",
+        ]
+    )
+    if not path.exists() or path.read_text(encoding="utf-8") != content:
+        path.write_text(content, encoding="utf-8")
+    path.chmod(0o644)
+    return path
+
+
+def supervisor_runtime_markers_dir(config: Config) -> Path:
+    path = config.state_dir / "runtime"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def role_scope_dir(config: Config, provider: str, role: str) -> Path:
